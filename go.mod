@@ -9,7 +9,7 @@ toolchain go1.25.11
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/ethereum/go-ethereum v1.17.3
+	github.com/ethereum/go-ethereum v1.17.4
 	github.com/gorilla/websocket v1.5.3
 	github.com/shopspring/decimal v1.4.0
 	github.com/spf13/cobra v1.10.2
