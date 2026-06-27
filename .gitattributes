@@ -1,0 +1,13 @@
+# Normalize line endings: LF in the repo, regardless of contributor OS.
+* text=auto eol=lf
+
+# Shell scripts and Go must always be LF.
+*.sh    text eol=lf
+*.go    text eol=lf
+
+# Golden test vectors / fixtures are exact bytes — never munge.
+*.golden  -text
+testdata/** -text
+
+# Generated docs (if any) don't count toward language stats.
+docs/cli/** linguist-generated=true

@@ -1,0 +1,33 @@
+# Binaries & test artifacts
+/deliverator
+/dist/
+*.exe
+*.test
+*.out
+*.prof
+*.log
+
+# Local state & secrets — NEVER commit
+*.age
+agent.key
+agent.key.*
+/secrets/
+.env
+.env.*
+!.env.example
+
+# Config / runtime state (machine-local)
+config.local.toml
+nonce.lock
+audit.jsonl
+meta.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Agent / tooling local state — NEVER commit (machine-local, may hold session data)
+.claude/
+scheduled_tasks.lock
