@@ -47,13 +47,21 @@ The agent contract is the product. See [`TOOLS.md`](./TOOLS.md) (also `deliverat
 
 ## Install
 
+**Homebrew** (macOS/Linux):
+
 ```sh
-go build -o deliverator .
-# or
-go install github.com/erickuhn19/deliverator@latest   # once public
+brew install --cask erickuhn19/tap/deliverator
 ```
 
-Requires Go 1.25+. macOS/Linux (uses `flock` + the OS keychain).
+Or with **Go**:
+
+```sh
+go install github.com/erickuhn19/deliverator@latest
+# or build from source:
+go build -o deliverator .
+```
+
+Building from source requires Go 1.25+. macOS/Linux (uses `flock` + the OS keychain).
 
 ---
 
@@ -227,21 +235,6 @@ Stream (live NDJSON): `stream book|bbo|trades|candles|fundings|active-asset|mids
 
 Run `deliverator <cmd> --help` for flags. Config lives at
 `~/.config/deliverator/config.toml` (see `deliverator config path`).
-
----
-
-## Status
-
-- **P1 — Read + contract** ✅ schema-v1 envelope, exit-code matrix, error catalog, all read commands, meta cache, nonce flock, clock-skew check, rate-limit budget, `info` raw passthrough.
-- **P2 — Write + safety** ✅ orders (market/limit/IOC/ALO/trigger), **linked OCO brackets**, **batch + grid**, modify + **batch modify**, cancel (single + by-list + all), close (perp + spot), leverage, margin, **TWAP**, DMS, halt, panic; risk layer incl. the **$10 min-order floor**; builder attach + **referral**; dry-run; auto-round; idempotent cloids + retry protocol.
-- **P3 — Streams + own client** ✅ WebSocket NDJSON streams (`stream book|bbo|trades|candles|mids|fundings|active-asset|fills|orders|webdata2|twap-fills|events`) with auto-reconnect + resubscribe and a `{channel:"reconnect"}` control marker. A from-scratch `internal/hl` client — direct Hyperliquid API, EIP-712 signing ported from the official Python SDK — that **replaced the third-party Go SDK entirely**, with golden `(r,s,v)` signature vectors per action family.
-- **HIP-3 sub-dex** ✅ builder sub-dex (`xyz:*`) perps — commodity + equity — trade, read, and stream from a unified account.
-- **HIP-4 outcome markets** ✅ binary Yes/No prediction markets (`#<encoding>`), opt-in via `outcomes = true` — probability pricing in (0,1), discovery via `markets --class outcome` (title, Yes/No, question grouping, expiry, resolution status), outcome-aware `ctx`, payoff-bounded `preview` (at-stake/max-gain, no leverage/liq), `class:"outcome"` rows in `positions`/`portfolio`, and `close`. Live-verified on mainnet (place/read/cancel, a filled buy + a buy→sell round-trip, and the open position surfaced with live mark/PnL).
-- **P3 — Agent-loop hardening** ✅ `watch` real-time failsafe (stream-driven metric → `alert`/`dms`/`panic`), `twap status` (running TWAPs + slice fills), typed reads (`predicted-fundings`, `historical-orders`, `impact_pxs` on `ctx`), and a documented stream-consistency contract (per-event dedup keys + resync-on-reconnect).
-
-**Live-verified on mainnet:** a ~50-order cross-asset gauntlet (crypto + commodity + equity + sub-dex perps, every order type, brackets, batch, grid, batch-cancel, the min-guard, batch-modify) passed 29/29. Unified accounts are supported: the USDC usable as perp collateral is reported as `available_collateral` in `balance`/`portfolio`.
-
-Out of scope **by design** (the non-custodial guarantee): deposits, withdrawals, and transfers (`usdSend`/`spotSend`/`withdraw`/`usdClassTransfer`) and master-only actions (`approveAgent`/`approveBuilderFee`) — they need the master key / user-signed EIP-712, which Deliverator never holds. The agent key itself is stored in the OS keychain by default (with an optional `DELIVERATOR_AGENT_KEY` env override for headless hosts).
 
 ---
 
