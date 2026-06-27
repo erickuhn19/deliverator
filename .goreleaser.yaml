@@ -50,9 +50,10 @@ checksum:
 sboms:
   - artifacts: archive
 
-# NOTE: artifact signing/provenance is added as a follow-up via GitHub's native
-# build-provenance attestation (actions/attest-build-provenance) — more robust than
-# cosign-in-goreleaser blob signing. Releases still ship sha256 checksums + SBOMs.
+# Provenance: SLSA build-provenance attestations are attached in release.yml via
+# actions/attest-build-provenance (keyless, GitHub OIDC) — verify a download with
+# `gh attestation verify <file> --repo erickuhn19/deliverator`. Releases also ship
+# sha256 checksums + per-archive SBOMs.
 
 # Homebrew tap (cask — the non-deprecated path). Works for an unsigned CLI binary
 # via the quarantine-strip hook, so `brew install` runs without a Gatekeeper prompt.
