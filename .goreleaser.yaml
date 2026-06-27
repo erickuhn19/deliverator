@@ -1,0 +1,114 @@
+# goreleaser config — https://goreleaser.com  (schema v2)
+# Builds reproducible, CGO-free multi-platform binaries on a `v*` tag, attaches
+# checksums + SBOMs, cosign-keyless-signs the checksums, publishes a GitHub Release,
+# and updates the Homebrew tap. Rehearse with `goreleaser release --snapshot --clean`.
+version: 2
+
+project_name: deliverator
+
+before:
+  hooks:
+    - go mod verify
+    - go mod tidy
+
+builds:
+  - id: deliverator
+    main: .
+    binary: deliverator
+    # CGO-free pure-Go build — cross-compiles cleanly and signs byte-identically to
+    # the cgo build (golden (r,s,v) vectors verified under CGO_ENABLED=0).
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/erickuhn19/deliverator/cmd.Version={{ .Version }}
+      - -X github.com/erickuhn19/deliverator/cmd.Commit={{ .Commit }}
+      - -X github.com/erickuhn19/deliverator/cmd.BuildDate={{ .CommitDate }}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    # Reproducible builds: stamp files with the commit time, not the build time.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: deliverator
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - NOTICE
+      - THIRD-PARTY-NOTICES.md
+      - README.md
+      - TOOLS.md
+      - AGENTS.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+sboms:
+  - artifacts: archive
+
+# Cosign keyless signing (Sigstore OIDC) of the checksums file. Verify with:
+#   cosign verify-blob --certificate checksums.txt.pem --signature checksums.txt.sig \
+#     --certificate-identity-regexp 'https://github.com/erickuhn19/deliverator/.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+# Homebrew tap (cask — the non-deprecated path). Works for an unsigned CLI binary
+# via the quarantine-strip hook, so `brew install` runs without a Gatekeeper prompt.
+homebrew_casks:
+  - name: deliverator
+    repository:
+      owner: erickuhn19
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://deliverator.net"
+    description: "Non-custodial Hyperliquid execution + tracking CLI for autonomous LLM agents."
+    commit_author:
+      name: Eric Kuhn
+      email: erickuhn19@gmail.com
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/deliverator"]
+          end
+
+changelog:
+  sort: asc
+  use: github
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  github:
+    owner: erickuhn19
+    name: deliverator
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"
