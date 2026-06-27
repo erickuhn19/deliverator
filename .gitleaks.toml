@@ -1,0 +1,17 @@
+# gitleaks config for Deliverator. Extends the default ruleset and allowlists the
+# deterministic THROWAWAY keys used by the signing + wallet test fixtures. These are
+# NOT real secrets — they exist to verify signing parity (golden (r,s,v) vectors) and
+# keychain handling. A finding OUTSIDE these reviewed locations is real and must block
+# the build. See CONTRIBUTING.md: no real keys in fixtures, ever.
+title = "Deliverator gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Throwaway test/golden keys in signing + wallet fixtures (reviewed, not real secrets)."
+paths = [
+  '''internal/hl/sign_test\.go$''',
+  '''internal/core/harness_test\.go$''',
+  '''internal/wallet/wallet_test\.go$''',
+]

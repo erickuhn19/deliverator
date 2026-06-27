@@ -1,0 +1,37 @@
+Deliverator
+Copyright (c) 2026 Eric Kuhn
+
+This product is licensed under the MIT License (see LICENSE).
+
+--------------------------------------------------------------------------------
+Trademarks & affiliation
+--------------------------------------------------------------------------------
+
+Deliverator is an independent, open-source project. It is NOT affiliated with,
+endorsed by, or sponsored by Hyperliquid or any of its operators. "Hyperliquid"
+and any related names or logos are the property of their respective owners and
+are used here only to describe interoperability.
+
+The name "Deliverator" references the character in Neal Stephenson's novel
+*Snow Crash*. The book and its contents are the property of their respective
+rights holders; no affiliation or endorsement is implied.
+
+--------------------------------------------------------------------------------
+Third-party software
+--------------------------------------------------------------------------------
+
+This software links third-party open-source libraries. Their licenses and
+copyright notices are reproduced in THIRD-PARTY-NOTICES.md.
+
+Note in particular that the Ethereum cryptography (github.com/ethereum/go-ethereum)
+is used under the GNU Lesser General Public License (LGPL-3.0). See
+THIRD-PARTY-NOTICES.md for the notice and a pointer to its corresponding source.
+
+--------------------------------------------------------------------------------
+Not financial advice
+--------------------------------------------------------------------------------
+
+Deliverator executes real financial transactions on a live exchange. It is
+provided "as is", without warranty of any kind. Nothing in this software is
+financial advice. You are solely responsible for your use of it and for any
+trades it places on your behalf.
