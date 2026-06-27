@@ -1,0 +1,87 @@
+name: CI
+
+# Run the full test suite on every PR and on pushes to main. No write access:
+# the job only reads the code and reports status.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (e.g. a force-push to a PR branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Forbid silent module-graph drift; a PR must commit go.mod/go.sum changes.
+  GOFLAGS: -mod=readonly
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      # flock + the OS keychain are platform-specific and worth testing on both.
+      # Windows is intentionally excluded: internal/state uses syscall.Flock with
+      # no Windows shim, so the package would not compile there.
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # Reads the `go`/`toolchain` directives from go.mod, so CI builds under the
+      # same pinned toolchain (go1.25.11) as local + release. Leave GOTOOLCHAIN
+      # unset so the toolchain auto-fetch can run. Module/build cache is on by default.
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: build
+        run: go build ./...
+
+      - name: gofmt (must be empty)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # -race needs cgo + a C toolchain (both runners ship one) — do NOT set
+      # CGO_ENABLED=0 here. -count=1 defeats the test cache: a money-signing tool
+      # must never trust a cached pass. This step runs the golden (r,s,v) signature
+      # vectors, the safety net that proves we sign exactly what we show.
+      - name: test -race
+        run: go test -race -count=1 ./...
+
+      # Per-package coverage floors. Linux only — one run is enough and the script
+      # is bash; macOS adds nothing here.
+      - name: coverage floors
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/check-coverage.sh
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          check-latest: false
+      # Run the govulncheck binary directly (rather than an action) so it uses the
+      # exact pinned toolchain. Fails the job on any reachable vulnerability.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...

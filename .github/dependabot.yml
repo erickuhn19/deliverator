@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Keep Go module dependencies current (security + maintenance).
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # Keep the pinned GitHub Action SHAs current — Dependabot bumps the SHA + the
+  # version comment together, so SHA-pinning stays maintainable.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
