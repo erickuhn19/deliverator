@@ -50,21 +50,9 @@ checksum:
 sboms:
   - artifacts: archive
 
-# Cosign keyless signing (Sigstore OIDC) of the checksums file. Verify with:
-#   cosign verify-blob --certificate checksums.txt.pem --signature checksums.txt.sig \
-#     --certificate-identity-regexp 'https://github.com/erickuhn19/deliverator/.*' \
-#     --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt
-signs:
-  - cmd: cosign
-    certificate: "${artifact}.pem"
-    args:
-      - sign-blob
-      - "--output-certificate=${certificate}"
-      - "--output-signature=${signature}"
-      - "${artifact}"
-      - "--yes"
-    artifacts: checksum
-    output: true
+# NOTE: artifact signing/provenance is added as a follow-up via GitHub's native
+# build-provenance attestation (actions/attest-build-provenance) — more robust than
+# cosign-in-goreleaser blob signing. Releases still ship sha256 checksums + SBOMs.
 
 # Homebrew tap (cask — the non-deprecated path). Works for an unsigned CLI binary
 # via the quarantine-strip hook, so `brew install` runs without a Gatekeeper prompt.
