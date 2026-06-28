@@ -65,6 +65,20 @@ Building from source requires Go 1.25+. macOS/Linux (uses `flock` + the OS keych
 
 ---
 
+## Verifying a download
+
+Every release ships sha256 `checksums.txt` and **SLSA build-provenance attestations** —
+signed proof that each binary was built by this repo's CI from a specific commit (so a
+tampered or substituted binary won't verify). To check a downloaded archive:
+
+```sh
+gh attestation verify deliverator_<version>_<os>_<arch>.tar.gz --repo erickuhn19/deliverator
+```
+
+`brew install` enforces integrity automatically via the cask's pinned sha256.
+
+---
+
 ## Quickstart
 
 **Easiest — guided setup** (creates your account via the referral link for a fee

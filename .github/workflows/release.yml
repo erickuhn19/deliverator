@@ -1,15 +1,17 @@
 name: Release
 
 # Cut a release when a v* tag is pushed: build the 4 platform binaries, checksums,
-# SBOMs, cosign-keyless-sign the checksums, publish the GitHub Release, and update
-# the Homebrew tap. Requires the HOMEBREW_TAP_GITHUB_TOKEN secret (fine-grained PAT,
-# contents:write on erickuhn19/homebrew-tap).
+# SBOMs, publish the GitHub Release, update the Homebrew tap, and attach SLSA build
+# provenance attestations to the artifacts. Requires the HOMEBREW_TAP_GITHUB_TOKEN
+# secret (fine-grained PAT, contents:write on erickuhn19/homebrew-tap).
 on:
   push:
     tags: ["v*"]
 
 permissions:
   contents: write # create the release + upload assets
+  id-token: write # OIDC identity for keyless provenance signing (Sigstore)
+  attestations: write # store the build-provenance attestation
 
 concurrency:
   group: release-${{ github.ref }}
@@ -41,3 +43,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Cross-repo push to the Homebrew tap (fine-grained PAT).
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      # SLSA build provenance for the published artifacts — a signed statement that
+      # these exact files were built by THIS workflow from THIS commit. Keyless via
+      # GitHub OIDC; no key to manage. Verify a downloaded artifact with:
+      #   gh attestation verify <file> --repo erickuhn19/deliverator
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt
