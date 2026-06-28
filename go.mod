@@ -13,7 +13,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/shopspring/decimal v1.4.0
 	github.com/spf13/cobra v1.10.2
-	github.com/spf13/pflag v1.0.9
+	github.com/spf13/pflag v1.0.10
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/term v0.44.0
