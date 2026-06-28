@@ -30,6 +30,41 @@ No backend. No telemetry. `scp` the binary to a box and go.
 
 ---
 
+## Target Use Case & Positioning
+
+Deliverator is the **execution and safety layer** for autonomous agents — particularly LLM-driven ones — that trade on Hyperliquid. The intro above covers *what* it does; this section is about *when to reach for it* instead of the alternatives.
+
+### The problem it targets
+
+When an LLM is in the decision loop, a handful of failure modes recur:
+
+- Hallucinated sizes, prices, leverage, or order types
+- Brittle retry logic that double-fills
+- Missing or inconsistent risk checks
+- Custody risk when full wallet keys are exposed to the agent
+
+Deliverator is built to absorb exactly these. Most general-purpose Hyperliquid tooling wasn't.
+
+### Where other tools fit
+
+| Category | Examples | Primary strength | Best for | Limitations for autonomous agents |
+|---|---|---|---|---|
+| **Low-level SDKs** | Official `hyperliquid-python-sdk` | Full control, lightweight, official | Custom development & deep integration | No built-in safety, risk engine, or agent ergonomics |
+| **Persistent bot frameworks** | Hummingbot (Hyperliquid connector) | Mature strategy engine + risk controls | Rule-based / market-making bots | Heavier for dynamic, decision-making agent loops |
+| **Human + scripting CLIs** | `hyperliquid-cli` (TS), similar community CLIs | Nice TUI, real-time monitoring, JSON output | Human traders + light automation | Limited portfolio-level risk enforcement & agent contract |
+| **Agent execution layer** | **Deliverator** | Non-custodial safety + machine-native contract | LLM agents & autonomous trading loops | Newer project (early 2026) |
+
+### Choosing between them
+
+- **Deliverator** — you're running an autonomous agent (especially an LLM) that must trade real capital in a loop, with non-custodial keys and strong safety guarantees, and you don't want to babysit it.
+- **Official SDK** — you want maximum flexibility and are prepared to build your own safety, retry, and risk layers on top.
+- **Hummingbot** — you need persistent, strategy-driven automation (especially market making) rather than dynamic, decision-making agent loops.
+- **Human-oriented CLI** — the main user is a person at a terminal, or you only need occasional scripted automation.
+
+Deliverator isn't trying to replace the Hyperliquid SDK or Hummingbot. It occupies a specific niche: a safe execution harness purpose-built for agents that trade real capital without supervision.
+
+---
+
 ## Why it exists
 
 The caller is an LLM, not a human. So Deliverator is:
