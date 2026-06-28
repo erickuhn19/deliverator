@@ -30,6 +30,70 @@ No backend. No telemetry. `scp` the binary to a box and go.
 
 ---
 
+## Target Use Case & Positioning
+
+Deliverator is built as the **execution and safety layer** for autonomous agents — particularly LLM-driven agents — that need to trade and manage positions on Hyperliquid.
+
+### The core problem it solves
+
+When an LLM (or any autonomous agent) is in the decision loop, several failure modes become common:
+
+- Hallucinated sizes, prices, leverage, or order types
+- Brittle retry logic that causes double-fills
+- Missing or inconsistent risk checks
+- Poor error messages and recovery paths
+- Custody risk when full wallet keys are exposed to the agent
+
+Most existing tools were not designed with these constraints in mind.
+
+### What Deliverator is
+
+Deliverator is a **defensive, machine-native CLI** that sits between the agent and Hyperliquid.
+
+The agent decides *what* to do. Deliverator ensures the *how* is correct, bounded, auditable, and safe — even when the caller is unreliable.
+
+Key design choices:
+
+- Uses a **non-custodial agent/API wallet** that physically cannot withdraw funds
+- Enforces comprehensive risk rules in core (not just at the surface)
+- Speaks a deterministic contract: one JSON object per command + documented exit codes
+- Provides explicit protocols for the hard parts (idempotency via `cloid`, retry on timeout, reconciliation after restarts)
+- Self-describing at runtime (`deliverator tools`, `schema`, `markets`)
+
+This makes it practical to drive Deliverator from any agent framework (LangChain, CrewAI, custom loops, etc.) via simple subprocess + JSON parsing.
+
+### Where other tools fit
+
+| Category | Examples | Primary strength | Best for | Limitations for LLM / autonomous agents |
+|---|---|---|---|---|
+| **Low-level SDKs** | Official `hyperliquid-python-sdk` | Full control, lightweight, official | Custom development & deep integration | No built-in safety, risk engine, or agent ergonomics |
+| **Persistent bot frameworks** | Hummingbot (Hyperliquid connector) | Mature strategy engine + risk controls | Rule-based / market making bots | Heavier for dynamic, decision-making agent loops |
+| **Human + scripting CLIs** | `hyperliquid-cli` (TS), similar community CLIs | Nice TUI, real-time monitoring, JSON output | Human traders + light automation | Limited portfolio-level risk enforcement & agent contract |
+| **Agent execution layer** | **Deliverator** | Non-custodial safety + machine-native contract | LLM agents & autonomous trading loops | Newer project (early 2026) |
+
+### When to use Deliverator
+
+Use **Deliverator** when you are building or running an autonomous agent (especially an LLM) that needs to:
+
+- Execute real trades with strong safety guarantees
+- Operate in a loop with reliable error handling and recovery
+- Avoid common LLM failure modes (bad sizing, double-fills, unbounded risk)
+- Keep the agent wallet non-custodial by design
+
+Use the **official SDK** when you want maximum flexibility and are prepared to build your own safety, retry, and risk layers on top.
+
+Use **Hummingbot** when you primarily need persistent, strategy-driven automation (especially market making) rather than dynamic agent decision-making.
+
+Use a **human-oriented CLI** when the main user is a person at a terminal, or when you only need occasional scripted automation.
+
+### Summary
+
+Deliverator is not trying to replace the Hyperliquid SDK or Hummingbot. It occupies a specific niche: **a safe, reliable execution harness purpose-built for autonomous agents**.
+
+If your agent needs to trade real capital without constantly babysitting it, Deliverator is designed to be the foundation you build on top of.
+
+---
+
 ## Why it exists
 
 The caller is an LLM, not a human. So Deliverator is:
