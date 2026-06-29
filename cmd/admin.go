@@ -345,6 +345,18 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 			return err
 		}
 		cfg.Risk.MaxOpenPositions = n
+	case "risk.max_priority_bps":
+		n, err := atoi()
+		if err != nil {
+			return err
+		}
+		cfg.Risk.MaxPriorityBps = n
+	case "automation.priority_bps":
+		n, err := atoi()
+		if err != nil {
+			return err
+		}
+		cfg.Automation.PriorityBps = n
 	case "alerting.webhook_url":
 		cfg.Alerting.WebhookURL = val
 	case "alerting.categories":
