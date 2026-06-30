@@ -24,16 +24,72 @@ func (m Model) View() string {
 	if !m.ready {
 		return "loading mission control…"
 	}
-	risk := m.renderRisk()
-	acct := m.renderAccount()
 	status := m.renderStatus()
-	used := lipgloss.Height(risk) + lipgloss.Height(acct) + lipgloss.Height(status) + 2
-	feedH := m.h - used
-	if feedH < 3 {
-		feedH = 3
+	bodyH := m.h - lipgloss.Height(status)
+	if bodyH < 8 {
+		bodyH = 8
 	}
-	feed := m.renderFeed(feedH)
-	return lipgloss.JoinVertical(lipgloss.Left, risk, acct, feed, status)
+
+	// Narrow terminals: stack everything (original single-column layout).
+	if m.w < 110 {
+		risk, acct := m.renderRisk(), m.renderAccount()
+		feedH := bodyH - lipgloss.Height(risk) - lipgloss.Height(acct) - 2
+		if feedH < 3 {
+			feedH = 3
+		}
+		return lipgloss.JoinVertical(lipgloss.Left, risk, acct, m.renderFeed(feedH), status)
+	}
+
+	// Wide terminals: two panes — risk + account on the left, activity on the right.
+	leftW := m.w * 48 / 100
+	if leftW < 66 {
+		leftW = 66
+	}
+	rightW := m.w - leftW - 2
+	left := lipgloss.JoinVertical(lipgloss.Left, m.renderRisk(), "", m.renderAccount())
+	right := m.renderFeedCol(bodyH, rightW)
+	leftCol := lipgloss.NewStyle().Width(leftW).MaxHeight(bodyH).Render(left)
+	rightCol := lipgloss.NewStyle().Width(rightW).MaxHeight(bodyH).Render(right)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, "  ", rightCol)
+	return lipgloss.JoinVertical(lipgloss.Left, body, status)
+}
+
+// renderFeedCol renders the activity feed sized for the right pane: the last
+// (height-1) lines, each truncated to the column width (feed lines carry no ANSI,
+// so rune-length truncation is exact).
+func (m Model) renderFeedCol(height, width int) string {
+	var b strings.Builder
+	b.WriteString(cTitle.Render("ACTIVITY") + "\n")
+	if len(m.feed) == 0 {
+		b.WriteString(cDim.Render("  (waiting for activity — set state.command_log to also see commands)"))
+		return b.String()
+	}
+	maxLines := height - 1
+	if maxLines < 1 {
+		maxLines = 1
+	}
+	lines := m.feed
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	for _, ln := range lines {
+		b.WriteString("  " + truncate(ln, width-2) + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func truncate(s string, w int) string {
+	if w < 1 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	return string(r[:w-1]) + "…"
 }
 
 func (m Model) renderRisk() string {

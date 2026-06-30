@@ -232,3 +232,15 @@ func TestModelView(t *testing.T) {
 		}
 	}
 }
+
+func TestTruncate(t *testing.T) {
+	if truncate("hello", 10) != "hello" {
+		t.Errorf("short string should be unchanged: %q", truncate("hello", 10))
+	}
+	if got := truncate("hello world", 5); got != "hell…" {
+		t.Errorf("truncate to 5 = %q want hell…", got)
+	}
+	if truncate("x", 0) != "" {
+		t.Error("zero width should be empty")
+	}
+}
