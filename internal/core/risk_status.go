@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"strconv"
+
+	"github.com/erickuhn19/deliverator/internal/config"
 )
 
 // RiskCap is one configured risk-envelope limit plus, where measurable, the live
@@ -55,7 +57,16 @@ func (c *Client) RiskStatus(ctx context.Context) (*RiskView, error) {
 	}
 	m := computePortfolioMetrics(perCoin)
 	st, ddPct, dlUSD, dlPct, found := ReadRiskState(equity)
+
+	// Read caps from disk, not the in-memory snapshot: a long-running console (and
+	// `risk` after a `config set`) must reflect edits to config.toml. The client's
+	// c.cfg is only the startup load. Falls back to the snapshot if there's no file.
 	r := c.cfg.Risk
+	if p := c.cfg.SourcePath(); p != "" {
+		if fresh, ferr := config.Load(p); ferr == nil {
+			r = fresh.Risk
+		}
+	}
 
 	f := func(v float64) *float64 { return &v }
 	mk := func(key, label, unit, value string, active bool, current *float64, capVal float64) RiskCap {

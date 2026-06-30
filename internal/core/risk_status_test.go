@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -122,5 +123,55 @@ func TestRiskStatusUtilization(t *testing.T) {
 	dd, _ := capByKey(rv.Caps, "risk.max_drawdown_pct")
 	if dd.Active || dd.UtilPct != nil {
 		t.Errorf("drawdown cap is off by default (0): %+v", dd)
+	}
+}
+
+// RiskStatus must re-read caps from disk so a long-running console (and `risk`
+// after a `config set`) reflects edits — the client's in-memory cfg is only a
+// startup snapshot.
+func TestRiskStatusRereadsConfigFromDisk(t *testing.T) {
+	testHome(t)
+	_ = os.MkdirAll(config.Dir(), 0o700)
+	cfgPath := filepath.Join(config.Dir(), "config.toml")
+	cfg := config.Default()
+	cfg.State.AuditPath = "" // avoid an absolute home-tied path (newTestClient swaps DELIVERATOR_HOME)
+	cfg.Risk.MaxAccountLeverage = 3
+	if err := cfg.Save(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.Load(cfgPath) // sets SourcePath
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := infoMap(map[string]string{
+		"clearinghouseState":     emptyState,
+		"frontendOpenOrders":     `[]`,
+		"spotClearinghouseState": `{"balances":[],"tokenToAvailableAfterMaintenance":[[0,"100"]]}`,
+	})
+	c, ctx := newTestClient(t, loaded, Options{}, info)
+
+	rv, err := c.RiskStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap1, _ := capByKey(rv.Caps, "risk.max_account_leverage"); cap1.Value != "3" {
+		t.Fatalf("initial cap value=%q want 3", cap1.Value)
+	}
+
+	// Edit the file on disk (as the console / `config set` would), then re-read.
+	edited, lerr := config.Load(cfgPath)
+	if lerr != nil {
+		t.Fatalf("reload config from %s: %v", cfgPath, lerr)
+	}
+	edited.Risk.MaxAccountLeverage = 7
+	if err := edited.Save(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	rv2, err := c.RiskStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap2, _ := capByKey(rv2.Caps, "risk.max_account_leverage"); cap2.Value != "7" {
+		t.Errorf("RiskStatus must re-read config from disk: cap value=%q want 7", cap2.Value)
 	}
 }

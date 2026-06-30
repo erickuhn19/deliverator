@@ -326,8 +326,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "e", "enter":
 			caps := m.selectableCaps()
 			if m.sel >= 0 && m.sel < len(caps) {
-				m.input.SetValue(caps[m.sel].Value)
-				m.input.CursorEnd()
+				// Empty input + the current value as placeholder, so typing REPLACES
+				// (rather than appending to a pre-filled value). Empty + enter = cancel.
+				m.input.SetValue("")
+				m.input.Placeholder = "new value (current " + caps[m.sel].Value + ")"
 				m.input.Focus()
 				m.phase = typing
 				m.lastErr = ""
