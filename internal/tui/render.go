@@ -208,7 +208,9 @@ func (m Model) renderStatus() string {
 	if !m.lastRefresh.IsZero() {
 		parts = append(parts, cDim.Render(fmt.Sprintf("refreshed %ds ago", int(time.Since(m.lastRefresh).Seconds()))))
 	}
-	if m.degraded {
+	if m.rateLimited {
+		parts = append(parts, cDim.Render("rate-limited · retrying"))
+	} else if m.degraded {
 		parts = append(parts, cWarn.Render("degraded"))
 	}
 	bar := strings.Join(parts, "  ·  ")
