@@ -46,7 +46,7 @@ func (c *Client) RiskStatus(ctx context.Context) (*RiskView, error) {
 	if err != nil {
 		return nil, err
 	}
-	equity := equityOf(pf.AccountValue, pf.AvailableCollateral)
+	equity := accountEquity(pf)
 	perCoin := map[string]float64{}
 	for _, p := range pf.Positions {
 		n := parseFloatSafe(p.PositionValue)

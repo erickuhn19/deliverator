@@ -118,7 +118,7 @@ func TestGateDailyLoss(t *testing.T) {
 
 func TestObserveEquityDayRolloverAndPeak(t *testing.T) {
 	testHome(t)
-	seed, _ := json.Marshal(riskState{PeakEquity: 5000, Day: "1970-01-01", DayAnchorEquity: 5000})
+	seed, _ := json.Marshal(riskState{PeakEquity: 5000, Day: "1970-01-01", DayAnchorEquity: 5000, Basis: currentEquityBasis})
 	_ = os.MkdirAll(filepath.Dir(riskStatePath()), 0o700)
 	if err := os.WriteFile(riskStatePath(), seed, 0o600); err != nil {
 		t.Fatal(err)
