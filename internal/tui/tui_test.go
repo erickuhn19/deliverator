@@ -273,3 +273,26 @@ func TestViewLayouts(t *testing.T) {
 		t.Error("narrow view missing a panel")
 	}
 }
+
+func TestModelRateLimitSoftError(t *testing.T) {
+	// seed last-good data
+	m, _ := upd(t, New(Deps{}), dataMsg{risk: riskWithCaps(), pf: &core.PortfolioView{AccountValue: "1"}})
+	// a 429 must be a calm, transient rate-limit: no red error, last-good kept
+	m, _ = upd(t, m, dataMsg{pfErr: errors.New("Hyperliquid returned 429 (per-IP weight exceeded)"), riskErr: errors.New("429")})
+	if !m.rateLimited || m.lastErr != "" {
+		t.Errorf("429 should be a soft rate-limit (rateLimited, no lastErr): rateLimited=%v lastErr=%q", m.rateLimited, m.lastErr)
+	}
+	if m.risk == nil || m.pf == nil {
+		t.Error("rate-limit must keep last-good data")
+	}
+	// a genuine error is shown as a red error, not a rate-limit
+	m, _ = upd(t, m, dataMsg{pfErr: errors.New("connection refused")})
+	if m.rateLimited || m.lastErr == "" {
+		t.Errorf("a non-429 error should surface as a red error: rateLimited=%v lastErr=%q", m.rateLimited, m.lastErr)
+	}
+	// recovery clears both
+	m, _ = upd(t, m, dataMsg{risk: riskWithCaps(), pf: &core.PortfolioView{}})
+	if m.rateLimited || m.lastErr != "" || m.degraded {
+		t.Errorf("a good refresh should clear error state: %+v", m)
+	}
+}

@@ -94,7 +94,8 @@ type Model struct {
 
 	status      string // last status / operator-approved warning line
 	lastErr     string
-	degraded    bool // last data refresh had a partial/total failure
+	degraded    bool // last data refresh failed (keeping last-good data)
+	rateLimited bool // last failure was a transient 429 (expected; shown calmly, not red)
 	lastRefresh time.Time
 
 	w, h  int
@@ -209,7 +210,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dataMsg:
 		m.lastRefresh = time.Now()
-		m.degraded = msg.riskErr != nil || msg.pfErr != nil
 		if msg.risk != nil {
 			m.risk = msg.risk
 			if m.sel >= len(m.risk.Caps) {
@@ -219,10 +219,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.pf != nil {
 			m.pf = msg.pf
 		}
-		if msg.riskErr != nil {
-			m.lastErr = "risk: " + msg.riskErr.Error()
-		} else if msg.pfErr != nil {
-			m.lastErr = "portfolio: " + msg.pfErr.Error()
+		err := msg.pfErr
+		if err == nil {
+			err = msg.riskErr
+		}
+		switch {
+		case err == nil:
+			m.lastErr, m.rateLimited, m.degraded = "", false, false
+		case isRateLimit(err):
+			// Transient + expected (shared per-IP weight budget): keep last-good
+			// data and show it calmly, don't flash a red error.
+			m.lastErr, m.rateLimited, m.degraded = "", true, true
+		default:
+			m.lastErr, m.rateLimited, m.degraded = "data: "+err.Error(), false, true
 		}
 		return m, nil
 
@@ -343,6 +352,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// isRateLimit reports whether err is a transient Hyperliquid rate-limit (HTTP 429 /
+// per-IP weight) — an expected, self-recovering condition the console shows calmly
+// rather than as a red failure.
+func isRateLimit(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "429") || strings.Contains(s, "per-ip") ||
+		strings.Contains(s, "rate limit") || strings.Contains(s, "rate-limit")
 }
 
 // Run builds and runs the console TUI program until the operator quits.
