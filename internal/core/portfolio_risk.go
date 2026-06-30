@@ -130,6 +130,32 @@ func (c *Client) portfolioEquitySnapshot(ctx context.Context) (*portfolioEquityS
 	return snap, nil
 }
 
+// portfolioMetrics is the pure book arithmetic the account-wide gates and the
+// read-only risk status share — gross/net notional, the largest single-coin
+// notional, and the open-position count (dust-filtered). No caps, no equity, no
+// I/O, so the gate evaluator and the status view can never drift.
+type portfolioMetrics struct {
+	gross, net      float64
+	maxCoinNotional float64
+	maxCoin         string
+	openPositions   int
+}
+
+func computePortfolioMetrics(perCoin map[string]float64) portfolioMetrics {
+	var m portfolioMetrics
+	for coin, v := range perCoin {
+		m.gross += absF(v)
+		m.net += v
+		if absF(v) > m.maxCoinNotional {
+			m.maxCoinNotional, m.maxCoin = absF(v), coin
+		}
+		if absF(v) > 0.005 { // ignore dust / a flip that lands at ~0
+			m.openPositions++
+		}
+	}
+	return m
+}
+
 // checkPortfolioGates enforces the configured account-wide gates against the
 // resulting book (live positions + the proposed new-exposure deltas). It is a
 // no-op unless a portfolio gate is set. It FAILS CLOSED: when the account snapshot
@@ -151,14 +177,8 @@ func (c *Client) checkPortfolioGates(ctx context.Context, deltas []exposureDelta
 	for _, d := range deltas {
 		resulting[d.coin] += d.signedNotional
 	}
-	gross, net, maxCoinNotional, maxCoin := 0.0, 0.0, 0.0, ""
-	for coin, v := range resulting {
-		gross += absF(v)
-		net += v
-		if absF(v) > maxCoinNotional {
-			maxCoinNotional, maxCoin = absF(v), coin
-		}
-	}
+	m := computePortfolioMetrics(resulting)
+	gross, net, maxCoinNotional, maxCoin := m.gross, m.net, m.maxCoinNotional, m.maxCoin
 
 	r := c.cfg.Risk
 	// Net exposure needs no equity, so it is always checkable.
@@ -170,12 +190,7 @@ func (c *Client) checkPortfolioGates(ctx context.Context, deltas []exposureDelta
 	// Open-position count: opening a NEW coin while at the cap is rejected; adding
 	// to an existing position (count unchanged) is not. Needs no equity.
 	if cap := r.MaxOpenPositions; cap > 0 {
-		count := 0
-		for _, v := range resulting {
-			if absF(v) > 0.005 { // ignore dust / a flip that lands at ~0
-				count++
-			}
-		}
+		count := m.openPositions
 		if count > cap {
 			return output.Risk("max_open_positions",
 				fmt.Sprintf("this would make %d open positions, over the max of %d", count, cap)).
@@ -281,4 +296,33 @@ func observeEquity(equity float64) (drawdownPct, dailyLossUSD, dailyLossPct floa
 		_ = state.WriteFileAtomic(riskStatePath(), b, 0o600)
 	}
 	return drawdownPct, dailyLossUSD, dailyLossPct, nil
+}
+
+// ReadRiskState reads the persistent drawdown/daily-loss state WITHOUT mutating it
+// and computes the drawdown-from-peak + daily-loss figures against the supplied live
+// equity — the read-only counterpart to observeEquity, for status/monitoring
+// surfaces (`deliverator risk`, the console TUI). It NEVER updates the high-water
+// mark or the day anchor: a passive monitor must not move the figures the agent's
+// gates depend on. found=false means there is no usable state file yet (fresh box
+// or corrupt file → zeroed figures, never an error). The daily figure is reported
+// only when the stored anchor is from the current UTC day (a new day re-anchors on
+// the next observeEquity write); drawdown uses the stored peak as-is.
+func ReadRiskState(equity float64) (st riskState, drawdownPct, dailyLossUSD, dailyLossPct float64, found bool) {
+	b, e := os.ReadFile(riskStatePath())
+	if e != nil {
+		return riskState{}, 0, 0, 0, false
+	}
+	if json.Unmarshal(b, &st) != nil {
+		return riskState{}, 0, 0, 0, false
+	}
+	found = true
+	if st.PeakEquity > 0 && equity < st.PeakEquity {
+		drawdownPct = (st.PeakEquity - equity) / st.PeakEquity * 100
+	}
+	today := time.Now().UTC().Format("2006-01-02")
+	if st.Day == today && st.DayAnchorEquity > 0 && equity < st.DayAnchorEquity {
+		dailyLossUSD = st.DayAnchorEquity - equity
+		dailyLossPct = dailyLossUSD / st.DayAnchorEquity * 100
+	}
+	return st, drawdownPct, dailyLossUSD, dailyLossPct, found
 }

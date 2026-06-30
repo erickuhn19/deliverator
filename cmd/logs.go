@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -72,41 +71,10 @@ machine use; this command formats them for humans.`,
 }
 
 // formatLogEntry renders one JSONL log row (command-log or audit) as a compact
-// human line. Unknown shapes fall back to the raw JSON.
+// human line. Delegates to state.FormatLogEntry so `deliverator logs` and the
+// console TUI activity feed render identically (one formatter, one test).
 func formatLogEntry(e map[string]any) string {
-	ts := ""
-	if v, ok := e["ts"].(float64); ok {
-		ts = time.UnixMilli(int64(v)).Format("15:04:05")
-	}
-	switch {
-	case e["argv"] != nil: // command-log line
-		argv, _ := e["argv"].([]any)
-		parts := make([]string, len(argv))
-		for i, a := range argv {
-			parts[i] = fmt.Sprint(a)
-		}
-		exit := 0
-		if v, ok := e["exit"].(float64); ok {
-			exit = int(v)
-		}
-		outcome := "ok"
-		if exit != 0 {
-			outcome = fmt.Sprintf("exit %d", exit)
-		}
-		return fmt.Sprintf("%s  $ deliverator %s  → %s", ts, strings.Join(parts, " "), outcome)
-	case e["action"] != nil: // audit line
-		action, _ := e["action"].(string)
-		var kv []string
-		for _, k := range []string{"coin", "side", "size", "status", "oid", "canceled", "secs", "complete"} {
-			if v, ok := e[k]; ok {
-				kv = append(kv, fmt.Sprintf("%s=%v", k, v))
-			}
-		}
-		return fmt.Sprintf("%s  %-13s %s", ts, action, strings.Join(kv, " "))
-	default:
-		b, _ := json.Marshal(e)
-		return fmt.Sprintf("%s  %s", ts, b)
-	}
+	return state.FormatLogEntry(e)
 }
 
 // followLog tails path, printing each newly-appended JSONL line formatted, until

@@ -38,6 +38,7 @@ type ClientAPI interface {
 	RawInfo(ctx context.Context, body map[string]any) (any, error)
 	Reconcile(ctx context.Context, opts ReconcileOpts) (*ReconcileView, error)
 	ReferralStatus(ctx context.Context) (*hl.ReferralInfo, error)
+	RiskStatus(ctx context.Context) (*RiskView, error)
 	Snapshot(ctx context.Context, coins []string) (*SnapshotView, []string, error)
 	TwapStatus(ctx context.Context, coin string, id int64) (*TwapStatusView, error)
 
