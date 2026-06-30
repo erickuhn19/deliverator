@@ -244,3 +244,32 @@ func TestTruncate(t *testing.T) {
 		t.Error("zero width should be empty")
 	}
 }
+
+func TestViewLayouts(t *testing.T) {
+	risk := riskWithCaps()
+	pf := &core.PortfolioView{Positions: []core.PositionView{
+		{Coin: "BTC", Side: "short", PositionValue: "640", UnrealizedPnl: "-5", DistanceToLiqPct: "12.3"},
+	}}
+	longFeed := []string{"15:04:05  $ deliverator " + strings.Repeat("x", 200) + " positions"}
+
+	// Wide (>=110): two-pane layout exercises renderFeedCol + long-line truncation.
+	mw, _ := upd(t, New(Deps{Network: "mainnet"}), tea.WindowSizeMsg{Width: 160, Height: 40})
+	mw, _ = upd(t, mw, dataMsg{risk: risk, pf: pf})
+	mw, _ = upd(t, mw, feedMsg{lines: longFeed, high: 1})
+	vw := mw.View()
+	if !strings.Contains(vw, "RISK ENVELOPE") || !strings.Contains(vw, "ACTIVITY") || !strings.Contains(vw, "ACCOUNT") {
+		t.Error("wide view missing a panel")
+	}
+	if !strings.Contains(vw, "…") {
+		t.Error("a long feed line should be truncated with an ellipsis in the right pane")
+	}
+
+	// Narrow (<110): stacked layout exercises the renderFeed path.
+	mn, _ := upd(t, New(Deps{Network: "mainnet"}), tea.WindowSizeMsg{Width: 90, Height: 40})
+	mn, _ = upd(t, mn, dataMsg{risk: risk, pf: pf})
+	mn, _ = upd(t, mn, feedMsg{lines: []string{"a line"}, high: 1})
+	vn := mn.View()
+	if !strings.Contains(vn, "RISK ENVELOPE") || !strings.Contains(vn, "ACTIVITY") {
+		t.Error("narrow view missing a panel")
+	}
+}
