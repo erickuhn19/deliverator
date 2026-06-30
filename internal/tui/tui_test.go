@@ -17,12 +17,12 @@ import (
 // fakeTUIClient stubs the two reads the TUI makes.
 type fakeTUIClient struct{ core.ClientAPI }
 
-func (fakeTUIClient) RiskStatus(ctx context.Context) (*core.RiskView, error) {
-	return riskWithCaps(), nil
-}
-
 func (fakeTUIClient) Portfolio(ctx context.Context) (*core.PortfolioView, error) {
 	return &core.PortfolioView{AccountValue: "1000"}, nil
+}
+
+func (fakeTUIClient) RiskStatusFromPortfolio(pf *core.PortfolioView) *core.RiskView {
+	return riskWithCaps()
 }
 
 func TestRefreshCmd(t *testing.T) {

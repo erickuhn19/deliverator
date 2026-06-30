@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	dataInterval = 3 * time.Second
+	dataInterval = 5 * time.Second // portfolio refresh — gentle on the per-IP weight budget
 	feedInterval = 700 * time.Millisecond
 	feedMax      = 500 // ring-buffer cap on retained feed lines
 )
@@ -121,15 +121,19 @@ func feedTickCmd() tea.Cmd {
 	return tea.Tick(feedInterval, func(t time.Time) tea.Msg { return feedTickMsg(t) })
 }
 
-// refreshCmd fetches risk + snapshot off the UI thread.
+// refreshCmd fetches the portfolio ONCE off the UI thread and derives both the
+// account panel and the risk view from it (RiskStatusFromPortfolio does no I/O) —
+// one API round-trip per tick, not two, to stay well under the per-IP weight budget.
 func (m Model) refreshCmd() tea.Cmd {
 	c := m.deps.Client
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
-		rv, rerr := c.RiskStatus(ctx)
 		pf, perr := c.Portfolio(ctx)
-		return dataMsg{risk: rv, riskErr: rerr, pf: pf, pfErr: perr}
+		if perr != nil {
+			return dataMsg{riskErr: perr, pfErr: perr}
+		}
+		return dataMsg{risk: c.RiskStatusFromPortfolio(pf), pf: pf}
 	}
 }
 
