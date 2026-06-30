@@ -46,6 +46,15 @@ func (c *Client) RiskStatus(ctx context.Context) (*RiskView, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.RiskStatusFromPortfolio(pf), nil
+}
+
+// RiskStatusFromPortfolio builds the RiskView from an ALREADY-FETCHED portfolio, so
+// a caller that already has the snapshot (e.g. the console refreshing every few
+// seconds, which also needs the portfolio for its account panel) gets risk without a
+// SECOND Portfolio round-trip — halving the per-IP request weight and the 429s that
+// caused. It performs no network I/O (caps re-read from the local config file).
+func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 	equity := accountEquity(pf)
 	perCoin := map[string]float64{}
 	for _, p := range pf.Positions {
@@ -108,5 +117,5 @@ func (c *Client) RiskStatus(ctx context.Context) (*RiskView, error) {
 		DailyLossPct:   dlPct,
 		RiskStateFound: found,
 		Halted:         c.Halted(),
-	}, nil
+	}
 }
