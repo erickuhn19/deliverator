@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/erickuhn19/deliverator/internal/config"
+	hl "github.com/erickuhn19/deliverator/internal/hl"
 )
 
 func approxEq(a, b float64) bool { return math.Abs(a-b) < 0.01 }
@@ -30,7 +31,7 @@ func TestReadRiskStateNoMutationAndCompute(t *testing.T) {
 	testHome(t)
 	_ = os.MkdirAll(config.Dir(), 0o700)
 	today := time.Now().UTC().Format("2006-01-02")
-	content := []byte(`{"peak_equity":1000,"day":"` + today + `","day_anchor_equity":900}`)
+	content := []byte(`{"peak_equity":1000,"day":"` + today + `","day_anchor_equity":900,"basis":2}`)
 	if err := os.WriteFile(riskStatePath(), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +73,7 @@ func TestReadRiskStateStaleDayNoDailyLoss(t *testing.T) {
 	_ = os.MkdirAll(config.Dir(), 0o700)
 	// Anchor from a different UTC day: a new day re-anchors on the next write, so a
 	// read-only view reports no daily loss; drawdown (from the stored peak) still computes.
-	content := []byte(`{"peak_equity":1000,"day":"2000-01-01","day_anchor_equity":900}`)
+	content := []byte(`{"peak_equity":1000,"day":"2000-01-01","day_anchor_equity":900,"basis":2}`)
 	_ = os.WriteFile(riskStatePath(), content, 0o600)
 	_, dd, dlUSD, _, found := ReadRiskState(800)
 	if !found || !approxEq(dd, 20) {
@@ -173,5 +174,46 @@ func TestRiskStatusRereadsConfigFromDisk(t *testing.T) {
 	}
 	if cap2, _ := capByKey(rv2.Caps, "risk.max_account_leverage"); cap2.Value != "7" {
 		t.Errorf("RiskStatus must re-read config from disk: cap value=%q want 7", cap2.Value)
+	}
+}
+
+func TestAccountEquity(t *testing.T) {
+	// Unified: spot USDC + perp uPnL (all dexes) + outcome value. The reserved
+	// margin lives inside the USDC balance, so it is NOT double-counted.
+	unified := &PortfolioView{
+		CollateralShared: true,
+		AccountValue:     "16",
+		SpotBalances:     []hl.SpotBalance{{Coin: "USDC", Total: "127.83"}},
+		Positions: []PositionView{
+			{Coin: "WLD", UnrealizedPnl: "2.62"},
+			{Coin: "xyz:META", UnrealizedPnl: "-0.33"},
+			{Coin: "#9", Class: "outcome", PositionValue: "5.00"},
+		},
+	}
+	if e := accountEquity(unified); !approxEq(e, 127.83+2.29+5.0) {
+		t.Errorf("unified equity = %v want ~135.12 (USDC + uPnL + outcome)", e)
+	}
+	// Pure-perp: Σ perp account_value (main + sub-dex) + spot + outcome. Position
+	// uPnL is NOT added (already inside account_value).
+	pureperp := &PortfolioView{
+		CollateralShared: false,
+		AccountValue:     "1000",
+		PerpDexs:         map[string]PerpBalance{"xyz": {AccountValue: "200"}},
+		SpotBalances:     []hl.SpotBalance{{Coin: "USDC", Total: "50"}},
+		Positions:        []PositionView{{Coin: "BTC", UnrealizedPnl: "999"}},
+	}
+	if e := accountEquity(pureperp); !approxEq(e, 1000+200+50) {
+		t.Errorf("pure-perp equity = %v want 1250 (account values + spot)", e)
+	}
+}
+
+func TestReadRiskStateStaleBasisResets(t *testing.T) {
+	testHome(t)
+	_ = os.MkdirAll(config.Dir(), 0o700)
+	today := time.Now().UTC().Format("2006-01-02")
+	// No "basis" field => old basis (0) => must be treated as fresh, not compared.
+	_ = os.WriteFile(riskStatePath(), []byte(`{"peak_equity":1000,"day":"`+today+`","day_anchor_equity":1000}`), 0o600)
+	if _, dd, _, _, found := ReadRiskState(800); found || dd != 0 {
+		t.Errorf("stale-basis state must read as fresh (found=false, dd=0); got found=%v dd=%v", found, dd)
 	}
 }

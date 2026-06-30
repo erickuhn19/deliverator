@@ -97,6 +97,51 @@ func equityOf(accountValue, availableCollateral string) float64 {
 	return e
 }
 
+// currentEquityBasis versions the equity computation below. When it changes, the
+// persisted drawdown/daily-loss anchors (captured under an older basis) are reset
+// rather than compared — so a basis change can never manufacture a phantom loss.
+const currentEquityBasis = 2
+
+// accountEquity is the TRUE total account equity across every instrument, used by
+// the account-wide gates (#43) and the risk status. Unlike equityOf's max()
+// heuristic — which reads available_collateral and so DROPS by the margin reserved
+// when positions open, manufacturing a phantom drawdown/daily-loss — this counts the
+// collateral held as margin and values held HIP-4 outcome shares:
+//
+//	unified (shared collateral): the margin is held inside the spot USDC balance, so
+//	  equity = spot USDC total + perp unrealized PnL (all dexes) + outcome value.
+//	pure-perp: collateral lives in the perp wallet(s), whose account_value already
+//	  includes margin + free + uPnL, so equity = Σ perp account_value (main +
+//	  sub-dex) + spot USDC + outcome value.
+//
+// For a FLAT account both branches equal the old equityOf, so only the buggy
+// margin-reserved case changes.
+func accountEquity(pf *PortfolioView) float64 {
+	var perpUPnL, outcomeValue float64
+	for _, p := range pf.Positions {
+		if p.Class == "outcome" {
+			outcomeValue += parseFloatSafe(p.PositionValue) // current market value of the Yes/No shares
+		} else {
+			perpUPnL += parseFloatSafe(p.UnrealizedPnl)
+		}
+	}
+	var usdc float64
+	for _, b := range pf.SpotBalances {
+		if b.Coin == "USDC" {
+			usdc = parseFloatSafe(b.Total)
+			break
+		}
+	}
+	if pf.CollateralShared {
+		return usdc + perpUPnL + outcomeValue
+	}
+	av := parseFloatSafe(pf.AccountValue)
+	for _, b := range pf.PerpDexs {
+		av += parseFloatSafe(b.AccountValue)
+	}
+	return usdc + av + outcomeValue
+}
+
 // portfolioEquitySnapshot is the live account state the gates evaluate against.
 type portfolioEquitySnapshot struct {
 	equity  float64            // perp account_value, or available USDC collateral when flat/unified
@@ -108,17 +153,12 @@ func (c *Client) portfolioEquitySnapshot(ctx context.Context) (*portfolioEquityS
 	if err != nil {
 		return nil, err
 	}
-	// Equity = the GREATER of perp account_value and available USDC collateral.
-	// On a UNIFIED (spot-collateral) account the equity lives in spot: perp
-	// account_value reads only the margin slice backing open positions (~0 when
-	// flat, e.g. $3 holding a $15 position) while the bulk sits in collateral —
-	// so account_value alone would over-state leverage ~50x and false-trip
-	// drawdown/daily-loss the instant a position opens (live-confirmed). On a
-	// pure-perp account it is the reverse: account_value is the full equity and
-	// collateral the free part. max() picks the meaningful figure in both, and
-	// since the two pools are disjoint it never exceeds true equity — it can only
-	// ever be conservative (over-reject), never unsafe.
-	equity := equityOf(pf.AccountValue, pf.AvailableCollateral)
+	// Equity = the TRUE total account equity (see accountEquity): on a unified
+	// account, spot USDC + perp uPnL + outcome value; on a pure-perp account, the
+	// perp account value(s) + spot + outcome. The earlier max(account_value,
+	// available_collateral) heuristic DROPPED by the margin reserved when a position
+	// opened, manufacturing a phantom drawdown/daily-loss.
+	equity := accountEquity(pf)
 	snap := &portfolioEquitySnapshot{equity: equity, perCoin: map[string]float64{}}
 	for _, p := range pf.Positions {
 		n := parseFloatSafe(p.PositionValue)
@@ -256,6 +296,7 @@ type riskState struct {
 	PeakEquity      float64 `json:"peak_equity"`
 	Day             string  `json:"day"`               // UTC date, YYYY-MM-DD
 	DayAnchorEquity float64 `json:"day_anchor_equity"` // equity at the day's first observation
+	Basis           int     `json:"basis,omitempty"`   // equity-computation version (currentEquityBasis)
 }
 
 // observeEquity records equity into the persistent high-water / daily-anchor state
@@ -274,6 +315,9 @@ func observeEquity(equity float64) (drawdownPct, dailyLossUSD, dailyLossPct floa
 	if b, e := os.ReadFile(riskStatePath()); e == nil {
 		_ = json.Unmarshal(b, &st) // corrupt => treated as fresh
 	}
+	if st.Basis != currentEquityBasis {
+		st = riskState{} // equity basis changed: re-anchor instead of comparing stale figures
+	}
 	today := time.Now().UTC().Format("2006-01-02")
 	if st.Day != today || st.DayAnchorEquity <= 0 {
 		st.Day = today
@@ -289,6 +333,7 @@ func observeEquity(equity float64) (drawdownPct, dailyLossUSD, dailyLossPct floa
 		dailyLossUSD = st.DayAnchorEquity - equity
 		dailyLossPct = dailyLossUSD / st.DayAnchorEquity * 100
 	}
+	st.Basis = currentEquityBasis
 	if b, e := json.Marshal(st); e == nil {
 		_ = os.MkdirAll(filepath.Dir(riskStatePath()), 0o700)
 		// Atomic+fsync: a crash mid-write must not zero the drawdown/daily-loss
@@ -314,6 +359,9 @@ func ReadRiskState(equity float64) (st riskState, drawdownPct, dailyLossUSD, dai
 	}
 	if json.Unmarshal(b, &st) != nil {
 		return riskState{}, 0, 0, 0, false
+	}
+	if st.Basis != currentEquityBasis {
+		return riskState{}, 0, 0, 0, false // stale basis: treat as fresh until observeEquity re-anchors
 	}
 	found = true
 	if st.PeakEquity > 0 && equity < st.PeakEquity {
