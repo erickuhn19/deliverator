@@ -15,12 +15,14 @@ import (
 
 var consoleCmd = &cobra.Command{
 	Use:   "console",
-	Short: "Mission control: live risk envelope (editable) + account + activity feed (TUI)",
+	Short: "Mission control: live risk envelope + trading posture (editable) + account + activity (TUI)",
 	Long: `A human-in-the-loop full-screen dashboard. The agent drives execution through
 the normal CLI; this is the operator's surface — view and edit the risk envelope (with
-live utilization), watch the command/audit activity feed, and glance at equity + open
-positions. Risk-cap edits go through the same guarded path as ` + "`config set`" + ` (loud,
-operator-confirmed, never silent). ↑↓ select · e edit · r refresh · q quit.`,
+live utilization) and the trading posture (what the agent may trade: outcome markets,
+limit-only, allowed coins, sub-dexes), watch the command/audit activity feed, and glance
+at equity + open positions. Risk-cap edits go through the same guarded path as ` + "`config set`" + `
+(loud, operator-confirmed, never silent); posture changes take a plain confirm.
+↑↓ select · e edit/toggle · r refresh · q quit.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// One reusable client: meta fetch under a bounded startup context, then the

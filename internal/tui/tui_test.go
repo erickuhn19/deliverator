@@ -296,3 +296,130 @@ func TestModelRateLimitSoftError(t *testing.T) {
 		t.Errorf("a good refresh should clear error state: %+v", m)
 	}
 }
+
+// riskWithPosture adds the operator posture rows after the two caps, so the flat
+// row order is: [0]cap max_leverage, [1]cap net_exposure, [2]outcomes(bool),
+// [3]allowed_coins(list,empty), [4]perp_dexs(list,"xyz").
+func riskWithPosture() *core.RiskView {
+	rv := riskWithCaps()
+	rv.Posture = []core.PostureSetting{
+		{Key: "outcomes", Label: "Outcome markets", Type: "bool", Value: "false"},
+		{Key: "automation.allowed_coins", Label: "Allowed coins", Type: "list", Value: ""},
+		{Key: "perp_dexs", Label: "Sub-dexes (HIP-3)", Type: "list", Value: "xyz"},
+	}
+	return rv
+}
+
+func navDown(t *testing.T, m Model, n int) Model {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		m, _ = upd(t, m, rk('j'))
+	}
+	return m
+}
+
+// A boolean posture row skips the text-entry step: `e` flips the value and goes
+// straight to confirm; `y` applies the flipped value exactly once.
+func TestPostureBoolTogglesAndConfirms(t *testing.T) {
+	var calls int
+	var gotKey, gotVal string
+	deps := Deps{SetCap: func(key, val string) (string, bool, error) {
+		calls++
+		gotKey, gotVal = key, val
+		return "false", false, nil // not a risk cap
+	}}
+	m, _ := upd(t, New(deps), dataMsg{risk: riskWithPosture()})
+	m = navDown(t, m, 2) // -> outcomes (index 2)
+	m, _ = upd(t, m, rk('e'))
+	if m.phase != confirming {
+		t.Fatalf("bool edit should jump to confirming, phase=%d", m.phase)
+	}
+	if m.editKey != "outcomes" || m.input.Value() != "true" {
+		t.Fatalf("expected outcomes flipped to true, key=%q val=%q", m.editKey, m.input.Value())
+	}
+	_, cmd := upd(t, m, rk('y'))
+	if cmd == nil {
+		t.Fatal("confirm should return a setCap command")
+	}
+	cmd()
+	if calls != 1 || gotKey != "outcomes" || gotVal != "true" {
+		t.Fatalf("SetCap calls=%d key=%q val=%q", calls, gotKey, gotVal)
+	}
+}
+
+// A list posture row takes free text; a non-empty value applies as typed.
+func TestPostureListEditApplies(t *testing.T) {
+	var gotKey, gotVal string
+	deps := Deps{SetCap: func(key, val string) (string, bool, error) { gotKey, gotVal = key, val; return "", false, nil }}
+	m, _ := upd(t, New(deps), dataMsg{risk: riskWithPosture()})
+	m = navDown(t, m, 4) // -> perp_dexs (index 4)
+	m, _ = upd(t, m, rk('e'))
+	if m.phase != typing {
+		t.Fatalf("list edit should enter typing, phase=%d", m.phase)
+	}
+	for _, r := range "ab" {
+		m, _ = upd(t, m, rk(r))
+	}
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // -> confirming
+	if m.phase != confirming {
+		t.Fatalf("non-empty list edit should confirm, phase=%d", m.phase)
+	}
+	_, cmd := upd(t, m, rk('y'))
+	cmd()
+	if gotKey != "perp_dexs" || gotVal != "ab" {
+		t.Fatalf("SetCap key=%q val=%q, want perp_dexs=ab", gotKey, gotVal)
+	}
+}
+
+// Empty input on a LIST row is a valid clear (proceed to confirm), unlike a numeric
+// cap where empty cancels.
+func TestPostureListEmptyClears(t *testing.T) {
+	var gotVal string
+	called := false
+	deps := Deps{SetCap: func(key, val string) (string, bool, error) { called = true; gotVal = val; return "xyz", false, nil }}
+	m, _ := upd(t, New(deps), dataMsg{risk: riskWithPosture()})
+	m = navDown(t, m, 4) // perp_dexs (has "xyz")
+	m, _ = upd(t, m, rk('e'))
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // empty + enter
+	if m.phase != confirming {
+		t.Fatalf("empty list edit should confirm (clear), phase=%d", m.phase)
+	}
+	_, cmd := upd(t, m, rk('y'))
+	cmd()
+	if !called || gotVal != "" {
+		t.Fatalf("clear should call SetCap with empty, called=%v val=%q", called, gotVal)
+	}
+}
+
+// A numeric cap still cancels on empty+enter (regression guard for the split path).
+func TestNumericCapEmptyCancels(t *testing.T) {
+	called := false
+	deps := Deps{SetCap: func(key, val string) (string, bool, error) { called = true; return "", true, nil }}
+	m, _ := upd(t, New(deps), dataMsg{risk: riskWithPosture()}) // sel=0 = a cap
+	m, _ = upd(t, m, rk('e'))
+	m, _ = upd(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // empty + enter
+	if m.phase != browsing {
+		t.Fatalf("empty numeric edit should cancel to browsing, phase=%d", m.phase)
+	}
+	if called {
+		t.Error("cancel must not call SetCap")
+	}
+}
+
+// The posture section renders (on/off + list) and its confirm is a plain change,
+// not the loud risk-cap warning.
+func TestPostureRenders(t *testing.T) {
+	m, _ := upd(t, New(Deps{}), tea.WindowSizeMsg{Width: 90, Height: 40})
+	m, _ = upd(t, m, dataMsg{risk: riskWithPosture(), pf: &core.PortfolioView{AccountValue: "1000"}})
+	v := m.View()
+	if !strings.Contains(v, "POSTURE") || !strings.Contains(v, "Outcome markets") {
+		t.Fatalf("posture section not rendered:\n%s", v)
+	}
+	// Confirm on a posture bool must NOT say "risk cap changed".
+	m = navDown(t, m, 2)
+	m, _ = upd(t, m, rk('e')) // -> confirming
+	cv := m.View()
+	if strings.Contains(cv, "risk cap changed") || !strings.Contains(cv, "change posture") {
+		t.Fatalf("posture confirm should be plain, got:\n%s", cv)
+	}
+}

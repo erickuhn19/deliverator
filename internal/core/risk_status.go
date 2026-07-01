@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"strconv"
+	"strings"
 
 	"github.com/erickuhn19/deliverator/internal/config"
 )
@@ -20,20 +21,32 @@ type RiskCap struct {
 	UtilPct *float64 `json:"util_pct,omitempty"` // Current/Value*100, when both known and active
 }
 
+// PostureSetting is one operator-owned capability/permission toggle — what the
+// agent is ALLOWED to trade, as distinct from the numeric risk caps that bound how
+// MUCH. Editable in the console (and via `config set`); not a safety cap, so a
+// change fires a plain confirm, not the loud risk-cap warning.
+type PostureSetting struct {
+	Key   string `json:"key"`   // dotted config key, e.g. "automation.limit_only"
+	Label string `json:"label"` // human label
+	Type  string `json:"type"`  // "bool" | "list"
+	Value string `json:"value"` // "true"/"false" for bool; comma-joined for list ("" = unset)
+}
+
 // RiskView is the operator's risk-envelope snapshot: live equity, every cap with
 // utilization, and the persisted drawdown/daily-loss trajectory. READ-ONLY — it
 // never moves the high-water/anchor the agent's gates depend on. Powers both
 // `deliverator risk` (machine-readable, agent-readable) and the console TUI.
 type RiskView struct {
-	Equity         string    `json:"equity"`
-	Caps           []RiskCap `json:"caps"`
-	PeakEquity     string    `json:"peak_equity"`
-	DrawdownPct    float64   `json:"drawdown_pct"`
-	DayAnchor      string    `json:"day_anchor_equity"`
-	DailyLossUSD   float64   `json:"daily_loss_usd"`
-	DailyLossPct   float64   `json:"daily_loss_pct"`
-	RiskStateFound bool      `json:"risk_state_found"`
-	Halted         bool      `json:"halted"`
+	Equity         string           `json:"equity"`
+	Caps           []RiskCap        `json:"caps"`
+	Posture        []PostureSetting `json:"posture"`
+	PeakEquity     string           `json:"peak_equity"`
+	DrawdownPct    float64          `json:"drawdown_pct"`
+	DayAnchor      string           `json:"day_anchor_equity"`
+	DailyLossUSD   float64          `json:"daily_loss_usd"`
+	DailyLossPct   float64          `json:"daily_loss_pct"`
+	RiskStateFound bool             `json:"risk_state_found"`
+	Halted         bool             `json:"halted"`
 }
 
 // RiskStatus reports the configured risk envelope + live utilization. READ-ONLY:
@@ -71,9 +84,17 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 	// `risk` after a `config set`) must reflect edits to config.toml. The client's
 	// c.cfg is only the startup load. Falls back to the snapshot if there's no file.
 	r := c.cfg.Risk
+	outcomes := c.cfg.Outcomes
+	limitOnly := c.cfg.Automation.LimitOnly
+	allowedCoins := c.cfg.Automation.AllowedCoins
+	perpDexs := c.cfg.PerpDexs
 	if p := c.cfg.SourcePath(); p != "" {
 		if fresh, ferr := config.Load(p); ferr == nil {
 			r = fresh.Risk
+			outcomes = fresh.Outcomes
+			limitOnly = fresh.Automation.LimitOnly
+			allowedCoins = fresh.Automation.AllowedCoins
+			perpDexs = fresh.PerpDexs
 		}
 	}
 
@@ -107,9 +128,19 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 		{Key: "risk.dead_man_switch_secs", Label: "Dead-man's switch", Unit: "secs", Value: strconv.Itoa(r.DeadManSwitchSecs), Active: r.DeadManSwitchSecs > 0},
 		{Key: "risk.max_priority_bps", Label: "Max priority fee", Unit: "bps", Value: strconv.Itoa(r.MaxPriorityBps), Active: r.MaxPriorityBps > 0},
 	}
+	// Operator-owned trading posture: WHAT the agent may trade (capabilities +
+	// permissions), distinct from the caps above that bound HOW MUCH. Editable in the
+	// console; a change is a plain confirm, not the loud risk-cap warning.
+	posture := []PostureSetting{
+		{Key: "outcomes", Label: "Outcome markets", Type: "bool", Value: strconv.FormatBool(outcomes)},
+		{Key: "automation.limit_only", Label: "Limit-only orders", Type: "bool", Value: strconv.FormatBool(limitOnly)},
+		{Key: "automation.allowed_coins", Label: "Allowed coins", Type: "list", Value: strings.Join(allowedCoins, ",")},
+		{Key: "perp_dexs", Label: "Sub-dexes (HIP-3)", Type: "list", Value: strings.Join(perpDexs, ",")},
+	}
 	return &RiskView{
 		Equity:         f2s(equity),
 		Caps:           caps,
+		Posture:        posture,
 		PeakEquity:     f2s(st.PeakEquity),
 		DrawdownPct:    ddPct,
 		DayAnchor:      f2s(st.DayAnchorEquity),

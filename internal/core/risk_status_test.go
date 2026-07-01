@@ -217,3 +217,54 @@ func TestReadRiskStateStaleBasisResets(t *testing.T) {
 		t.Errorf("stale-basis state must read as fresh (found=false, dd=0); got found=%v dd=%v", found, dd)
 	}
 }
+
+func postureByKey(ps []PostureSetting, key string) (PostureSetting, bool) {
+	for _, p := range ps {
+		if p.Key == key {
+			return p, true
+		}
+	}
+	return PostureSetting{}, false
+}
+
+// RiskStatus surfaces the operator-owned trading posture (capabilities +
+// permissions) alongside the numeric caps, with the right bool/list typing.
+func TestRiskStatusPosture(t *testing.T) {
+	testHome(t)
+	cfg := config.Default()
+	cfg.Outcomes = true
+	cfg.Automation.LimitOnly = true
+	cfg.Automation.AllowedCoins = []string{"BTC", "ETH"}
+	cfg.PerpDexs = []string{"xyz"}
+	c, ctx := newTestClient(t, cfg, Options{}, infoMap(map[string]string{
+		"clearinghouseState":     `{"marginSummary":{"accountValue":"5000"},"assetPositions":[]}`,
+		"frontendOpenOrders":     `[]`,
+		"spotClearinghouseState": `{"balances":[]}`,
+	}))
+	rv, err := c.RiskStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"outcomes":                 "true",
+		"automation.limit_only":    "true",
+		"automation.allowed_coins": "BTC,ETH",
+		"perp_dexs":                "xyz",
+	}
+	for k, v := range want {
+		p, ok := postureByKey(rv.Posture, k)
+		if !ok {
+			t.Errorf("posture %q missing", k)
+			continue
+		}
+		if p.Value != v {
+			t.Errorf("posture %s = %q, want %q", k, p.Value, v)
+		}
+	}
+	if p, _ := postureByKey(rv.Posture, "outcomes"); p.Type != "bool" {
+		t.Errorf("outcomes type=%q want bool", p.Type)
+	}
+	if p, _ := postureByKey(rv.Posture, "perp_dexs"); p.Type != "list" {
+		t.Errorf("perp_dexs type=%q want list", p.Type)
+	}
+}

@@ -99,35 +99,84 @@ func (m Model) renderRisk() string {
 		b.WriteString(cDim.Render("  loading…"))
 		return b.String()
 	}
-	for i, rc := range m.risk.Caps {
-		name := fmt.Sprintf("%-22s", rc.Label)
-		if i == m.sel {
-			name = cSel.Render(name)
+	idx := 0
+	for _, rc := range m.risk.Caps {
+		b.WriteString(m.renderCapRow(rc, idx))
+		idx++
+	}
+	if len(m.risk.Posture) > 0 {
+		b.WriteString(cHdr.Render("  POSTURE") + cDim.Render("  — what the agent may trade") + "\n")
+		for _, p := range m.risk.Posture {
+			b.WriteString(m.renderPostureRow(p, idx))
+			idx++
 		}
-		val := fmt.Sprintf("%9s %-4s", rc.Value, rc.Unit)
-		cur, util := "", ""
-		if rc.Current != nil {
-			cur = "cur " + fmtNum(*rc.Current, rc.Unit)
-			if rc.UtilPct != nil {
-				util = utilCell(*rc.UtilPct)
-			}
-		} else if !rc.Active {
-			cur = cDim.Render("off")
-		}
-		prefix := "  "
-		if i == m.sel {
-			prefix = "› "
-		}
-		b.WriteString(fmt.Sprintf("%s%s %s  %-18s %s\n", prefix, name, val, cur, util))
 	}
 	switch m.phase {
 	case typing:
 		b.WriteString("\n" + cWarn.Render("edit "+m.curKey()+" = ") + m.input.View() + cDim.Render("   (enter to review · esc cancel)"))
 	case confirming:
-		b.WriteString("\n" + cDanger.Render(fmt.Sprintf("risk cap changed: %s %s → %s", m.curKey(), m.curVal(), strings.TrimSpace(m.input.Value()))))
-		b.WriteString("\n" + cWarn.Render("Deliverator does NOT block this. Press y to confirm the account operator approved this change; any other key cancels."))
+		newVal := strings.TrimSpace(m.input.Value())
+		if strings.HasPrefix(m.curKey(), "risk.") {
+			b.WriteString("\n" + cDanger.Render(fmt.Sprintf("risk cap changed: %s %s → %s", m.curKey(), m.curVal(), newVal)))
+			b.WriteString("\n" + cWarn.Render("Deliverator does NOT block this. Press y to confirm the account operator approved this change; any other key cancels."))
+		} else {
+			b.WriteString("\n" + cWarn.Render(fmt.Sprintf("change posture: %s  %s → %s", m.curKey(), m.curVal(), newVal)))
+			b.WriteString("\n" + cDim.Render("Press y to confirm; any other key cancels."))
+		}
 	}
 	return b.String()
+}
+
+// renderCapRow renders one risk cap: label, configured value+unit, live current
+// value, and a utilization bar when the cap is measurable.
+func (m Model) renderCapRow(rc core.RiskCap, i int) string {
+	name := fmt.Sprintf("%-22s", rc.Label)
+	prefix := "  "
+	if i == m.sel {
+		name = cSel.Render(name)
+		prefix = "› "
+	}
+	val := fmt.Sprintf("%9s %-4s", rc.Value, rc.Unit)
+	cur, util := "", ""
+	if rc.Current != nil {
+		cur = "cur " + fmtNum(*rc.Current, rc.Unit)
+		if rc.UtilPct != nil {
+			util = utilCell(*rc.UtilPct)
+		}
+	} else if !rc.Active {
+		cur = cDim.Render("off")
+	}
+	return fmt.Sprintf("%s%s %s  %-18s %s\n", prefix, name, val, cur, util)
+}
+
+// renderPostureRow renders one posture setting: booleans as on/off, lists as their
+// comma-joined value (or a dim placeholder that reflects the empty-list semantics).
+func (m Model) renderPostureRow(p core.PostureSetting, i int) string {
+	name := fmt.Sprintf("%-22s", p.Label)
+	prefix := "  "
+	if i == m.sel {
+		name = cSel.Render(name)
+		prefix = "› "
+	}
+	var val string
+	switch p.Type {
+	case "bool":
+		if strings.EqualFold(strings.TrimSpace(p.Value), "true") {
+			val = cOK.Render("on")
+		} else {
+			val = cDim.Render("off")
+		}
+	default: // list
+		switch {
+		case strings.TrimSpace(p.Value) != "":
+			val = truncate(p.Value, 34)
+		case p.Key == "automation.allowed_coins":
+			val = cDim.Render("(all coins)")
+		default:
+			val = cDim.Render("(none)")
+		}
+	}
+	return fmt.Sprintf("%s%s %s\n", prefix, name, val)
 }
 
 func (m Model) renderAccount() string {
@@ -226,17 +275,29 @@ func (m Model) renderStatus() string {
 // ----- small formatters -----
 
 func (m Model) curKey() string {
-	if m.risk != nil && m.sel >= 0 && m.sel < len(m.risk.Caps) {
-		return m.risk.Caps[m.sel].Key
+	if m.editKey != "" {
+		return m.editKey
+	}
+	if row, ok := m.rowAt(m.sel); ok {
+		return row.key
 	}
 	return ""
 }
 
 func (m Model) curVal() string {
-	if m.risk != nil && m.sel >= 0 && m.sel < len(m.risk.Caps) {
-		return m.risk.Caps[m.sel].Value
+	if row, ok := m.rowAt(m.sel); ok {
+		return row.value
 	}
 	return ""
+}
+
+// listOrNone renders a comma-joined list value for a placeholder, showing "none"
+// when empty so the current state reads clearly.
+func listOrNone(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "none"
+	}
+	return v
 }
 
 func fmtNum(v float64, unit string) string {
