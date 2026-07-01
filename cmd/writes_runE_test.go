@@ -316,8 +316,23 @@ func TestWriteConfigTemplate(t *testing.T) {
 	if fi.Mode().Perm() != 0o600 {
 		t.Errorf("template mode = %v, want 0600", fi.Mode().Perm())
 	}
-	if _, err := config.Load(config.Path()); err != nil {
+	loaded, err := config.Load(config.Path())
+	if err != nil {
 		t.Fatalf("template must be a valid loadable config: %v", err)
+	}
+	// Shipped defaults (opinionated onboarding): mainnet, xyz sub-dex, outcomes on,
+	// limit-only on. Locked here so a future template edit can't silently drop them.
+	if loaded.Network != config.NetworkMainnet {
+		t.Errorf("shipped network = %q, want mainnet", loaded.Network)
+	}
+	if !loaded.Outcomes {
+		t.Error("shipped default should enable outcomes")
+	}
+	if len(loaded.PerpDexs) != 1 || loaded.PerpDexs[0] != "xyz" {
+		t.Errorf("shipped perp_dexs = %v, want [xyz]", loaded.PerpDexs)
+	}
+	if !loaded.Automation.LimitOnly {
+		t.Error("shipped default should enable limit_only")
 	}
 }
 

@@ -13,8 +13,9 @@ var riskCmd = &cobra.Command{
 	Short: "Show the risk envelope + live utilization (operator-owned)",
 	Long: `Report the configured risk caps and how much of each is currently in use
 (net exposure, account leverage, per-coin concentration, open positions, drawdown,
-daily loss), against live equity. Read-only — it never moves the drawdown/daily-loss
-anchors the agent's gates depend on.
+daily loss), against live equity, plus the trading posture (what the agent may trade:
+outcome markets, limit-only, allowed coins, sub-dexes). Read-only — it never moves the
+drawdown/daily-loss anchors the agent's gates depend on.
 
 The risk envelope is the operator's domain: the agent trades within it and may widen
 a cap only loudly (` + "`config set risk.*`" + ` warns), never silently. This command is

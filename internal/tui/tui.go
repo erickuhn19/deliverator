@@ -88,9 +88,10 @@ type Model struct {
 	feed      []string            // formatted feed lines, ring-buffered (oldest first)
 	feedSince int64               // high-water ts (ms) for incremental ReadSince
 
-	sel   int // selected cap row (only risk caps are selectable/editable)
-	phase editPhase
-	input textinput.Model
+	sel     int    // selected editable row (caps + posture, flat index into rows())
+	editKey string // config key being edited (set on entering typing/confirming)
+	phase   editPhase
+	input   textinput.Model
 
 	status      string // last status / operator-approved warning line
 	lastErr     string
@@ -189,11 +190,57 @@ func (m Model) setCapCmd(key, val string) tea.Cmd {
 	}
 }
 
-func (m *Model) selectableCaps() []core.RiskCap {
+// editRow is one selectable/editable row in the console — a risk cap OR a posture
+// setting, flattened so the operator navigates and edits them uniformly. kind
+// drives the edit UX: "num"/"list" take free text, "bool" flips with a confirm.
+type editRow struct {
+	key, label, value, kind string // kind: "num" | "bool" | "list"
+}
+
+// rows is the flat, ordered list the operator navigates: every risk cap (as "num")
+// followed by every posture setting (bool/list). m.sel indexes into this.
+func (m Model) rows() []editRow {
 	if m.risk == nil {
 		return nil
 	}
-	return m.risk.Caps
+	rs := make([]editRow, 0, len(m.risk.Caps)+len(m.risk.Posture))
+	for _, c := range m.risk.Caps {
+		rs = append(rs, editRow{key: c.Key, label: c.Label, value: c.Value, kind: "num"})
+	}
+	for _, p := range m.risk.Posture {
+		rs = append(rs, editRow{key: p.Key, label: p.Label, value: p.Value, kind: p.Type})
+	}
+	return rs
+}
+
+func (m Model) rowAt(i int) (editRow, bool) {
+	rs := m.rows()
+	if i < 0 || i >= len(rs) {
+		return editRow{}, false
+	}
+	return rs[i], true
+}
+
+// flipBool returns the opposite boolean string ("true"⇄"false"), defaulting a
+// non-/empty value to "true" (enabling is the common intent).
+func flipBool(v string) string {
+	if strings.EqualFold(strings.TrimSpace(v), "true") {
+		return "false"
+	}
+	return "true"
+}
+
+// nextValue returns the value a flip-and-confirm edit will apply: the boolean
+// opposite for "bool" rows, and the other network for the "network" enum
+// (mainnet⇄testnet). Any other enum falls back to a boolean flip.
+func nextValue(row editRow) string {
+	if row.kind == "enum" && row.key == "network" {
+		if strings.EqualFold(strings.TrimSpace(row.value), "mainnet") {
+			return "testnet"
+		}
+		return "mainnet"
+	}
+	return flipBool(row.value)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -212,8 +259,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastRefresh = time.Now()
 		if msg.risk != nil {
 			m.risk = msg.risk
-			if m.sel >= len(m.risk.Caps) {
-				m.sel = len(m.risk.Caps) - 1
+			if n := len(m.rows()); m.sel >= n {
+				m.sel = n - 1
+			}
+			if m.sel < 0 {
+				m.sel = 0
 			}
 		}
 		if msg.pf != nil {
@@ -255,9 +305,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = ""
 		} else {
 			m.lastErr = ""
-			if msg.isRiskCap {
+			switch {
+			case msg.isRiskCap:
 				m.status = fmt.Sprintf("risk cap changed: %s %s → %s — confirm the account operator approved this safety-limit change.", msg.key, msg.old, msg.val)
-			} else {
+			case msg.key == "network":
+				m.status = fmt.Sprintf("network → %s — restart the console/agent to apply (this session stays on %s).", msg.val, msg.old)
+			default:
 				m.status = fmt.Sprintf("set %s = %s", msg.key, msg.val)
 			}
 			return m, m.refreshCmd() // reflect the persisted value
@@ -287,7 +340,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			val := strings.TrimSpace(m.input.Value())
-			if val == "" {
+			// Empty cancels a numeric edit (a cap can't be blank), but empty is a valid
+			// clear for a list (allow-all coins / no sub-dex) — proceed to confirm.
+			row, _ := m.rowAt(m.sel)
+			if val == "" && row.kind != "list" {
 				m.phase = browsing
 				m.input.Blur()
 				return m, nil
@@ -302,12 +358,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case confirming:
 		switch msg.String() {
 		case "y", "Y":
-			caps := m.selectableCaps()
-			if m.sel < 0 || m.sel >= len(caps) {
+			if m.editKey == "" {
 				m.phase = browsing
 				return m, nil
 			}
-			key := caps[m.sel].Key
+			key := m.editKey
 			val := strings.TrimSpace(m.input.Value())
 			m.phase = browsing
 			m.input.Blur()
@@ -332,22 +387,35 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "down", "j":
-			if n := len(m.selectableCaps()); m.sel < n-1 {
+			if n := len(m.rows()); m.sel < n-1 {
 				m.sel++
 			}
 			return m, nil
 		case "e", "enter":
-			caps := m.selectableCaps()
-			if m.sel >= 0 && m.sel < len(caps) {
-				// Empty input + the current value as placeholder, so typing REPLACES
-				// (rather than appending to a pre-filled value). Empty + enter = cancel.
-				m.input.SetValue("")
-				m.input.Placeholder = "new value (current " + caps[m.sel].Value + ")"
-				m.input.Focus()
-				m.phase = typing
-				m.lastErr = ""
-				m.status = ""
+			row, ok := m.rowAt(m.sel)
+			if !ok {
+				return m, nil
 			}
+			m.editKey = row.key
+			m.lastErr = ""
+			m.status = ""
+			if row.kind == "bool" || row.kind == "enum" {
+				// Boolean / two-value enum (e.g. network): flip the value and go straight
+				// to confirm — no free text to type, just approve the toggle.
+				m.input.SetValue(nextValue(row))
+				m.phase = confirming
+				return m, nil
+			}
+			// Empty input + the current value as placeholder, so typing REPLACES
+			// (rather than appending). Numeric: empty+enter cancels; list: empty clears.
+			m.input.SetValue("")
+			if row.kind == "list" {
+				m.input.Placeholder = listEditHint(row) + " (current " + listOrNone(row.value) + ")"
+			} else {
+				m.input.Placeholder = "new value (current " + row.value + ")"
+			}
+			m.input.Focus()
+			m.phase = typing
 			return m, nil
 		}
 	}

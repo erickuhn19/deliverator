@@ -60,7 +60,9 @@ type Config struct {
 	Endpoints  Endpoints         `toml:"endpoints"`
 	// PerpDexs opts into builder-deployed sub-dex perps (HIP-3), e.g. ["xyz"] to
 	// trade xyz:BRENTOIL. Each named dex's universe is loaded and its coins become
-	// tradable as "<dex>:<coin>". Empty (default) = main perp dex + spot only.
+	// tradable as "<dex>:<coin>". The wildcard ["all"] (or ["*"]) opts into every
+	// sub-dex live on the network, resolved dynamically at load. Empty (default) =
+	// main perp dex + spot only.
 	PerpDexs []string `toml:"perp_dexs,omitempty"`
 	// Outcomes opts into HIP-4 outcome (prediction) markets. When true, the live
 	// outcome universe is loaded each init and its binary Yes/No legs become tradable
@@ -182,7 +184,7 @@ type Endpoints struct {
 // TOML file on top of this, so any key absent from the file keeps its default.
 func Default() *Config {
 	return &Config{
-		Network: NetworkTestnet, // testnet-first by design (§15)
+		Network: NetworkTestnet, // neutral safe fallback; `config init` writes the opinionated shipped defaults (mainnet, xyz sub-dex, outcomes, limit-only)
 		Builder: Builder{
 			Address:      DefaultBuilderAddress,
 			FeeTenthsBps: DefaultBuilderFeeTenthsBps, // 0.05%; only charged after the one-time master approveBuilderFee (graceful attach)
