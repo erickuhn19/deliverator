@@ -102,3 +102,19 @@ func TestSetCapGuarded(t *testing.T) {
 		t.Errorf("rejected edit must not persist; got %d", reloaded2.Risk.MaxLeverage)
 	}
 }
+
+func TestSetConfigKeyOutcomes(t *testing.T) {
+	cfg := config.Default()
+	if err := setConfigKey(cfg, "outcomes", "true"); err != nil {
+		t.Fatalf("set outcomes: %v", err)
+	}
+	if !cfg.Outcomes {
+		t.Error("outcomes should be true after set")
+	}
+	if err := setConfigKey(cfg, "outcomes", "false"); err != nil || cfg.Outcomes {
+		t.Errorf("outcomes=false: err=%v val=%v", err, cfg.Outcomes)
+	}
+	if err := setConfigKey(config.Default(), "outcomes", "notabool"); err == nil {
+		t.Error("a non-bool must be rejected")
+	}
+}

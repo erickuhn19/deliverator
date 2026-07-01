@@ -436,6 +436,12 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 			}
 			cfg.PerpDexs = parts
 		}
+	case "outcomes":
+		b, err := strconv.ParseBool(val)
+		if err != nil {
+			return err
+		}
+		cfg.Outcomes = b
 	default:
 		return fmt.Errorf("unknown or unsettable key %q", key)
 	}
