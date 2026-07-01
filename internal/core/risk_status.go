@@ -28,8 +28,8 @@ type RiskCap struct {
 type PostureSetting struct {
 	Key   string `json:"key"`   // dotted config key, e.g. "automation.limit_only"
 	Label string `json:"label"` // human label
-	Type  string `json:"type"`  // "bool" | "list"
-	Value string `json:"value"` // "true"/"false" for bool; comma-joined for list ("" = unset)
+	Type  string `json:"type"`  // "bool" | "list" | "enum"
+	Value string `json:"value"` // "true"/"false" for bool; comma-joined for list ("" = unset); the value for enum (e.g. "mainnet")
 }
 
 // RiskView is the operator's risk-envelope snapshot: live equity, every cap with
@@ -84,6 +84,7 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 	// `risk` after a `config set`) must reflect edits to config.toml. The client's
 	// c.cfg is only the startup load. Falls back to the snapshot if there's no file.
 	r := c.cfg.Risk
+	network := c.cfg.Network
 	outcomes := c.cfg.Outcomes
 	limitOnly := c.cfg.Automation.LimitOnly
 	allowedCoins := c.cfg.Automation.AllowedCoins
@@ -91,6 +92,7 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 	if p := c.cfg.SourcePath(); p != "" {
 		if fresh, ferr := config.Load(p); ferr == nil {
 			r = fresh.Risk
+			network = fresh.Network
 			outcomes = fresh.Outcomes
 			limitOnly = fresh.Automation.LimitOnly
 			allowedCoins = fresh.Automation.AllowedCoins
@@ -132,6 +134,7 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 	// permissions), distinct from the caps above that bound HOW MUCH. Editable in the
 	// console; a change is a plain confirm, not the loud risk-cap warning.
 	posture := []PostureSetting{
+		{Key: "network", Label: "Network", Type: "enum", Value: network},
 		{Key: "outcomes", Label: "Outcome markets", Type: "bool", Value: strconv.FormatBool(outcomes)},
 		{Key: "automation.limit_only", Label: "Limit-only orders", Type: "bool", Value: strconv.FormatBool(limitOnly)},
 		{Key: "automation.allowed_coins", Label: "Allowed coins", Type: "list", Value: strings.Join(allowedCoins, ",")},

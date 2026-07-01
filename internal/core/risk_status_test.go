@@ -232,6 +232,7 @@ func postureByKey(ps []PostureSetting, key string) (PostureSetting, bool) {
 func TestRiskStatusPosture(t *testing.T) {
 	testHome(t)
 	cfg := config.Default()
+	cfg.Network = "testnet"
 	cfg.Outcomes = true
 	cfg.Automation.LimitOnly = true
 	cfg.Automation.AllowedCoins = []string{"BTC", "ETH"}
@@ -246,6 +247,7 @@ func TestRiskStatusPosture(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{
+		"network":                  "testnet",
 		"outcomes":                 "true",
 		"automation.limit_only":    "true",
 		"automation.allowed_coins": "BTC,ETH",
@@ -266,5 +268,8 @@ func TestRiskStatusPosture(t *testing.T) {
 	}
 	if p, _ := postureByKey(rv.Posture, "perp_dexs"); p.Type != "list" {
 		t.Errorf("perp_dexs type=%q want list", p.Type)
+	}
+	if p, _ := postureByKey(rv.Posture, "network"); p.Type != "enum" {
+		t.Errorf("network type=%q want enum", p.Type)
 	}
 }

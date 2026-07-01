@@ -105,7 +105,7 @@ func (m Model) renderRisk() string {
 		idx++
 	}
 	if len(m.risk.Posture) > 0 {
-		b.WriteString(cHdr.Render("  POSTURE") + cDim.Render("  — what the agent may trade") + "\n")
+		b.WriteString(cHdr.Render("  POSTURE") + cDim.Render("  — environment & what the agent may trade") + "\n")
 		for _, p := range m.risk.Posture {
 			b.WriteString(m.renderPostureRow(p, idx))
 			idx++
@@ -116,10 +116,14 @@ func (m Model) renderRisk() string {
 		b.WriteString("\n" + cWarn.Render("edit "+m.curKey()+" = ") + m.input.View() + cDim.Render("   (enter to review · esc cancel)"))
 	case confirming:
 		newVal := strings.TrimSpace(m.input.Value())
-		if strings.HasPrefix(m.curKey(), "risk.") {
+		switch {
+		case m.curKey() == "network":
+			b.WriteString("\n" + cDanger.Render(fmt.Sprintf("switch network: %s → %s", m.curVal(), newVal)))
+			b.WriteString("\n" + cWarn.Render("Changes the trading environment (mainnet = real funds). Restart the console/agent to apply. Press y to confirm; any other key cancels."))
+		case strings.HasPrefix(m.curKey(), "risk."):
 			b.WriteString("\n" + cDanger.Render(fmt.Sprintf("risk cap changed: %s %s → %s", m.curKey(), m.curVal(), newVal)))
 			b.WriteString("\n" + cWarn.Render("Deliverator does NOT block this. Press y to confirm the account operator approved this change; any other key cancels."))
-		} else {
+		default:
 			b.WriteString("\n" + cWarn.Render(fmt.Sprintf("change posture: %s  %s → %s", m.curKey(), m.curVal(), newVal)))
 			b.WriteString("\n" + cDim.Render("Press y to confirm; any other key cancels."))
 		}
@@ -160,6 +164,12 @@ func (m Model) renderPostureRow(p core.PostureSetting, i int) string {
 	}
 	var val string
 	switch p.Type {
+	case "enum": // network: mainnet (live/real) vs testnet
+		if strings.EqualFold(strings.TrimSpace(p.Value), "mainnet") {
+			val = cOK.Render("mainnet")
+		} else {
+			val = cWarn.Render(strings.TrimSpace(p.Value) + " (test)")
+		}
 	case "bool":
 		if strings.EqualFold(strings.TrimSpace(p.Value), "true") {
 			val = cOK.Render("on")

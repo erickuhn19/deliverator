@@ -184,7 +184,7 @@ type Endpoints struct {
 // TOML file on top of this, so any key absent from the file keeps its default.
 func Default() *Config {
 	return &Config{
-		Network: NetworkTestnet, // testnet-first by design (§15)
+		Network: NetworkTestnet, // neutral safe fallback; `config init` writes the opinionated shipped defaults (mainnet, xyz sub-dex, outcomes, limit-only)
 		Builder: Builder{
 			Address:      DefaultBuilderAddress,
 			FeeTenthsBps: DefaultBuilderFeeTenthsBps, // 0.05%; only charged after the one-time master approveBuilderFee (graceful attach)

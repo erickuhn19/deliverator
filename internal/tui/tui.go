@@ -230,6 +230,19 @@ func flipBool(v string) string {
 	return "true"
 }
 
+// nextValue returns the value a flip-and-confirm edit will apply: the boolean
+// opposite for "bool" rows, and the other network for the "network" enum
+// (mainnet⇄testnet). Any other enum falls back to a boolean flip.
+func nextValue(row editRow) string {
+	if row.kind == "enum" && row.key == "network" {
+		if strings.EqualFold(strings.TrimSpace(row.value), "mainnet") {
+			return "testnet"
+		}
+		return "mainnet"
+	}
+	return flipBool(row.value)
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -292,9 +305,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = ""
 		} else {
 			m.lastErr = ""
-			if msg.isRiskCap {
+			switch {
+			case msg.isRiskCap:
 				m.status = fmt.Sprintf("risk cap changed: %s %s → %s — confirm the account operator approved this safety-limit change.", msg.key, msg.old, msg.val)
-			} else {
+			case msg.key == "network":
+				m.status = fmt.Sprintf("network → %s — restart the console/agent to apply (this session stays on %s).", msg.val, msg.old)
+			default:
 				m.status = fmt.Sprintf("set %s = %s", msg.key, msg.val)
 			}
 			return m, m.refreshCmd() // reflect the persisted value
@@ -383,10 +399,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.editKey = row.key
 			m.lastErr = ""
 			m.status = ""
-			if row.kind == "bool" {
-				// Boolean posture: flip the value and go straight to confirm — no free
-				// text to type, just approve the toggle.
-				m.input.SetValue(flipBool(row.value))
+			if row.kind == "bool" || row.kind == "enum" {
+				// Boolean / two-value enum (e.g. network): flip the value and go straight
+				// to confirm — no free text to type, just approve the toggle.
+				m.input.SetValue(nextValue(row))
 				m.phase = confirming
 				return m, nil
 			}

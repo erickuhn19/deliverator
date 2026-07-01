@@ -445,3 +445,30 @@ func TestPostureWildcardRenders(t *testing.T) {
 		t.Errorf("perp_dexs edit hint should mention `all`, got %q", m.input.Placeholder)
 	}
 }
+
+// The network row is a two-value enum: `e` flips mainnet⇄testnet and goes straight
+// to a network-specific confirm; `y` applies the other network.
+func TestPostureNetworkEnumToggles(t *testing.T) {
+	var gotKey, gotVal string
+	deps := Deps{SetCap: func(key, val string) (string, bool, error) { gotKey, gotVal = key, val; return "testnet", false, nil }}
+	rv := riskWithPosture()
+	rv.Posture = append([]core.PostureSetting{{Key: "network", Label: "Network", Type: "enum", Value: "testnet"}}, rv.Posture...)
+	m, _ := upd(t, New(deps), tea.WindowSizeMsg{Width: 90, Height: 40})
+	m, _ = upd(t, m, dataMsg{risk: rv, pf: &core.PortfolioView{AccountValue: "1"}})
+	if v := m.View(); !strings.Contains(v, "testnet") {
+		t.Fatalf("network row should render its value:\n%s", v)
+	}
+	m = navDown(t, m, 2) // network is the first posture row, at index len(caps)=2
+	m, _ = upd(t, m, rk('e'))
+	if m.phase != confirming || m.editKey != "network" || m.input.Value() != "mainnet" {
+		t.Fatalf("network flip: phase=%d key=%q val=%q", m.phase, m.editKey, m.input.Value())
+	}
+	if cv := m.View(); !strings.Contains(cv, "switch network") {
+		t.Fatalf("network confirm should be network-specific:\n%s", cv)
+	}
+	_, cmd := upd(t, m, rk('y'))
+	cmd()
+	if gotKey != "network" || gotVal != "mainnet" {
+		t.Fatalf("SetCap key=%q val=%q, want network=mainnet", gotKey, gotVal)
+	}
+}
