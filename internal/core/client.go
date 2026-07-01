@@ -182,9 +182,41 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Client, error)
 	return c, nil
 }
 
+// isPerpDexWildcard reports whether a perp_dexs entry is the "opt into everything"
+// token — "all" or "*" (case-insensitive) — rather than a specific sub-dex name.
+func isPerpDexWildcard(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "all" || s == "*"
+}
+
+// expandPerpDexs resolves the configured perp_dexs list against the sub-dex names
+// available on the network. If the config contains the "all"/"*" wildcard, it becomes
+// every non-empty available name (index 0 = "" is the core dex, excluded), in network
+// order (deterministic). Otherwise the configured list is returned unchanged.
+func expandPerpDexs(configured, available []string) []string {
+	wild := false
+	for _, d := range configured {
+		if isPerpDexWildcard(d) {
+			wild = true
+			break
+		}
+	}
+	if !wild {
+		return configured
+	}
+	out := make([]string, 0, len(available))
+	for _, n := range available {
+		if strings.TrimSpace(n) != "" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // loadPerpDexs loads each configured builder sub-dex (HIP-3) and registers its
 // coins (as "<dex>:<coin>") into the meta store and the read Info, so they are
-// tradable and sign with the correct asset id.
+// tradable and sign with the correct asset id. The "all"/"*" wildcard opts into
+// every sub-dex live on the network (resolved from the fetched dex names).
 func (c *Client) loadPerpDexs(ctx context.Context) error {
 	if len(c.cfg.PerpDexs) == 0 {
 		return nil
@@ -193,6 +225,11 @@ func (c *Client) loadPerpDexs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Resolve the "all"/"*" wildcard in place so every downstream consumer (reads,
+	// writes, watch, risk view) sees the concrete sub-dex list with no special-casing.
+	// c.cfg is the client's own *config.Config and is never re-saved, so this in-memory
+	// expansion has no persistence side effect; the on-disk sentinel stays "all".
+	c.cfg.PerpDexs = expandPerpDexs(c.cfg.PerpDexs, names)
 	idxByName := make(map[string]int, len(names))
 	for i, n := range names {
 		if n != "" {

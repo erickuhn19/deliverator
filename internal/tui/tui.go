@@ -394,7 +394,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// (rather than appending). Numeric: empty+enter cancels; list: empty clears.
 			m.input.SetValue("")
 			if row.kind == "list" {
-				m.input.Placeholder = "comma-separated, empty clears (current " + listOrNone(row.value) + ")"
+				m.input.Placeholder = listEditHint(row) + " (current " + listOrNone(row.value) + ")"
 			} else {
 				m.input.Placeholder = "new value (current " + row.value + ")"
 			}

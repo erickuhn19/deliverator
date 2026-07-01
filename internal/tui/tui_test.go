@@ -423,3 +423,25 @@ func TestPostureRenders(t *testing.T) {
 		t.Fatalf("posture confirm should be plain, got:\n%s", cv)
 	}
 }
+
+// The perp_dexs "all" wildcard renders as a clear "All sub-dexes" (not the raw
+// token), and its edit hint points at `all` rather than the misleading "empty clears".
+func TestPostureWildcardRenders(t *testing.T) {
+	rv := riskWithPosture()
+	for i := range rv.Posture {
+		if rv.Posture[i].Key == "perp_dexs" {
+			rv.Posture[i].Value = "all"
+		}
+	}
+	m, _ := upd(t, New(Deps{}), tea.WindowSizeMsg{Width: 90, Height: 40})
+	m, _ = upd(t, m, dataMsg{risk: rv, pf: &core.PortfolioView{AccountValue: "1000"}})
+	if v := m.View(); !strings.Contains(v, "All sub-dexes") {
+		t.Fatalf("perp_dexs=all should render 'All sub-dexes':\n%s", v)
+	}
+	// Editing the perp_dexs row surfaces the `all` hint.
+	m = navDown(t, m, 4) // perp_dexs
+	m, _ = upd(t, m, rk('e'))
+	if !strings.Contains(m.input.Placeholder, "all") {
+		t.Errorf("perp_dexs edit hint should mention `all`, got %q", m.input.Placeholder)
+	}
+}

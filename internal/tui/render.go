@@ -167,8 +167,11 @@ func (m Model) renderPostureRow(p core.PostureSetting, i int) string {
 			val = cDim.Render("off")
 		}
 	default: // list
+		v := strings.TrimSpace(p.Value)
 		switch {
-		case strings.TrimSpace(p.Value) != "":
+		case p.Key == "perp_dexs" && isAllToken(v):
+			val = cOK.Render("All sub-dexes")
+		case v != "":
 			val = truncate(p.Value, 34)
 		case p.Key == "automation.allowed_coins":
 			val = cDim.Render("(all coins)")
@@ -298,6 +301,26 @@ func listOrNone(v string) string {
 		return "none"
 	}
 	return v
+}
+
+// isAllToken reports whether a list value is the "everything" wildcard ("all"/"*").
+func isAllToken(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v == "all" || v == "*"
+}
+
+// listEditHint tailors the edit placeholder to each list setting's semantics — the
+// key asymmetry being that empty means "all" for allowed_coins but "none" for
+// perp_dexs (which instead uses the `all` wildcard to mean everything).
+func listEditHint(row editRow) string {
+	switch row.key {
+	case "perp_dexs":
+		return "`all` for every sub-dex, or comma-separated names; empty = none"
+	case "automation.allowed_coins":
+		return "comma-separated; empty = all coins"
+	default:
+		return "comma-separated; empty clears"
+	}
 }
 
 func fmtNum(v float64, unit string) string {

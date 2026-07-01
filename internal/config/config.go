@@ -60,7 +60,9 @@ type Config struct {
 	Endpoints  Endpoints         `toml:"endpoints"`
 	// PerpDexs opts into builder-deployed sub-dex perps (HIP-3), e.g. ["xyz"] to
 	// trade xyz:BRENTOIL. Each named dex's universe is loaded and its coins become
-	// tradable as "<dex>:<coin>". Empty (default) = main perp dex + spot only.
+	// tradable as "<dex>:<coin>". The wildcard ["all"] (or ["*"]) opts into every
+	// sub-dex live on the network, resolved dynamically at load. Empty (default) =
+	// main perp dex + spot only.
 	PerpDexs []string `toml:"perp_dexs,omitempty"`
 	// Outcomes opts into HIP-4 outcome (prediction) markets. When true, the live
 	// outcome universe is loaded each init and its binary Yes/No legs become tradable
