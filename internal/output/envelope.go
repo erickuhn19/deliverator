@@ -24,6 +24,14 @@ type Envelope struct {
 	Error    *Error   `json:"error"`
 	Warnings []string `json:"warnings"`
 	Meta     Meta     `json:"meta"`
+	// Read-health fields (additive, schema v1; omitted when clean). A tolerant
+	// read still exits 0 on partial coverage, but it must be machine-visible:
+	// DegradedDexs names the HIP-3 sub-dexs whose state/orders could not be
+	// read this call (their positions/orders are MISSING from data, not gone);
+	// Truncated marks a paged history read that stopped at its safety cap with
+	// more rows available. Both always come with a matching warning.
+	DegradedDexs []string `json:"degraded_dexs,omitempty"`
+	Truncated    bool     `json:"truncated,omitempty"`
 }
 
 // Meta is the per-call context block (§5.1).
@@ -67,18 +75,23 @@ type Response struct {
 	Data     any
 	Warnings []string
 	Meta     Meta
+	// Read-health passthroughs (see Envelope.DegradedDexs / Truncated).
+	DegradedDexs []string
+	Truncated    bool
 }
 
 // Emit writes a success envelope (one JSON line in JSON mode).
 func Emit(r Response) {
 	render(Envelope{
-		Schema:   SchemaVersion,
-		OK:       true,
-		Ts:       Now(),
-		Cmd:      r.Cmd,
-		Data:     r.Data,
-		Warnings: r.Warnings,
-		Meta:     r.Meta,
+		Schema:       SchemaVersion,
+		OK:           true,
+		Ts:           Now(),
+		Cmd:          r.Cmd,
+		Data:         r.Data,
+		Warnings:     r.Warnings,
+		Meta:         r.Meta,
+		DegradedDexs: r.DegradedDexs,
+		Truncated:    r.Truncated,
 	})
 }
 

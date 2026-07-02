@@ -74,7 +74,7 @@ func TestSnapshotPartialFailureIsolated(t *testing.T) {
 		return 200, `{}`
 	}
 	c, ctx := newTestClient(t, config.Default(), Options{}, resp)
-	sv, warns, err := c.Snapshot(ctx, nil)
+	sv, rm, err := c.Snapshot(ctx, nil)
 	if err != nil {
 		t.Fatal(err) // a section failure must NOT be a top-level error
 	}
@@ -88,11 +88,14 @@ func TestSnapshotPartialFailureIsolated(t *testing.T) {
 		t.Fatalf("failed should be [limits], got %v", sv.Failed)
 	}
 	joined := ""
-	for _, w := range warns {
+	for _, w := range rm.EnvelopeWarnings() {
 		joined += w
 	}
 	if joined == "" {
 		t.Fatal("expected a top-level warning listing the failed section")
+	}
+	if len(rm.DegradedDexs) != 0 {
+		t.Fatalf("a failed limits section is not sub-dex degradation: %v", rm.DegradedDexs)
 	}
 }
 

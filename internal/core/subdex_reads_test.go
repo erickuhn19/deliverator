@@ -68,7 +68,7 @@ func TestSubDexPositionNormalizedAndFilterable(t *testing.T) {
 	cfg.PerpDexs = []string{"xyz"}
 	c, ctx := newTestClient(t, cfg, Options{}, subDexResp(t))
 
-	all, err := c.Positions(ctx, "")
+	all, _, err := c.Positions(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestSubDexPositionNormalizedAndFilterable(t *testing.T) {
 	}
 
 	// The canonical prefixed filter must find it (this was returning 0 before).
-	byPrefixed, err := c.Positions(ctx, "xyz:GOLD")
+	byPrefixed, _, err := c.Positions(ctx, "xyz:GOLD")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestSubDexPositionNormalizedAndFilterable(t *testing.T) {
 		t.Fatalf("positions --coin xyz:GOLD must find the sub-dex position, got %+v", byPrefixed)
 	}
 	// The bare filter must also find it (symmetric tolerance).
-	byBare, err := c.Positions(ctx, "GOLD")
+	byBare, _, err := c.Positions(ctx, "GOLD")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,11 +15,14 @@ var rCoins string // snapshot --coins
 // snapshotCmd is the unified one-moment read an agent calls once per tick instead
 // of chaining portfolio + limits + ctx + builder. Each section carries its own
 // ok/error; a partial failure is a top-level warning, not a failed command (#45).
+// runReadMeta (not runReadWarn) so a degraded embedded portfolio surfaces the
+// TOP-LEVEL degraded_dexs envelope field TOOLS.md promises — the tick loop keys
+// on it, and only seeing the copy nested in data.portfolio.data is a doc-drift trap.
 var snapshotCmd = &cobra.Command{
 	Use:   "snapshot",
 	Short: "Unified one-moment read: portfolio, limits, ctx[coins], builder status (one call)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runReadWarn("snapshot", func(ctx context.Context, c core.ClientAPI) (any, []string, error) {
+		return runReadMeta("snapshot", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
 			return c.Snapshot(ctx, splitCoins(rCoins))
 		})
 	},
@@ -64,7 +67,13 @@ var portfolioCmd = &cobra.Command{
 	Use:   "portfolio",
 	Short: "Full snapshot: positions, open orders, balances, margin, uPnL",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRead("portfolio", func(ctx context.Context, c core.ClientAPI) (any, error) { return c.Portfolio(ctx) })
+		return runReadMeta("portfolio", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
+			pf, err := c.Portfolio(ctx)
+			if err != nil {
+				return nil, core.ReadMeta{}, err
+			}
+			return pf, pf.ReadMeta(), nil
+		})
 	},
 }
 
@@ -72,7 +81,9 @@ var positionsCmd = &cobra.Command{
 	Use:   "positions",
 	Short: "Open perp positions",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRead("positions", func(ctx context.Context, c core.ClientAPI) (any, error) { return c.Positions(ctx, rCoin) })
+		return runReadMeta("positions", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
+			return c.Positions(ctx, rCoin)
+		})
 	},
 }
 
@@ -80,7 +91,9 @@ var ordersCmd = &cobra.Command{
 	Use:   "orders",
 	Short: "Resting open orders",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRead("orders", func(ctx context.Context, c core.ClientAPI) (any, error) { return c.Orders(ctx, rCoin) })
+		return runReadMeta("orders", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
+			return c.Orders(ctx, rCoin)
+		})
 	},
 }
 
@@ -88,7 +101,9 @@ var fillsCmd = &cobra.Command{
 	Use:   "fills",
 	Short: "Recent fills (incl. fee, builderFee, closedPnl)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRead("fills", func(ctx context.Context, c core.ClientAPI) (any, error) { return c.Fills(ctx, sincePtr(), rLimit) })
+		return runReadMeta("fills", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
+			return c.Fills(ctx, sincePtr(), rLimit)
+		})
 	},
 }
 
@@ -96,7 +111,9 @@ var fundingCmd = &cobra.Command{
 	Use:   "funding",
 	Short: "Funding payments",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRead("funding", func(ctx context.Context, c core.ClientAPI) (any, error) { return c.Funding(ctx, sincePtr()) })
+		return runReadMeta("funding", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
+			return c.Funding(ctx, sincePtr())
+		})
 	},
 }
 
@@ -104,7 +121,9 @@ var ledgerCmd = &cobra.Command{
 	Use:   "ledger",
 	Short: "Deposits/withdrawals/transfers (non-funding)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRead("ledger", func(ctx context.Context, c core.ClientAPI) (any, error) { return c.Ledger(ctx, sincePtr()) })
+		return runReadMeta("ledger", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
+			return c.Ledger(ctx, sincePtr())
+		})
 	},
 }
 
@@ -125,11 +144,12 @@ var pnlCmd = &cobra.Command{
 }
 
 // pnlAttributionCmd nets realized PnL − fees − builder fee + funding, per coin.
+// One window governs all components (default: the current UTC day).
 var pnlAttributionCmd = &cobra.Command{
 	Use:   "attribution",
-	Short: "Net session P&L by coin + source: realized, trading fees, builder fee, funding",
+	Short: "Net session P&L by coin + source: realized, trading fees, builder fee, funding (one window, default: current UTC day)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRead("pnl.attribution", func(ctx context.Context, c core.ClientAPI) (any, error) {
+		return runReadMeta("pnl.attribution", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
 			return c.PnlAttribution(ctx, sincePtr(), rCoin)
 		})
 	},
@@ -308,7 +328,7 @@ func init() {
 	candlesCmd.Flags().StringVar(&rInterval, "interval", "1m", "candle interval (1m,5m,1h,...)")
 	candlesCmd.Flags().Int64Var(&rSince, "since", 0, "since this unix-ms time (default 24h)")
 	pnlCmd.Flags().StringVar(&rWindow, "window", "7d", "time window (informational)")
-	pnlAttributionCmd.Flags().Int64Var(&rSince, "since", 0, "only fills/funding since this unix-ms time (default: all available)")
+	pnlAttributionCmd.Flags().Int64Var(&rSince, "since", 0, "window start (unix ms) applied to fills, fees AND funding (default: current UTC midnight)")
 	pnlAttributionCmd.Flags().StringVar(&rCoin, "coin", "", "filter by coin (e.g. BTC, xyz:GOLD)")
 	pnlCmd.AddCommand(pnlAttributionCmd)
 

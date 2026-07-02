@@ -18,10 +18,10 @@ func TestPnlAttribution(t *testing.T) {
 		`{"delta":{"coin":"ETH","fundingRate":"0.0001","size":"0.1","type":"funding","usdc":"-0.50"},"hash":"0x","time":2}` +
 		`]`
 	c, ctx := newTestClient(t, config.Default(), Options{}, infoMap(map[string]string{
-		"userFills":   fills,
-		"userFunding": funding,
+		"userFillsByTime": fills, // the default window is time-bounded (UTC day)
+		"userFunding":     funding,
 	}))
-	v, err := c.PnlAttribution(ctx, nil, "")
+	v, _, err := c.PnlAttribution(ctx, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,10 +46,10 @@ func TestPnlAttributionCoinFilter(t *testing.T) {
 	fills := `[{"coin":"BTC","px":"60000","sz":"0.01","side":"A","time":1,"oid":1,"hash":"0x","fee":"0.1","feeToken":"USDC","closedPnl":"10","startPosition":"0","dir":"Close","crossed":true,"tid":1},` +
 		`{"coin":"ETH","px":"2000","sz":"0.1","side":"A","time":1,"oid":2,"hash":"0x","fee":"0.1","feeToken":"USDC","closedPnl":"5","startPosition":"0","dir":"Close","crossed":true,"tid":2}]`
 	c, ctx := newTestClient(t, config.Default(), Options{}, infoMap(map[string]string{
-		"userFills":   fills,
-		"userFunding": `[]`,
+		"userFillsByTime": fills,
+		"userFunding":     `[]`,
 	}))
-	v, err := c.PnlAttribution(ctx, nil, "BTC")
+	v, _, err := c.PnlAttribution(ctx, nil, "BTC")
 	if err != nil {
 		t.Fatal(err)
 	}

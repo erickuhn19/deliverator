@@ -26,7 +26,7 @@ func TestOrdersSweepsSubDex(t *testing.T) {
 		return 200, "{}"
 	}
 	c, ctx := newTestClient(t, cfg, Options{}, resp)
-	orders, err := c.Orders(ctx, "")
+	orders, _, err := c.Orders(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestOrdersNoSubDexSingleRead(t *testing.T) {
 		return 200, "{}"
 	}
 	c, ctx := newTestClient(t, config.Default(), Options{}, resp) // PerpDexs empty
-	if _, err := c.Orders(ctx, ""); err != nil {
+	if _, _, err := c.Orders(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {

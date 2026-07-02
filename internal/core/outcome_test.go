@@ -226,7 +226,7 @@ func TestOutcomePositions(t *testing.T) {
 	c, ctx := newTestClient(t, config.Default(), Options{}, resp)
 	c.Meta().AddOutcomes(outcome641)
 
-	pos, err := c.Positions(ctx, "")
+	pos, _, err := c.Positions(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
