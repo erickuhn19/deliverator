@@ -74,6 +74,8 @@ func TestCopyExecuteTimeoutStopsCycle(t *testing.T) {
 		switch typ {
 		case "allMids":
 			return 200, `{"BTC":"64000","ETH":"3000"}`
+		case "frontendOpenOrders":
+			return 200, `[]` // the position cap counts resting orders (fail-closed read)
 		}
 		return 200, `{}`
 	}

@@ -81,12 +81,14 @@ func TestModifyBatchDryRun(t *testing.T) {
 	}
 }
 
-// A modify REPLACES a resting order, so re-pricing N same-coin orders must NOT
-// be summed against the position cap — exposure is unchanged. (10 × $60.10 would
-// breach a $500 cap if wrongly accumulated; each leg alone is fine.)
+// A modify REPLACES a resting order, so re-pricing N same-coin orders must not
+// count old + new together against the position cap. The book holds 10 × $60;
+// each leg's basis is the working book with its own old order swapped for the
+// replacement (~$601 worst case) — within a $650 cap. Double-counting the old
+// orders alongside the replacements (~$1200) would false-reject every leg.
 func TestModifyBatchSameCoinRepriceNotSummed(t *testing.T) {
 	cfg := config.Default()
-	cfg.Risk.MaxPositionNotionalUSD = 500
+	cfg.Risk.MaxPositionNotionalUSD = 650
 	parts := make([]string, 10)
 	reqs := make([]ModifyReq, 10)
 	statuses := make([]string, 10)

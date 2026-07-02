@@ -108,6 +108,8 @@ func TestOutcomePositionCapCountsHolding(t *testing.T) {
 			return 200, `{"balances":[{"coin":"+6410","total":"200","hold":"0","entryNtl":"40"}]}`
 		case "allMids":
 			return 200, `{"#6410":"0.25"}`
+		case "frontendOpenOrders":
+			return 200, `[]` // the position cap counts resting orders (fail-closed read)
 		}
 		return 200, `{}`
 	}

@@ -92,7 +92,10 @@ bad call can do is place a bad trade, never move funds.
   (not linked to one entry, unlike the bracket). Side is derived from the position
   (a long → SELL triggers); `--size` defaults to the full position. Reduce-only, so no
   portfolio gate / $10 floor applies; perp-only; works on `xyz:*` sub-dex coins.
-- Trigger order: `--trigger <PX> [--trigger-type tp|sl] [--trigger-market]`
+- Trigger order: `--trigger <PX> [--trigger-type tp|sl] [--trigger-market]`.
+  A `--trigger-market` order EXECUTES as a market order when it fires, so under
+  `automation.limit_only` it is blocked like any market order (exit 20) unless it
+  is an exit (`--reduce-only`); trigger-*limit* orders stay allowed.
 - Size by USD: `--notional <usd>` on `buy`/`sell`/`order` (and a `notional` field per batch leg) — Deliverator derives `size = notional / price` (the `--limit`, else the live mid), then rounds + risk-checks it. Omit the size argument; passing both a size and `--notional` is rejected.
 - Reduce only: add `--reduce-only`
 - TWAP (sliced over N minutes, min ~$50 / $10 per minute): `deliverator twap <COIN> <buy|sell> <SIZE> --minutes <N> --json`;
@@ -158,6 +161,17 @@ bad call can do is place a bad trade, never move funds.
 - Modify a resting order: `deliverator modify --cloid <ID> --limit <PX> [--size <SZ>] --json`
 - Modify many at once: `deliverator modify-batch --file modifies.json --json`
   (array of `{oid|cloid, size?, limit?}`; one signed action, atomic pre-flight).
+- **Modifies are risk-gated like new orders.** A modify that *grows* an order's
+  worst-case exposure (larger size, or a larger size×limit notional) runs the
+  full gauntlet — the per-coin caps **and** every account-wide portfolio gate —
+  evaluated with the old order **replaced** by the new one (it never
+  double-counts itself, so a routine re-price is not penalized; a batch applies
+  earlier legs' replacements before evaluating later ones). A modify that
+  shrinks or holds worst-case exposure is de-risking and is **exempt**: it
+  works even while a tripped drawdown/daily-loss gate is pausing new exposure,
+  and is never blocked by unreadable book state. Modifying a reduce-only order
+  stays exempt (it contributes zero either way). You cannot place a small
+  compliant order and modify it up past a cap.
 - Cancel: `deliverator cancel --cloid <ID> --json` · by lists: `--oids 1,2,3` / `--cloids 0x..,0x..`
   (one action) · all: `deliverator cancel --all [--coin <COIN>] --json`. A cancel of an
   already-gone order is reported in `data.failed[]`, not a hard error.
@@ -283,13 +297,19 @@ heartbeat lapse), `--action panic` actually flattens.
 - `deliverator panic --yes` cancels all orders, cancels running TWAPs, and flattens all positions (every dex). It **works during a global halt**: its flatten legs bypass the halt gate core-internally (there is no flag for it — a plain `close` or order under a halt still rejects exit 21). It then re-verifies: `complete:false` (and a non-zero exit) + a `degraded:[dex]` list mean the teardown could NOT be confirmed flat — re-run / inspect that dex.
 
 ## Account-wide risk gates (core-enforced, exit 20)
-Beyond the per-order caps, the operator may set **portfolio-level** gates that bound the whole book — you cannot bypass them by switching command. They evaluate the *resulting* book (current positions + this order); reduce-only/close orders are exempt, including a `batch`/`grid --reduce-only` whose **every** leg is reduce-only (one exposure-adding leg keeps the whole batch gated) — so you can always de-risk even while a tripped gate is pausing new exposure. A breach is exit 20 with a concrete message — **respect it, don't retry as-is** (reduce size or stop):
+Beyond the per-order caps, the operator may set **portfolio-level** gates that bound the whole book — you cannot bypass them by switching command. They evaluate the *resulting* book: current positions **plus your resting (unfilled) non-reduce-only orders, counted as worst-case future exposure** (an untriggered `--trigger` order counts too — it can fire), plus this order. You cannot ladder past a cap with sequential orders that each look small against the filled book; canceling resting orders frees headroom. Reduce-only/close orders are exempt — as are reduce-only *resting* orders (TP/SL), which count zero — including a `batch`/`grid --reduce-only` whose **every** leg is reduce-only (one exposure-adding leg keeps the whole batch gated) — so you can always de-risk even while a tripped gate is pausing new exposure. A breach is exit 20 with a concrete message — **respect it, don't retry as-is** (reduce size, cancel resting orders, or stop):
 - `risk.max_account_leverage` — resulting gross notional / equity.
-- `risk.max_net_exposure_usd` — resulting |long − short|.
+- `risk.max_net_exposure_usd` — resulting |long − short|, at the per-direction worst case: resting buys count toward the long side, resting sells toward the short side, and the larger direction is measured. A resting order can tighten this gate but never offset it — parking an opposite-side order does not free net headroom (pending orders fill independently, so the offset may never happen).
 - `risk.max_concentration_pct_per_coin` — one coin as a % of equity.
 - `risk.max_drawdown_pct` — pauses new exposure once equity falls that % below its high-water (persists until you recover or the operator resets it).
 - `risk.max_daily_loss_usd` / `_pct` — pauses new exposure after that much loss since the UTC-midnight anchor; resets at UTC midnight.
-- `risk.max_open_positions` — rejects opening a NEW coin once you already hold that many positions (adding to an existing one is fine).
+- `risk.max_open_positions` — rejects opening a NEW coin once you already hold that many positions (adding to an existing one is fine; a coin holding only a resting non-reduce-only order counts — it becomes a position on fill).
+
+The drawdown/daily-loss anchors are stored **per network+account**: a testnet peak never gates a mainnet account, and two accounts never share a daily anchor. The first gated write for a network+account anchors fresh at the current equity and emits a warning that the anchors were (re)initialized — surface it to the operator: fresh anchors measure nothing until they move (next UTC day / new peak).
+
+**Unreadable state fails closed, retryably (exit 40):** when a configured cap needs account state that cannot be read (position, resting orders, equity — e.g. a 429 burst or an API outage, including a silently-degraded HIP-3 sub-dex read), an exposure-**adding** order is rejected with a *retryable* network error — back off and retry; it is not a cap breach, so exit 20's "stop trying" rule does not apply. Reduce-only orders still pass on unreadable state (they carry reduce-only on the wire, so the exchange itself guarantees they only reduce), and so do exposure-shrinking modifies. This costs at most ONE extra open-orders info read (weight 20) per gated write — the per-coin cap and the portfolio gates share a single fetch (a modify's own resolve read doubles as it).
+
+These gates also apply to `modify`/`modify-batch` when the modify grows worst-case exposure — see **Managing** above; shrinking modifies stay exempt like reduce-only orders.
 
 These are the account's survival floor — when one trips, the loop should stop opening risk, not size around it.
 
