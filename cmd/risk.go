@@ -22,8 +22,14 @@ a cap only loudly (` + "`config set risk.*`" + ` warns), never silently. This co
 also the data source for ` + "`deliverator console`" + `.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRead("risk", func(ctx context.Context, c core.ClientAPI) (any, error) {
-			return c.RiskStatus(ctx)
+		return runReadMeta("risk", func(ctx context.Context, c core.ClientAPI) (any, core.ReadMeta, error) {
+			rv, err := c.RiskStatus(ctx)
+			if err != nil {
+				return nil, core.ReadMeta{}, err
+			}
+			// Surface the source portfolio's partial-read markers: utilization
+			// computed from an incomplete book must be loud, never silent.
+			return rv, core.ReadMeta{Degraded: rv.Degraded, DegradedDexs: rv.DegradedDexs}, nil
 		})
 	},
 }

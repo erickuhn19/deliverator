@@ -93,7 +93,7 @@ func TestPositionsSurfacesOutcomeHoldingLazily(t *testing.T) {
 	if c.Meta().OutcomeMeta() != nil {
 		t.Fatal("precondition: outcomes must start unloaded")
 	}
-	pos, err := c.Positions(ctx, "")
+	pos, _, err := c.Positions(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}

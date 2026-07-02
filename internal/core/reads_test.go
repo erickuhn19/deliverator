@@ -89,7 +89,7 @@ func TestPositionsAndBalance(t *testing.T) {
 		"clearinghouseState":     btcShort,
 		"spotClearinghouseState": `{"balances":[{"coin":"USDC","token":0,"total":"500","hold":"0","entryNtl":"0"}],"tokenToAvailableAfterMaintenance":[[0,"480"]]}`,
 	}))
-	pos, err := c.Positions(ctx, "")
+	pos, _, err := c.Positions(ctx, "")
 	if err != nil || len(pos) != 1 || pos[0].Side != "short" {
 		t.Fatalf("positions: %+v err=%v", pos, err)
 	}
@@ -138,7 +138,7 @@ func TestFillsAndPnl(t *testing.T) {
 		"userFills": fills,
 		"portfolio": `[["day",{"accountValueHistory":[[1,"100"],[2,"110"]],"pnlHistory":[[1,"0"],[2,"10"]],"vlm":"100"}]]`,
 	}))
-	f, err := c.Fills(ctx, nil, 1)
+	f, _, err := c.Fills(ctx, nil, 1)
 	if err != nil || len(f) != 1 || f[0].Time != 2 { // newest first, limited to 1
 		t.Fatalf("fills: %+v err=%v", f, err)
 	}

@@ -180,6 +180,15 @@ plus, on write failures, `cloids` — the client order id(s) the action was sign
 with (all legs for a batch/grid), even when auto-generated — so the retry
 protocol below is always runnable.
 
+Two optional read-health fields (additive, omitted when clean) mark a tolerant
+read that succeeded with **incomplete data**: `degraded_dexs: ["<dex>"]` — a
+HIP-3 sub-dex's state/orders were unreadable this call, so anything held there
+is *missing from the response, not gone* (never treat that absence as
+closed/flat; retry) — and `truncated: true` — a paged history read (`fills
+--since`, `funding`, `ledger`) stopped with more rows available (its safety
+cap, or a same-millisecond burst larger than one exchange page). Both always
+come with a matching warning.
+
 ### Exit codes
 | Code | Meaning | Agent action |
 |---|---|---|
@@ -211,6 +220,12 @@ is reserved for a definitive exchange rejection.
 The exchange can take ~1–2s to index a new order by cloid, so a status check
 immediately after a timeout may report "absent" for an order that actually
 landed. Wait briefly and re-check (or query by `--oid`) before resubmitting.
+
+`order status --cloid` only reports "absent" from a live open-orders sweep that
+read **every** dex successfully; if the sweep is degraded (e.g. a sub-dex 429)
+and the order isn't found on a readable dex, it returns a retryable exit 40
+(`order_status_unconfirmed`) instead of a confident answer — re-check when reads
+recover, don't resubmit.
 
 ---
 
@@ -305,7 +320,10 @@ Track (reads): `snapshot` (one-call tick: portfolio + limits + ctx[coins] + buil
 `info <type> [k=v]` (raw passthrough to any HL info endpoint)
 
 `positions`/`portfolio` also carry computed risk fields: `distance_to_liq_pct`
-per position, and account `maintenance_margin` + `margin_ratio`.
+per position, and account `maintenance_margin` + `margin_ratio` (divided by the
+equity that can actually back perp margin: the gates' unified-account equity on
+a unified account, the perp wallet(s) alone on a non-unified one — idle spot
+USDC cannot meet a perp margin call).
 
 Submit (writes):
 - Orders: `buy`/`sell`/`order` — market, limit, IOC (`--ioc`), post-only (`--alo`),

@@ -2,7 +2,7 @@ package cmd
 
 // RunE coverage for the write commands in writes.go (close, cancel, modify,
 // leverage, margin, twap[+status/cancel], position-tpsl, panic) plus sell/order
-// (which share runTrade with buy) and snapshot (runReadWarn). Uses the shared
+// (which share runTrade with buy) and snapshot (runReadMeta). Uses the shared
 // harness (withFakeClient/runCmd). All identifiers are prefixed `wr`; the
 // configurable wrFake embeds core.ClientAPI so only the methods a handler calls
 // are stubbed. No t.Parallel (the seam + flag globals are process-wide).
@@ -31,7 +31,7 @@ type wrFake struct {
 	panicFn    func() (*core.PanicResult, error)
 	placeFn    func(core.OrderReq) (*core.PlaceResult, []string, error)
 	bracketFn  func(core.BracketReq) ([]*core.PlaceResult, []string, error)
-	snapFn     func([]string) (*core.SnapshotView, []string, error)
+	snapFn     func([]string) (*core.SnapshotView, core.ReadMeta, error)
 }
 
 func (f wrFake) PlaceBracket(_ context.Context, r core.BracketReq) ([]*core.PlaceResult, []string, error) {
@@ -78,7 +78,7 @@ func (f wrFake) Place(_ context.Context, r core.OrderReq) (*core.PlaceResult, []
 	return f.placeFn(r)
 }
 
-func (f wrFake) Snapshot(_ context.Context, coins []string) (*core.SnapshotView, []string, error) {
+func (f wrFake) Snapshot(_ context.Context, coins []string) (*core.SnapshotView, core.ReadMeta, error) {
 	return f.snapFn(coins)
 }
 
@@ -338,11 +338,11 @@ func TestWriteConfigTemplate(t *testing.T) {
 	}
 }
 
-// snapshot exercises runReadWarn (read + top-level warnings).
+// snapshot exercises runReadMeta (read + read-health warnings).
 func TestSnapshotCmd(t *testing.T) {
 	wrResetGlobals(t)
-	withFakeClient(t, wrFake{snapFn: func([]string) (*core.SnapshotView, []string, error) {
-		return &core.SnapshotView{}, []string{"ctx: rate limited"}, nil
+	withFakeClient(t, wrFake{snapFn: func([]string) (*core.SnapshotView, core.ReadMeta, error) {
+		return &core.SnapshotView{}, core.ReadMeta{Notes: []string{"ctx: rate limited"}}, nil
 	}})
 	env, err := runCmd(t, snapshotCmd, nil)
 	if err != nil || !env.OK || env.Cmd != "snapshot" {

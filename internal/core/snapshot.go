@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 
+	hl "github.com/erickuhn19/deliverator/internal/hl"
+
 	"github.com/erickuhn19/deliverator/internal/output"
 )
 
@@ -58,13 +60,18 @@ type SnapshotView struct {
 // fetch ctx for; empty => auto-discover from the portfolio's positions + open
 // orders. Only a missing query address (a precondition for every read) returns a
 // top-level error; an individual section failure is captured in its Section.
-func (c *Client) Snapshot(ctx context.Context, coins []string) (*SnapshotView, []string, error) {
+// The returned ReadMeta carries the section warnings (Notes) PLUS the embedded
+// portfolio's degradation — so the snapshot envelope surfaces the top-level
+// degraded_dexs field on a partial read, exactly like `portfolio` itself: the
+// snapshot is the once-per-tick read agents act on, and an agent keying on
+// envelope.degraded_dexs (the documented protocol) must see it here too.
+func (c *Client) Snapshot(ctx context.Context, coins []string) (*SnapshotView, ReadMeta, error) {
+	var rm ReadMeta
 	if err := c.requireQueryAddr(); err != nil {
-		return nil, nil, err
+		return nil, rm, err
 	}
 	sv := &SnapshotView{Ctx: map[string]Section{}, Coins: []string{}}
 	var pf *PortfolioView
-	var warnings []string
 
 	// Phase 1: portfolio, limits, builder concurrently. Each writes its own struct
 	// field (disjoint addresses, no race); pf is read only after Wait.
@@ -105,6 +112,14 @@ func (c *Client) Snapshot(ctx context.Context, coins []string) (*SnapshotView, [
 	if !sv.BuilderStatus.OK {
 		sv.Failed = append(sv.Failed, "builder_status")
 	}
+	// A PARTIAL portfolio (unreadable sub-dex / spot state) is an ok section —
+	// tolerant read — but must be LOUD: the tick loop acts on these numbers
+	// (NEXT-2 item 1). Merging its ReadMeta hoists degraded/degraded_dexs to the
+	// snapshot's OWN envelope (top-level field + PARTIAL DATA warning); the
+	// section data still carries the nested copy.
+	if pf != nil {
+		rm.merge(pf.ReadMeta())
+	}
 
 	// Phase 2: resolve the ctx coin set (needs the portfolio result), then fan out.
 	resolved := dedupSortCoins(coins)
@@ -113,37 +128,20 @@ func (c *Client) Snapshot(ctx context.Context, coins []string) (*SnapshotView, [
 		case sv.Portfolio.OK && pf != nil:
 			resolved = dedupSortCoins(discoverCtxCoins(pf))
 			if len(resolved) > 0 {
-				warnings = append(warnings, "ctx coins auto-discovered from positions+orders: "+strings.Join(resolved, ","))
+				rm.Notes = append(rm.Notes, "ctx coins auto-discovered from positions+orders: "+strings.Join(resolved, ","))
 			}
 		default:
-			warnings = append(warnings, "ctx auto-discovery skipped: portfolio unavailable")
+			rm.Notes = append(rm.Notes, "ctx auto-discovery skipped: portfolio unavailable")
 		}
 	}
 	if len(resolved) > maxSnapshotCtxCoins {
-		warnings = append(warnings, fmt.Sprintf("ctx truncated to %d coins (had %d)", maxSnapshotCtxCoins, len(resolved)))
+		rm.Notes = append(rm.Notes, fmt.Sprintf("ctx truncated to %d coins (had %d)", maxSnapshotCtxCoins, len(resolved)))
 		resolved = resolved[:maxSnapshotCtxCoins]
 	}
 	sv.Coins = resolved
 
 	if len(resolved) > 0 {
-		var mu sync.Mutex // Go maps race on concurrent writes even to distinct keys
-		var cwg sync.WaitGroup
-		cwg.Add(len(resolved))
-		for _, coin := range resolved {
-			go func(coin string) {
-				defer cwg.Done()
-				sec := okSection(nil)
-				if v, err := c.Ctx(ctx, coin); err != nil {
-					sec = errSection(err)
-				} else {
-					sec = okSection(v)
-				}
-				mu.Lock()
-				sv.Ctx[coin] = sec
-				mu.Unlock()
-			}(coin)
-		}
-		cwg.Wait()
+		c.snapshotCtxSections(ctx, resolved, sv)
 		for _, coin := range resolved {
 			if !sv.Ctx[coin].OK {
 				sv.Failed = append(sv.Failed, "ctx["+coin+"]")
@@ -152,9 +150,95 @@ func (c *Client) Snapshot(ctx context.Context, coins []string) (*SnapshotView, [
 	}
 
 	if len(sv.Failed) > 0 {
-		warnings = append(warnings, "snapshot sections failed: "+strings.Join(sv.Failed, ", "))
+		rm.Notes = append(rm.Notes, "snapshot sections failed: "+strings.Join(sv.Failed, ", "))
 	}
-	return sv, warnings, nil
+	return sv, rm, nil
+}
+
+// snapshotCtxSections fills sv.Ctx for every resolved coin with MINIMAL API
+// weight (NEXT-2 item 8): one metaAndAssetCtxs fetch per DISTINCT dex (main dex
+// "" included), one spotMetaAndAssetCtxs when any spot pair is requested, one
+// allMids when any outcome is requested — each requested coin's view is then
+// sliced out locally. The old per-coin fan-out issued N identical heavyweight
+// fetches CONCURRENTLY, self-inflicting the per-IP 429s the snapshot exists to
+// avoid; fetches here are sequential (a handful at most). Outcome best bid/ask
+// still costs one l2Book per outcome coin — inherently per-coin data.
+func (c *Client) snapshotCtxSections(ctx context.Context, coins []string, sv *SnapshotView) {
+	type target struct {
+		coin string
+		mk   Market
+	}
+	perpByDex := map[string][]target{} // dex "" = main
+	var spotCoins, outcomeCoins []target
+	for _, coin := range coins {
+		mk, ok := c.meta.Lookup(coin)
+		if !ok {
+			sv.Ctx[coin] = errSection(unknownCoin(coin))
+			continue
+		}
+		t := target{coin: coin, mk: mk}
+		switch {
+		case mk.IsOutcome:
+			outcomeCoins = append(outcomeCoins, t)
+		case mk.IsSpot:
+			spotCoins = append(spotCoins, t)
+		default:
+			perpByDex[dexOf(coin)] = append(perpByDex[dexOf(coin)], t)
+		}
+	}
+	// Deterministic dex order (map iteration is random; keep request order stable).
+	dexs := make([]string, 0, len(perpByDex))
+	for d := range perpByDex {
+		dexs = append(dexs, d)
+	}
+	sort.Strings(dexs)
+	for _, d := range dexs {
+		var dexParam *string
+		if d != "" {
+			dd := d
+			dexParam = &dd
+		}
+		mac, err := c.info.MetaAndAssetCtxs(ctx, hl.MetaAndAssetCtxsParams{Dex: dexParam})
+		for _, t := range perpByDex[d] {
+			if err != nil {
+				sv.Ctx[t.coin] = errSection(mapNetwork("meta_and_asset_ctxs", err))
+				continue
+			}
+			if v, verr := perpCtxView(mac, t.mk); verr != nil {
+				sv.Ctx[t.coin] = errSection(verr)
+			} else {
+				sv.Ctx[t.coin] = okSection(v)
+			}
+		}
+	}
+	if len(spotCoins) > 0 {
+		spotMeta, ctxs, err := c.info.SpotMetaAndAssetCtxs(ctx)
+		for _, t := range spotCoins {
+			if err != nil {
+				sv.Ctx[t.coin] = errSection(mapNetwork("spot_meta_and_asset_ctxs", err))
+				continue
+			}
+			if v, verr := spotCtxView(spotMeta, ctxs, t.mk); verr != nil {
+				sv.Ctx[t.coin] = errSection(verr)
+			} else {
+				sv.Ctx[t.coin] = okSection(v)
+			}
+		}
+	}
+	if len(outcomeCoins) > 0 {
+		mids, err := c.info.AllMids(ctx)
+		for _, t := range outcomeCoins {
+			if err != nil {
+				sv.Ctx[t.coin] = errSection(mapNetwork("all_mids", err))
+				continue
+			}
+			if v, verr := c.outcomeCtxWith(ctx, mids, t.mk); verr != nil {
+				sv.Ctx[t.coin] = errSection(verr)
+			} else {
+				sv.Ctx[t.coin] = okSection(v)
+			}
+		}
+	}
 }
 
 // discoverCtxCoins returns the coins the account has exposure to — every position

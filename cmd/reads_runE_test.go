@@ -47,6 +47,9 @@ type rdEnvelope struct {
 		Code     string `json:"code"`
 		Category string `json:"category"`
 	} `json:"error"`
+	// Read-health fields (additive): see output.Envelope.
+	DegradedDexs []string `json:"degraded_dexs"`
+	Truncated    bool     `json:"truncated"`
 }
 
 const rdMasterAddr = "0x9ccAcA47f0318FaeF9C8175767a15AEe1586177e"
@@ -83,6 +86,17 @@ func (s *rdServer) handle(w http.ResponseWriter, r *http.Request) {
 	s.requests = append(s.requests, req)
 	fail := s.failTypes[typ]
 	resp, custom := s.responses[typ]
+	// A dex-scoped registration ("<type>@<dex>") targets only the sub-dex form
+	// of a request (body carries "dex"), so a test can degrade ONE sub-dex while
+	// the main-dex read stays healthy.
+	if d, _ := req["dex"].(string); d != "" {
+		if s.failTypes[typ+"@"+d] {
+			fail = true
+		}
+		if r, ok := s.responses[typ+"@"+d]; ok {
+			resp, custom = r, true
+		}
+	}
 	s.mu.Unlock()
 
 	if fail {
@@ -146,6 +160,12 @@ func rdDefaultBody(typ string) string {
 		return `{"status":"unknownOid"}`
 	case "outcomeMeta":
 		return `{"outcomes":[],"questions":[]}`
+	case "perpDexs":
+		// index 0 = null = the main dex; "xyz" = the sub-dex rdWithSubDex configures
+		return `[null,{"name":"xyz","full_name":"XYZ Markets"}]`
+	case "meta":
+		// served for MetaForDex (loadPerpDexs) when a sub-dex is configured
+		return `{"universe":[{"name":"GOLD","szDecimals":2,"maxLeverage":10}],"marginTables":[]}`
 	default:
 		return `{}`
 	}
@@ -424,12 +444,22 @@ func TestReadPnlRunE(t *testing.T) {
 
 func TestReadPnlAttributionRunE(t *testing.T) {
 	srv := rdSetup(t)
-	srv.setResp("userFills", `[{"coin":"BTC","px":"60000","sz":"0.1","side":"B","time":2,"oid":1,"dir":"Close Long","closedPnl":"12.5","fee":"0.5","feeToken":"USDC","builderFee":"0.1","hash":"0x","startPosition":"0.1","tid":7}]`)
+	// The default window is the current UTC day, applied via the TIME-BOUNDED
+	// fills read (userFillsByTime) — one window for fills, fees, and funding.
+	srv.setResp("userFillsByTime", `[{"coin":"BTC","px":"60000","sz":"0.1","side":"B","time":2,"oid":1,"dir":"Close Long","closedPnl":"12.5","fee":"0.5","feeToken":"USDC","builderFee":"0.1","hash":"0x","startPosition":"0.1","tid":7}]`)
 	srv.setResp("userFunding", `[{"hash":"0x","time":3,"delta":{"coin":"BTC","fundingRate":"0.0001","size":"0.1"}}]`)
 	env, err := rdRun(t, pnlAttributionCmd, nil)
 	rdAssertOK(t, env, err, "pnl.attribution")
+	fillsReq := srv.requestFor("userFillsByTime")
+	fundingReq := srv.requestFor("userFunding")
+	if fillsReq == nil || fundingReq == nil {
+		t.Fatal("both fills and funding must be fetched time-bounded")
+	}
+	if fillsReq["startTime"] != fundingReq["startTime"] {
+		t.Fatalf("ONE window must govern fills and funding: %v vs %v", fillsReq["startTime"], fundingReq["startTime"])
+	}
 
-	srv.fail("userFills")
+	srv.fail("userFillsByTime")
 	env, err = rdRun(t, pnlAttributionCmd, nil)
 	rdAssertFail(t, env, err, "network", output.ExitNetwork)
 }

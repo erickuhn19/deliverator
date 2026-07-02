@@ -93,7 +93,10 @@ func (c *Client) Reconcile(ctx context.Context, opts ReconcileOpts) (*ReconcileV
 	if err != nil {
 		return nil, mapNetwork("open_orders", err)
 	}
-	positions, err := c.Positions(ctx, "")
+	// TODO(NEXT-4): a degraded positions read must not be treated as
+	// authoritative for reconciliation verdicts; the read-health return is
+	// consumed in that cluster (tracked separately — scope discipline).
+	positions, _, err := c.Positions(ctx, "")
 	if err != nil {
 		return nil, err
 	}

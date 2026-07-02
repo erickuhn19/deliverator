@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"sort"
@@ -66,7 +67,11 @@ type PortfolioView struct {
 	// MaintenanceMargin is the total maintenance margin required across all
 	// positions (Σ |position_value| × the coin's tier maintenance fraction); the
 	// account is liquidated as equity approaches it. MarginRatio = maintenance /
-	// equity (0..1; higher = closer to liquidation). Both empty when flat.
+	// the equity that can BACK perp margin (perpMarginEquity — 0..1; higher =
+	// closer to liquidation): on a unified account the same corrected equity the
+	// risk gates use (accountEquity, basis 2); on a NON-unified account the perp
+	// wallet(s) alone, since idle spot USDC / outcome holdings cannot meet a
+	// perp margin call. Both empty when flat.
 	MaintenanceMargin string `json:"maintenance_margin,omitempty"`
 	MarginRatio       string `json:"margin_ratio,omitempty"`
 	// CollateralShared flags a unified account: available_collateral is the single
@@ -81,13 +86,23 @@ type PortfolioView struct {
 	// `balance`, which already breaks out per-dex collateral).
 	PerpDexs map[string]PerpBalance `json:"perp_dexs,omitempty"`
 
-	// degraded (core-internal, not serialized) lists the gate-relevant inputs
-	// this snapshot silently could NOT read: spot state, a configured sub-dex
-	// clearinghouse or open-orders sweep, or the data needed to value held
-	// outcome tokens. Read surfaces stay tolerant of a partial snapshot, but the
-	// account-wide risk gates FAIL CLOSED on it — a partial book would let an
-	// order pass a gate the full book breaches (see portfolioEquitySnapshot).
-	degraded []string
+	// Degraded lists the gate-relevant inputs this snapshot could NOT read:
+	// spot state, a configured sub-dex clearinghouse or open-orders sweep, or
+	// the data needed to value held outcome tokens. Read surfaces stay tolerant
+	// of a partial snapshot but must SHOW it (this field + envelope warnings —
+	// a silently smaller book is a money bug); the account-wide risk gates FAIL
+	// CLOSED on it — a partial book would let an order pass a gate the full
+	// book breaches (see portfolioEquitySnapshot). DegradedDexs is the
+	// machine-readable subset: just the sub-dex names whose clearinghouse or
+	// open-orders read failed. Both additive (schema v1), omitted when clean.
+	Degraded     []string `json:"degraded,omitempty"`
+	DegradedDexs []string `json:"degraded_dexs,omitempty"`
+}
+
+// ReadMeta renders the portfolio's degradation as read-health metadata for the
+// envelope (warnings + degraded_dexs).
+func (v *PortfolioView) ReadMeta() ReadMeta {
+	return ReadMeta{Degraded: v.Degraded, DegradedDexs: v.DegradedDexs}
 }
 
 // sharedCollateralNote annotates a per-dex (or main perp) balance block on a
@@ -358,19 +373,29 @@ func (c *Client) outcomePositionViews(spot []hl.SpotBalance, mids map[string]str
 // `positions` shows outcome EXPOSURE even when outcomes weren't pre-enabled (#104:
 // previously this returned early when outcomes were unloaded, hiding open bets).
 // Costs one extra spot read on the positions path; returns nil when nothing held.
-func (c *Client) outcomePositionsFromSpot(ctx context.Context, coin string) []PositionView {
+// Every silently-skipped input is REPORTED into deg (NEXT-2 item 1): an
+// unreadable spot state hides outcome holdings entirely; a missing universe or
+// mids hides/undervalues them.
+func (c *Client) outcomePositionsFromSpot(ctx context.Context, coin string, deg *ReadMeta) []PositionView {
 	ss, err := c.info.SpotUserState(ctx, c.queryAddr)
-	if err != nil || ss == nil || !hasOutcomeBalance(ss.Balances) {
+	if err != nil {
+		deg.addDegraded("spot state (outcome holdings undetectable)", "")
+		return nil
+	}
+	if ss == nil || !hasOutcomeBalance(ss.Balances) {
 		return nil
 	}
 	if c.meta.OutcomeMeta() == nil {
 		if err := c.EnsureOutcomes(ctx); err != nil || c.meta.OutcomeMeta() == nil {
+			deg.addDegraded("outcome universe (held outcome tokens invisible)", "")
 			return nil // can't decorate without the universe
 		}
 	}
 	mids, err := c.info.AllMids(ctx)
 	if err != nil {
-		mids = nil // surface the holding without a mark rather than failing the read
+		// surface the holding without a mark rather than failing the read
+		deg.addDegraded("outcome mids (holdings shown without marks)", "")
+		mids = nil
 	}
 	return c.outcomePositionViews(ss.Balances, mids, coin)
 }
@@ -393,9 +418,10 @@ func (c *Client) portfolioWith(ctx context.Context, preOrders []hl.FrontendOpenO
 	if err != nil {
 		return nil, mapNetwork("clearinghouse_state", err)
 	}
-	// degraded collects the inputs that silently fail below; the read surfaces
-	// tolerate a partial snapshot, the risk gates fail closed on it.
-	var degraded []string
+	// deg collects the inputs that fail below; the read surfaces tolerate a
+	// partial snapshot but SURFACE it (Degraded/DegradedDexs + warnings), the
+	// risk gates fail closed on it.
+	var deg ReadMeta
 	orders := preOrders
 	if orders == nil {
 		var staleOrderDexs []string
@@ -404,7 +430,7 @@ func (c *Client) portfolioWith(ctx context.Context, preOrders []hl.FrontendOpenO
 			return nil, mapNetwork("open_orders", err)
 		}
 		for _, d := range staleOrderDexs {
-			degraded = append(degraded, "open orders ("+d+")")
+			deg.addDegraded("open orders ("+d+")", d)
 		}
 	}
 	if orders == nil {
@@ -416,7 +442,7 @@ func (c *Client) portfolioWith(ctx context.Context, preOrders []hl.FrontendOpenO
 		spot = ss.Balances
 		collateral = usdcCollateral(ss)
 	} else {
-		degraded = append(degraded, "spot state")
+		deg.addDegraded("spot state", "")
 	}
 	if spot == nil {
 		spot = []hl.SpotBalance{}
@@ -434,7 +460,7 @@ func (c *Client) portfolioWith(ctx context.Context, preOrders []hl.FrontendOpenO
 		}
 		dst, derr := c.info.UserStateForDex(ctx, c.queryAddr, d)
 		if derr != nil {
-			degraded = append(degraded, "sub-dex state ("+d+")")
+			deg.addDegraded("sub-dex state ("+d+")", d)
 			continue
 		}
 		positions = append(positions, normalizedDexPositions(dst, d, "")...)
@@ -464,30 +490,22 @@ func (c *Client) portfolioWith(ctx context.Context, preOrders []hl.FrontendOpenO
 		if c.meta.OutcomeMeta() != nil {
 			mids, merr := c.info.AllMids(ctx)
 			if merr != nil {
-				degraded = append(degraded, "outcome mids") // held outcome tokens can't be valued
+				deg.addDegraded("outcome mids", "") // held outcome tokens can't be valued
 			}
 			positions = append(positions, c.outcomePositionViews(spot, mids, "")...)
 		} else {
-			degraded = append(degraded, "outcome universe") // held outcome tokens invisible
+			deg.addDegraded("outcome universe", "") // held outcome tokens invisible
 		}
 	}
 	// Account-level liquidation health: total maintenance margin across positions
-	// (tier-based) and its ratio to equity. Equity uses the same basis as the risk
-	// gates (the greater of account_value and collateral — see equityOf).
+	// (tier-based) and its ratio to equity.
 	maint := 0.0
 	for _, p := range positions {
 		if pv := parseFloatSafe(p.PositionValue); pv > 0 {
 			maint += pv * c.meta.MaintenanceMarginFraction(p.Coin, pv)
 		}
 	}
-	var maintStr, ratioStr string
-	if maint > 0 {
-		maintStr = f2s(maint)
-		if eq := equityOf(st.MarginSummary.AccountValue, collateral); eq > 0 {
-			ratioStr = f2s(maint / eq)
-		}
-	}
-	return &PortfolioView{
+	view := &PortfolioView{
 		Address:             c.queryAddr,
 		CollateralShared:    collateral != "",
 		AccountValue:        st.MarginSummary.AccountValue,
@@ -498,24 +516,45 @@ func (c *Client) portfolioWith(ctx context.Context, preOrders []hl.FrontendOpenO
 		OpenOrders:          orders,
 		SpotBalances:        spot,
 		AvailableCollateral: collateral,
-		MaintenanceMargin:   maintStr,
-		MarginRatio:         ratioStr,
 		PerpDexs:            perpDexs,
-		degraded:            degraded,
-	}, nil
+		Degraded:            deg.Degraded,
+		DegradedDexs:        deg.DegradedDexs,
+	}
+	if maint > 0 {
+		view.MaintenanceMargin = f2s(maint)
+		// Divide by the equity that can actually BACK perp margin
+		// (perpMarginEquity): on a unified account the same corrected equity the
+		// risk gates use (accountEquity, basis 2 — NOT the deprecated equityOf
+		// max() heuristic, which overstated this ratio once margin was reserved);
+		// on a NON-unified account the perp wallet(s) alone — idle spot USDC
+		// cannot meet a perp margin call, and counting it would UNDERSTATE
+		// liquidation proximity (NEXT-2 item 6 + fix-up).
+		if eq := perpMarginEquity(view); eq > 0 {
+			view.MarginRatio = f2s(maint / eq)
+		}
+	}
+	return view, nil
 }
 
-// Positions returns perp positions, optionally filtered by coin.
-func (c *Client) Positions(ctx context.Context, coin string) ([]PositionView, error) {
+// Positions returns perp positions, optionally filtered by coin, plus the
+// read-health metadata naming any input (sub-dex clearinghouse, spot state for
+// outcome detection, outcome universe/mids) it could not include — a partial
+// book must be visible, never silent (NEXT-2 item 1). Tolerant: exit 0.
+func (c *Client) Positions(ctx context.Context, coin string) ([]PositionView, ReadMeta, error) {
+	var rm ReadMeta
 	if err := c.requireQueryAddr(); err != nil {
-		return nil, err
+		return nil, rm, err
 	}
 	st, err := c.info.UserState(ctx, c.queryAddr)
 	if err != nil {
-		return nil, mapNetwork("clearinghouse_state", err)
+		return nil, rm, mapNetwork("clearinghouse_state", err)
 	}
-	positions := append(toPositionViews(st, coin), c.subDexPositions(ctx, coin)...)
-	return append(positions, c.outcomePositionsFromSpot(ctx, coin)...), nil
+	sub, stale := c.subDexPositionsTimeout(ctx, coin, 0)
+	for _, d := range stale {
+		rm.addDegraded("sub-dex state ("+d+")", d)
+	}
+	positions := append(toPositionViews(st, coin), sub...)
+	return append(positions, c.outcomePositionsFromSpot(ctx, coin, &rm)...), rm, nil
 }
 
 // subDexPositions gathers positions from each configured HIP-3 sub-dex — their
@@ -609,14 +648,21 @@ func (c *Client) allOpenOrdersStale(ctx context.Context) (orders []hl.FrontendOp
 	return orders, stale, nil
 }
 
-// Orders returns resting orders, optionally filtered by coin.
-func (c *Client) Orders(ctx context.Context, coin string) ([]hl.FrontendOpenOrder, error) {
+// Orders returns resting orders, optionally filtered by coin, plus read-health
+// metadata naming any sub-dex whose sweep failed — those resting orders are
+// MISSING from the result, which the agent must see (NEXT-2 item 1). Tolerant:
+// exit 0 with warnings, never a silently smaller book.
+func (c *Client) Orders(ctx context.Context, coin string) ([]hl.FrontendOpenOrder, ReadMeta, error) {
+	var rm ReadMeta
 	if err := c.requireQueryAddr(); err != nil {
-		return nil, err
+		return nil, rm, err
 	}
-	orders, err := c.allOpenOrders(ctx)
+	orders, stale, err := c.allOpenOrdersStale(ctx)
 	if err != nil {
-		return nil, mapNetwork("open_orders", err)
+		return nil, rm, mapNetwork("open_orders", err)
+	}
+	for _, d := range stale {
+		rm.addDegraded("open orders ("+d+")", d)
 	}
 	out := []hl.FrontendOpenOrder{}
 	for _, o := range orders {
@@ -626,7 +672,7 @@ func (c *Client) Orders(ctx context.Context, coin string) ([]hl.FrontendOpenOrde
 			out = append(out, o)
 		}
 	}
-	return out, nil
+	return out, rm, nil
 }
 
 // OrderStatus queries one order by oid or cloid (§5.4 retry protocol).
@@ -646,10 +692,22 @@ func (c *Client) OrderStatus(ctx context.Context, oid *int64, cloid string) (*hl
 		// HL's orderStatus-by-cloid may return the original (now canceled)
 		// order, which would mislead the retry protocol into thinking a live
 		// order is gone — risking a double-place. Prefer a live resting order
-		// carrying this cloid; fall back to the historical query only when none
-		// is open.
-		if live, ok := c.openOrderByCloid(ctx, cloid); ok {
+		// carrying this cloid; fall back to the historical query only when the
+		// live sweep read EVERY dex successfully and found none. A DEGRADED
+		// sweep (main read failed, or any configured sub-dex skipped) that does
+		// not find the order proves nothing — the order may be resting on the
+		// unreadable dex, so answering with the historical (possibly canceled
+		// predecessor) row would invite "absent → resubmit" → double-place
+		// (NEXT-2 item 2). That case is a retryable exit 40, never a confident
+		// absent.
+		live, found, sweepErr := c.openOrderByCloid(ctx, cloid)
+		if found {
 			return live, nil
+		}
+		if sweepErr != nil {
+			return nil, output.Network("order_status_unconfirmed",
+				"cannot confirm order "+cloid+" is gone: the live open-orders sweep was degraded ("+sweepErr.Error()+") — it may still be resting on an unreadable dex").Retry().
+				WithHint("transient read failure — re-run `order status --cloid " + cloid + "` when reads recover; do NOT resubmit on this answer")
 		}
 		res, err = c.info.QueryOrderByCloid(ctx, c.queryAddr, cloid)
 	}
@@ -662,10 +720,13 @@ func (c *Client) OrderStatus(ctx context.Context, oid *int64, cloid string) (*hl
 // openOrderByCloid returns the live resting order carrying cloid (shaped as an
 // OrderQueryResult), if one exists. Used so order-status reflects the live order
 // after a modify, not a stale canceled predecessor sharing the same cloid.
-func (c *Client) openOrderByCloid(ctx context.Context, cloid string) (*hl.OrderQueryResult, bool) {
-	orders, err := c.allOpenOrders(ctx)
+// found=false with a non-nil error means the sweep was DEGRADED (total read
+// failure, or a configured sub-dex silently skipped) — "not found" from such a
+// sweep is inconclusive and must not fall through to the historical query.
+func (c *Client) openOrderByCloid(ctx context.Context, cloid string) (res *hl.OrderQueryResult, found bool, sweepErr error) {
+	orders, stale, err := c.allOpenOrdersStale(ctx)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 	for _, o := range orders {
 		if o.Cloid == nil || !strings.EqualFold(*o.Cloid, cloid) {
@@ -686,27 +747,38 @@ func (c *Client) openOrderByCloid(ctx context.Context, cloid string) (*hl.OrderQ
 					OrderType: oo.OrderType, OrigSz: f2s(oo.OrigSz), Cloid: oo.Cloid,
 				},
 			},
-		}, true
+		}, true, nil
 	}
-	return nil, false
+	if len(stale) > 0 {
+		return nil, false, fmt.Errorf("open orders unreadable on sub-dex(es): %s", strings.Join(stale, ", "))
+	}
+	return nil, false, nil
 }
 
 // Fills returns recent fills, optionally since a timestamp, capped at limit.
-func (c *Client) Fills(ctx context.Context, since *int64, limit int) ([]hl.Fill, error) {
+// A time-bounded read (since != nil) is paged to completion past HL's per-page
+// cap (NEXT-2 item 7); ReadMeta.Truncated reports a read stopped at the hard
+// safety cap — never a silent shortfall.
+func (c *Client) Fills(ctx context.Context, since *int64, limit int) ([]hl.Fill, ReadMeta, error) {
+	var rm ReadMeta
 	if err := c.requireQueryAddr(); err != nil {
-		return nil, err
+		return nil, rm, err
 	}
 	var (
 		fills []hl.Fill
 		err   error
 	)
 	if since != nil {
-		fills, err = c.info.UserFillsByTime(ctx, c.queryAddr, *since, nil, nil)
+		fills, rm, err = pageByTime(*since, fillsPageSize, "fills",
+			func(f hl.Fill) int64 { return f.Time },
+			func(start int64) ([]hl.Fill, error) {
+				return c.info.UserFillsByTime(ctx, c.queryAddr, start, nil, nil)
+			})
 	} else {
 		fills, err = c.info.UserFills(ctx, hl.UserFillsParams{Address: c.queryAddr})
 	}
 	if err != nil {
-		return nil, mapNetwork("user_fills", err)
+		return nil, ReadMeta{}, mapNetwork("user_fills", err)
 	}
 	// newest first
 	sort.Slice(fills, func(i, j int) bool { return fills[i].Time > fills[j].Time })
@@ -716,7 +788,7 @@ func (c *Client) Fills(ctx context.Context, since *int64, limit int) ([]hl.Fill,
 	if fills == nil {
 		fills = []hl.Fill{}
 	}
-	return fills, nil
+	return fills, rm, nil
 }
 
 // TwapRunning is one live TWAP's progress (a flattened, snake_cased TwapState).
@@ -850,34 +922,44 @@ func defaultSince(since *int64, d time.Duration) int64 {
 	return time.Now().Add(-d).UnixMilli()
 }
 
-// Funding returns funding payments since a timestamp (default 7d).
-func (c *Client) Funding(ctx context.Context, since *int64) ([]hl.UserFundingHistory, error) {
+// Funding returns funding payments since a timestamp (default 7d), paged to
+// completion past HL's per-page cap (NEXT-2 item 7).
+func (c *Client) Funding(ctx context.Context, since *int64) ([]hl.UserFundingHistory, ReadMeta, error) {
 	if err := c.requireQueryAddr(); err != nil {
-		return nil, err
+		return nil, ReadMeta{}, err
 	}
-	f, err := c.info.UserFundingHistory(ctx, c.queryAddr, defaultSince(since, 7*24*time.Hour), nil)
+	f, rm, err := pageByTime(defaultSince(since, 7*24*time.Hour), ledgerPageSize, "funding",
+		func(r hl.UserFundingHistory) int64 { return r.Time },
+		func(start int64) ([]hl.UserFundingHistory, error) {
+			return c.info.UserFundingHistory(ctx, c.queryAddr, start, nil)
+		})
 	if err != nil {
-		return nil, mapNetwork("user_funding", err)
+		return nil, ReadMeta{}, mapNetwork("user_funding", err)
 	}
 	if f == nil {
 		f = []hl.UserFundingHistory{}
 	}
-	return f, nil
+	return f, rm, nil
 }
 
-// Ledger returns non-funding ledger updates since a timestamp (default 30d).
-func (c *Client) Ledger(ctx context.Context, since *int64) ([]hl.UserNonFundingLedgerUpdates, error) {
+// Ledger returns non-funding ledger updates since a timestamp (default 30d),
+// paged to completion past HL's per-page cap (NEXT-2 item 7).
+func (c *Client) Ledger(ctx context.Context, since *int64) ([]hl.UserNonFundingLedgerUpdates, ReadMeta, error) {
 	if err := c.requireQueryAddr(); err != nil {
-		return nil, err
+		return nil, ReadMeta{}, err
 	}
-	l, err := c.info.UserNonFundingLedgerUpdates(ctx, c.queryAddr, defaultSince(since, 30*24*time.Hour), nil)
+	l, rm, err := pageByTime(defaultSince(since, 30*24*time.Hour), ledgerPageSize, "ledger",
+		func(r hl.UserNonFundingLedgerUpdates) int64 { return r.Time },
+		func(start int64) ([]hl.UserNonFundingLedgerUpdates, error) {
+			return c.info.UserNonFundingLedgerUpdates(ctx, c.queryAddr, start, nil)
+		})
 	if err != nil {
-		return nil, mapNetwork("user_ledger", err)
+		return nil, ReadMeta{}, mapNetwork("user_ledger", err)
 	}
 	if l == nil {
 		l = []hl.UserNonFundingLedgerUpdates{}
 	}
-	return l, nil
+	return l, rm, nil
 }
 
 // Balance returns perp + spot balances.
@@ -1128,6 +1210,15 @@ func (c *Client) Ctx(ctx context.Context, coin string) (*CtxView, error) {
 	if err != nil {
 		return nil, mapNetwork("meta_and_asset_ctxs", err)
 	}
+	return perpCtxView(mac, mk)
+}
+
+// perpCtxView slices one coin's context out of an ALREADY-FETCHED
+// metaAndAssetCtxs payload — shared by Ctx (one coin, one fetch) and Snapshot,
+// which fetches each dex's payload ONCE and derives every requested coin from
+// it locally (NEXT-2 item 8: N concurrent heavyweight fetches per snapshot
+// self-inflicted the per-IP 429s the snapshot exists to avoid).
+func perpCtxView(mac *hl.MetaAndAssetCtxs, mk Market) (*CtxView, error) {
 	for i, a := range mac.Meta.Universe {
 		if strings.EqualFold(a.Name, mk.Coin) && i < len(mac.Ctxs) {
 			ac := mac.Ctxs[i]
@@ -1145,7 +1236,7 @@ func (c *Client) Ctx(ctx context.Context, coin string) (*CtxView, error) {
 			}, nil
 		}
 	}
-	return nil, unknownCoin(coin)
+	return nil, unknownCoin(mk.Coin)
 }
 
 // spotCtx maps a spot pair's context (no funding/OI/oracle; adds supply) into the
@@ -1158,6 +1249,13 @@ func (c *Client) spotCtx(ctx context.Context, mk Market) (*CtxView, error) {
 	if err != nil {
 		return nil, mapNetwork("spot_meta_and_asset_ctxs", err)
 	}
+	return spotCtxView(spotMeta, ctxs, mk)
+}
+
+// spotCtxView slices one pair's context out of an already-fetched
+// spotMetaAndAssetCtxs payload (shared by spotCtx and Snapshot — see
+// perpCtxView for why).
+func spotCtxView(spotMeta *hl.SpotMeta, ctxs []hl.SpotAssetCtx, mk Market) (*CtxView, error) {
 	for _, p := range spotMeta.Universe {
 		if !strings.EqualFold(p.Name, mk.Coin) {
 			continue
@@ -1189,6 +1287,13 @@ func (c *Client) outcomeCtx(ctx context.Context, mk Market) (*CtxView, error) {
 	if err != nil {
 		return nil, mapNetwork("all_mids", err)
 	}
+	return c.outcomeCtxWith(ctx, mids, mk)
+}
+
+// outcomeCtxWith is outcomeCtx with the allMids payload PRE-FETCHED (Snapshot
+// fetches it once for all outcome coins); the per-coin l2Book fetch remains —
+// best bid/ask is inherently per-coin data.
+func (c *Client) outcomeCtxWith(ctx context.Context, mids map[string]string, mk Market) (*CtxView, error) {
 	mid := mids[mk.Coin]
 	cv := &CtxView{
 		Coin:             mk.Coin,

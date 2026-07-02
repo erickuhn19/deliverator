@@ -47,6 +47,12 @@ type RiskView struct {
 	DailyLossPct   float64          `json:"daily_loss_pct"`
 	RiskStateFound bool             `json:"risk_state_found"`
 	Halted         bool             `json:"halted"`
+	// Degraded/DegradedDexs carry the source portfolio's partial-read markers
+	// (NEXT-2 item 1): when set, equity/utilization above were computed from an
+	// INCOMPLETE book (the gates themselves refuse to act on it — fail closed).
+	// Additive, omitted when the snapshot was complete.
+	Degraded     []string `json:"degraded,omitempty"`
+	DegradedDexs []string `json:"degraded_dexs,omitempty"`
 }
 
 // RiskStatus reports the configured risk envelope + live utilization. READ-ONLY:
@@ -155,5 +161,11 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 		DailyLossPct:   dlPct,
 		RiskStateFound: found,
 		Halted:         c.Halted(),
+		// Carry the source portfolio's partial-read markers: equity/utilization
+		// above were computed from an incomplete book and must say so (NEXT-2
+		// item 1). Note this view is strictly READ-ONLY (ReadRiskState) — a
+		// degraded equity here can never move the persisted anchors.
+		Degraded:     pf.Degraded,
+		DegradedDexs: pf.DegradedDexs,
 	}
 }

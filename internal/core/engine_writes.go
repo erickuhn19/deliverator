@@ -2460,8 +2460,10 @@ func (c *Client) Panic(ctx context.Context) (*PanicResult, error) {
 		}
 	}
 
-	// 3. Flatten every position (main + sub-dex), best-effort per leg.
-	if positions, perr := c.Positions(ctx, ""); perr != nil {
+	// 3. Flatten every position (main + sub-dex), best-effort per leg. The
+	// read-health return is deliberately unused: panic's own step-4 strict
+	// re-verification re-reads every dex and reports the degraded ones itself.
+	if positions, _, perr := c.Positions(ctx, ""); perr != nil {
 		res.Complete = false
 	} else {
 		for _, p := range positions {
