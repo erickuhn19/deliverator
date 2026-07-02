@@ -7,10 +7,13 @@ import (
 )
 
 // Preview (#46) is a no-sign what-if: given a proposed order it projects the
-// resulting position, the resulting ACCOUNT leverage (exact, same basis as the
-// risk gates), the margin it needs, and an estimated liquidation price — so an
-// agent can size risk-aware BEFORE committing, instead of placing then polling.
-// It reads only; it never signs.
+// resulting position, the resulting ACCOUNT leverage (on the perpMarginEquity
+// basis — the equity that can actually back perp margin; this is conservative
+// vs. the gates' total-wealth accountEquity, so preview leverage >= the gate's
+// figure and never green-lights an order a leverage gate would reject), the
+// margin it needs, and an estimated liquidation price — so an agent can size
+// risk-aware BEFORE committing, instead of placing then polling. It reads only;
+// it never signs.
 
 // PreviewResult is the projection. Prices/sizes are strings.
 type PreviewResult struct {
@@ -190,9 +193,13 @@ func (c *Client) Preview(ctx context.Context, coin string, side Side, size, limi
 	if liq > 0 {
 		res.EstDistanceToLiqPct = f2s(absF(px-liq) / px * 100)
 	}
-	// Resulting account leverage = gross book (incl. this order) / equity, the same
-	// basis the risk gates use.
-	if eq := equityOf(pf.AccountValue, pf.AvailableCollateral); eq > 0 {
+	// Resulting account leverage = gross book (incl. this order) / the equity
+	// that can BACK perp margin (perpMarginEquity): on a unified account the
+	// corrected gate-basis equity (accountEquity, basis 2 — NOT the deprecated
+	// equityOf max() heuristic); on a NON-unified account the perp wallet(s)
+	// alone — idle spot USDC can't back a perp position, and counting it would
+	// understate this figure and invite oversizing (NEXT-2 item 6 + fix-up).
+	if eq := perpMarginEquity(pf); eq > 0 {
 		perCoin[mk.Coin] += sideSign * orderNotional
 		gross := 0.0
 		for _, v := range perCoin {

@@ -231,6 +231,41 @@ func (m *MetaStore) SpotBaseToken(coin string) (int, bool) {
 	return 0, false
 }
 
+// SpotPairForToken resolves a token NAME (e.g. "HYPE", a fill's feeToken) to
+// the Market of its <token>/USDC spot pair. A plain "<TOKEN>/USDC" name lookup
+// only works for canonical pairs (on mainnet, essentially just PURR/USDC) — the
+// rest carry an "@<index>" universe name, so the join must go token name →
+// token index → the pair whose tokens are [token, USDC]. Used to value non-USDC
+// fees at the pair's mid (pnl attribution): failing this join would wrongly
+// EXCLUDE a fee whose mid is available, under-reporting costs.
+func (m *MetaStore) SpotPairForToken(token string) (Market, bool) {
+	if mk, ok := m.Lookup(token + "/USDC"); ok && mk.IsSpot {
+		return mk, true // canonical pair name
+	}
+	if m.spotMeta == nil {
+		return Market{}, false
+	}
+	up := strings.ToUpper(strings.TrimSpace(token))
+	tokIdx, usdcIdx := -1, -1
+	for _, tk := range m.spotMeta.Tokens {
+		switch strings.ToUpper(tk.Name) {
+		case up:
+			tokIdx = tk.Index
+		case "USDC":
+			usdcIdx = tk.Index
+		}
+	}
+	if tokIdx < 0 || usdcIdx < 0 || tokIdx == usdcIdx {
+		return Market{}, false
+	}
+	for _, p := range m.spotMeta.Universe {
+		if len(p.Tokens) == 2 && p.Tokens[0] == tokIdx && p.Tokens[1] == usdcIdx {
+			return m.Lookup(p.Name)
+		}
+	}
+	return Market{}, false
+}
+
 // Markets returns all markets in universe order (perps first, then spot).
 func (m *MetaStore) Markets() []Market { return m.ordered }
 

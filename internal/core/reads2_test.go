@@ -12,10 +12,10 @@ func TestFundingLedgerCandles(t *testing.T) {
 		"userNonFundingLedgerUpdates": `[{"delta":{"type":"deposit","usdc":"100"},"hash":"0x","time":2}]`,
 		"candleSnapshot":              `[{"t":1,"T":2,"s":"BTC","i":"1m","o":"1","h":"2","l":"1","c":"2","v":"10","n":3}]`,
 	}))
-	if f, err := c.Funding(ctx, nil); err != nil || len(f) != 1 || f[0].Delta.Coin != "BTC" {
+	if f, _, err := c.Funding(ctx, nil); err != nil || len(f) != 1 || f[0].Delta.Coin != "BTC" {
 		t.Fatalf("funding: %+v err=%v", f, err)
 	}
-	if l, err := c.Ledger(ctx, nil); err != nil || len(l) != 1 || l[0].Delta.Type != "deposit" {
+	if l, _, err := c.Ledger(ctx, nil); err != nil || len(l) != 1 || l[0].Delta.Type != "deposit" {
 		t.Fatalf("ledger: %+v err=%v", l, err)
 	}
 	if cd, err := c.Candles(ctx, "BTC", "1m", nil); err != nil || len(cd) != 1 || cd[0].Close != "2" {

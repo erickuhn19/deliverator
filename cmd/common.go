@@ -130,20 +130,26 @@ func runRead(cmd string, fn func(context.Context, core.ClientAPI) (any, error)) 
 	return nil
 }
 
-// runReadWarn is runRead for a read that also returns top-level warnings (e.g.
-// snapshot listing which sections failed) — the read still succeeds overall.
-func runReadWarn(cmd string, fn func(context.Context, core.ClientAPI) (any, []string, error)) error {
+// runReadMeta is runRead for a TOLERANT read that reports its own health
+// (core.ReadMeta): partial coverage (an unreadable sub-dex / spot state) or a
+// truncated paged history still succeed (exit 0) but surface loud warnings plus
+// the additive machine-readable degraded_dexs / truncated envelope fields —
+// the agent acts on read data, so a silently smaller answer is a money bug.
+func runReadMeta(cmd string, fn func(context.Context, core.ClientAPI) (any, core.ReadMeta, error)) error {
 	ctx, cancel := cmdCtx()
 	defer cancel()
 	c, err := newClient(ctx)
 	if err != nil {
 		return fail(cmd, err)
 	}
-	data, warnings, err := fn(ctx, c)
+	data, rm, err := fn(ctx, c)
 	if err != nil {
 		return fail(cmd, err)
 	}
-	emit(cmd, data, warnings...)
+	output.Emit(output.Response{
+		Cmd: cmd, Data: data, Warnings: rm.EnvelopeWarnings(), Meta: RootMeta(0),
+		DegradedDexs: rm.DegradedDexs, Truncated: rm.Truncated,
+	})
 	return nil
 }
 

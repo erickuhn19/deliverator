@@ -38,7 +38,7 @@ func TestPositionDistanceToLiq(t *testing.T) {
 		}
 		return 200, `[]`
 	})
-	pos, err := c.Positions(ctx, "BTC")
+	pos, _, err := c.Positions(ctx, "BTC")
 	if err != nil || len(pos) != 1 {
 		t.Fatalf("positions: err=%v n=%d", err, len(pos))
 	}

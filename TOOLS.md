@@ -20,7 +20,7 @@ bad call can do is place a bad trade, never move funds.
 | Positions / resting orders | `deliverator positions --json` · `deliverator orders --json` |
 | One order's status | `deliverator order status --cloid <ID> --json` |
 | Fills (incl. fee, builderFee, closedPnl) | `deliverator fills --json` |
-| Net session P&L (did this make money?) | `deliverator pnl attribution --json` (per coin + total: realized − fees − builder fee + funding; `--since <ms>` / `--coin <C>`) |
+| Net session P&L (did this make money?) | `deliverator pnl attribution --json` (per coin + total: realized − fees − builder fee + funding; **one window governs all three components** — default the current UTC day; `--since <ms>` / `--coin <C>`) |
 | Market data | `deliverator book <COIN> --json` · `deliverator bbo <COIN> --json` · `deliverator mids --json` |
 | Per-coin context (mark/oracle/funding/OI/premium + **impact_pxs** for slippage) | `deliverator ctx <COIN> --json` |
 | Forward funding (carry signal) | `deliverator predicted-fundings [--coin <C>] --json` (next-interval forecast per coin+venue) |
@@ -37,9 +37,62 @@ bad call can do is place a bad trade, never move funds.
 > sections, not a failed command). `ctx` defaults to the coins you have exposure to
 > (positions + open orders); pass `--coins BTC,ETH` to prime others. Balances and
 > open orders live under `data.portfolio.data` (not duplicated as separate sections).
+> Ctx is derived from **one** `metaAndAssetCtxs` fetch per dex (plus one spot / one
+> mids fetch when needed), however many coins you request — snapshot weight no
+> longer scales with position count.
+
+> **Partial reads are LOUD, never silent (`degraded_dexs`).** `portfolio`,
+> `positions`, `orders`, `risk`, and `snapshot` stay exit 0 when a configured
+> HIP-3 sub-dex's clearinghouse or open-orders read fails transiently, but the
+> response then carries a **top-level `degraded_dexs: ["<dex>"]` envelope field**
+> plus a `PARTIAL DATA` warning (portfolio/risk data also embed `degraded` +
+> `degraded_dexs`). Anything held on those dexs is **missing from the response,
+> not gone** — never treat a degraded read's absence as closed/canceled/flat;
+> retry the read. An unreadable spot state / outcome universe is likewise listed
+> in `degraded` (understated equity/balances). The account-wide risk gates refuse
+> to act on a degraded snapshot (fail closed, retryable exit 40) and never record
+> drawdown/daily-loss anchors from one.
+
+> **`order status --cloid` never fakes an "absent" from a partial sweep.** The
+> live open-orders scan reads every dex; when that sweep is degraded and the
+> cloid is not found on a readable dex, the command returns a **retryable exit 40**
+> (`order_status_unconfirmed`) instead of falling back to the historical query —
+> the order may be resting on the unreadable dex, and the historical row can be a
+> stale canceled predecessor after a modify. Do NOT resubmit on that answer;
+> re-run the status check when reads recover. (Found = answered normally.)
+
+> **History reads paginate (`truncated`).** `fills --since`, `funding`, `ledger`
+> (and `pnl attribution`, which consumes them) page past Hyperliquid's per-response
+> caps (2000 fills / 500 funding-or-ledger rows) sequentially until the window is
+> complete — including rows that share one millisecond across a page boundary
+> (e.g. a multi-level sweep's fills): the cursor re-starts AT the boundary
+> timestamp, never past it, so nothing is silently skipped or double-counted. A
+> read that would exceed the 10-page safety cap — or hits a same-millisecond
+> burst larger than one page, which the API cannot page within — stops and sets
+> the **top-level `truncated: true` envelope field** + a warning (with a
+> continue-from `--since` hint where applicable) — totals from a truncated read
+> under-report; narrow the window.
+
+> **`pnl attribution` window + fee tokens.** One window governs realized PnL,
+> fees, AND funding (`window_start_ms` / `window` state it; default = the current
+> UTC day, matching the daily-loss anchor; `--since <ms>` overrides). Fees not
+> charged in USDC (a **spot buy** pays its fee in the BASE token) are valued at
+> the live mid and itemized in `fee_tokens` (the token's `<TOKEN>/USDC` pair
+> resolves even when the universe lists it under an internal `@<index>` name —
+> most mainnet spot pairs); a token with no readable USDC mid is
+> **excluded** from `trading_fees`/`net_session_pnl` (reported in `fee_tokens`
+> with `converted:false` + a warning) — token quantities are never summed as
+> dollars at face value.
 
 > **Risk-aware sizing:** `positions`/`portfolio` carry `distance_to_liq_pct` (per
-> position, exact) and account `maintenance_margin` + `margin_ratio`. Before
+> position, exact) and account `maintenance_margin` + `margin_ratio` —
+> `margin_ratio` and preview's `resulting_account_leverage` divide by the equity
+> that can actually **back perp margin**: on a **unified** account, the same
+> corrected equity the risk gates and `risk` report (spot USDC + uPnL, not the
+> perp margin slice); on a **non-unified** account, the perp wallet(s) alone —
+> idle spot USDC / outcome holdings cannot meet a perp margin call, so they never
+> dilute these liquidation-proximity figures (`risk`'s `equity` remains total
+> account wealth, the drawdown/daily-loss basis). Before
 > committing, `deliverator preview <coin> <buy|sell> <size> [--limit <px>] [--leverage <L>]`
 > projects the resulting position, **resulting account leverage**, margin required,
 > and an estimated liquidation price — without signing. Size so an order stays

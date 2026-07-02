@@ -121,10 +121,12 @@ func parseFloatSafe(s string) float64 {
 	return f
 }
 
-// equityOf is the equity portfolio risk math divides by: the GREATER of perp
-// account_value and available USDC collateral. See portfolioEquitySnapshot for
-// why (a unified account holds its equity in spot, where account_value reads only
-// the open-position margin slice). Shared by the gates (#43) and margin_ratio (#46).
+// equityOf is the DEPRECATED max(perp account_value, available USDC collateral)
+// equity heuristic. Both inputs drop by the margin reserved when positions
+// open, understating a unified account's equity — the gates, margin_ratio, and
+// preview all moved to accountEquity (basis 2, commit 2c000c9 + NEXT-2 item 6).
+// Sole remaining caller: copy.go's scale factor (tracked separately in the
+// copy-trading cluster — do not add new callers).
 func equityOf(accountValue, availableCollateral string) float64 {
 	e := parseFloatSafe(accountValue)
 	if c := parseFloatSafe(availableCollateral); c > e {
@@ -176,6 +178,35 @@ func accountEquity(pf *PortfolioView) float64 {
 		av += parseFloatSafe(b.AccountValue)
 	}
 	return usdc + av + outcomeValue
+}
+
+// perpMarginEquity is the equity that can actually BACK PERP MARGIN — the
+// denominator for the liquidation-proximity read surfaces (portfolio's
+// margin_ratio, preview's resulting_account_leverage). It deliberately differs
+// from accountEquity (total wealth: the drawdown/daily-loss and gate basis) on
+// a NON-unified account, where liquidation depends on the perp wallet(s) alone:
+// idle spot USDC and HIP-4 outcome holdings cannot be pulled in to meet a perp
+// margin call, so counting them dilutes the ratio and UNDERSTATES liquidation
+// proximity — the dangerous direction (an agent's "reduce if margin_ratio > X"
+// rule would never fire while the perp wallet liquidates). On a unified account
+// the spot USDC balance IS the shared margin pool, so it is kept — but HIP-4
+// outcome share value cannot back a perp margin call on EITHER account type and
+// is always excluded from this basis (accountEquity/the gate basis keep it).
+func perpMarginEquity(pf *PortfolioView) float64 {
+	if pf.CollateralShared {
+		var outcomeValue float64
+		for _, p := range pf.Positions {
+			if p.Class == "outcome" {
+				outcomeValue += parseFloatSafe(p.PositionValue)
+			}
+		}
+		return accountEquity(pf) - outcomeValue
+	}
+	av := parseFloatSafe(pf.AccountValue)
+	for _, b := range pf.PerpDexs {
+		av += parseFloatSafe(b.AccountValue)
+	}
+	return av
 }
 
 // pendingAdd is one coin's worst-case FUTURE exposure from resting orders:
@@ -313,12 +344,15 @@ func (c *Client) portfolioEquitySnapshot(ctx context.Context, book *gateBook) (*
 	if err != nil {
 		return nil, err
 	}
-	// FAIL CLOSED on a PARTIAL snapshot too: a silently-skipped sub-dex read, an
+	// FAIL CLOSED on a PARTIAL snapshot too: a skipped sub-dex read, an
 	// unreadable spot state, or unvalued outcome holdings under-count the book the
 	// gates evaluate — the gate would run "successfully" against a smaller account.
-	// Portfolio() stays tolerant for the read surfaces; only gating refuses.
-	if len(pf.degraded) > 0 {
-		return nil, fmt.Errorf("partial account snapshot — unreadable: %s", strings.Join(pf.degraded, ", "))
+	// Portfolio() stays tolerant for the read surfaces (which now surface the
+	// degradation as warnings + degraded_dexs); only gating refuses. This is also
+	// what guarantees observeEquity below can never anchor the drawdown/daily-loss
+	// state from degraded (understated) equity.
+	if len(pf.Degraded) > 0 {
+		return nil, fmt.Errorf("partial account snapshot — unreadable: %s", strings.Join(pf.Degraded, ", "))
 	}
 	// Equity = the TRUE total account equity (see accountEquity): on a unified
 	// account, spot USDC + perp uPnL + outcome value; on a pure-perp account, the

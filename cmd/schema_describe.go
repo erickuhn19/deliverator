@@ -11,8 +11,9 @@ import (
 
 // schemaRegistry maps a command name to a zero value of the type its `data`
 // payload deserializes to, so `schema <command>` can emit that payload's JSON
-// Schema. The envelope schema (schema/ok/ts/cmd/data/error/warnings/meta) is the
-// same for every command and is what bare `schema` prints; this describes the
+// Schema. The envelope schema (schema/ok/ts/cmd/data/error/warnings/meta plus
+// the optional read-health fields degraded_dexs/truncated) is the same for
+// every command and is what bare `schema` prints; this describes the
 // command-specific `data`. Keys are the names you pass to `schema <name>`.
 var schemaRegistry = map[string]any{
 	// reads
