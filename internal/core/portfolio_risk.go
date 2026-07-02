@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/erickuhn19/deliverator/internal/config"
+	hl "github.com/erickuhn19/deliverator/internal/hl"
 	"github.com/erickuhn19/deliverator/internal/output"
 	"github.com/erickuhn19/deliverator/internal/state"
 )
@@ -19,15 +21,20 @@ import (
 // before signing, so a hallucinating or mis-sized agent cannot exceed them by
 // switching invocation — unlike the per-order/per-coin caps, they bound the book
 // as a whole. They are evaluated against the RESULTING book (current positions +
-// the proposed NEW exposure); reduce-only/close legs add no exposure and are
-// exempt. All gates default to 0 = off, so the safe baseline is unchanged until
-// the operator opts in, and the whole path (incl. the live snapshot fetch) is
-// skipped when none is configured.
+// resting non-reduce-only orders' worst-case adds + the proposed NEW exposure —
+// without the resting term, sequential single orders each passing against the
+// FILLED book tunnel arbitrarily far past every cap); reduce-only/close legs add
+// no exposure and are exempt. All gates default to 0 = off, so the safe baseline
+// is unchanged until the operator opts in, and the whole path (incl. the live
+// snapshot fetch) is skipped when none is configured.
 //
-// They apply on the exposure-OPENING paths (Place / bracket entry / batch+grid /
-// twap). A modify re-prices an EXISTING order, so it adds no new order and is not
-// portfolio-gated here (the per-coin max_position_notional cap still applies);
-// gating a modify would false-reject a routine grid re-price.
+// They apply on every path that can GROW worst-case exposure: Place / bracket
+// entry / batch+grid / twap, AND modify/modify-batch. A modify REPLACES its own
+// resting order, so the gates evaluate the book with the old order swapped for
+// the replacement at its new size/price (never double-counting itself — a
+// routine grid re-price is not false-rejected); a modify that does not raise
+// the order's worst-case contribution is de-risking and skips the gates
+// entirely, parity with the all-reduce-only batch exemption (see Modify).
 
 // portfolioGuardsActive reports whether any account-wide gate is configured. When
 // false the entire portfolio-check path is skipped (zero added latency / behavior).
@@ -53,8 +60,12 @@ func (c *Client) portfolioGuardsActive() bool {
 // guard: the reduce-only flag exempts an order from every notional/portfolio
 // cap, so a reduce-only order that is not actually reducing is a risk-gate
 // breach, not merely malformed input. The check is SKIPPED only when the
-// position cannot be read at all (no query address / read error) — that
-// fail-open is a known, separately-tracked gap.
+// position cannot be read at all (no query address / read error) — that is
+// deliberate, not a gap: post-P0-A every reduce-only order carries r:true on
+// the wire, so the EXCHANGE guarantees it can only reduce (a mislabeled one is
+// rejected/clamped server-side). De-risking must never be blocked by a local
+// read failure; only exposure-ADDING orders fail closed on unreadable state
+// (see currentPositionNotional / checkPortfolioGates).
 func (c *Client) reduceOnlyFlipErr(ctx context.Context, coin string, side Side, orderSzAbs float64) error {
 	szi, ok := c.positionSziRead(ctx, coin)
 	if !ok {
@@ -167,16 +178,147 @@ func accountEquity(pf *PortfolioView) float64 {
 	return usdc + av + outcomeValue
 }
 
-// portfolioEquitySnapshot is the live account state the gates evaluate against.
-type portfolioEquitySnapshot struct {
-	equity  float64            // perp account_value, or available USDC collateral when flat/unified
-	perCoin map[string]float64 // signed notional per coin, across all dexes
+// pendingAdd is one coin's worst-case FUTURE exposure from resting orders:
+// the remaining size × limit/trigger price of every NON-reduce-only open
+// order, split by side. Untriggered non-reduce-only trigger orders count too —
+// they can fire. Reduce-only orders (incl. bracket/position TP/SL children)
+// can only shrink a position and contribute zero.
+type pendingAdd struct {
+	buy, sell float64
 }
 
-func (c *Client) portfolioEquitySnapshot(ctx context.Context) (*portfolioEquitySnapshot, error) {
-	pf, err := c.Portfolio(ctx)
+// pendingContribution is ONE open order's worst-case pending-add notional —
+// exactly the value pendingAddsFromOrders folds for it, exposed separately so
+// the modify paths can take a specific order OUT of the fold (the modified
+// order must never double-count itself). Reduce-only / position-TP/SL /
+// unpriced / non-finite rows contribute zero.
+func pendingContribution(o hl.FrontendOpenOrder) float64 {
+	if o.ReduceOnly || o.IsPositionTpSl {
+		return 0
+	}
+	px := o.LimitPx
+	if px <= 0 {
+		px = o.TriggerPx // pure trigger rows may carry no limit
+	}
+	n := o.Sz * px // remaining (unfilled) size: the filled part is already in the position
+	if n <= 0 || math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0
+	}
+	return n
+}
+
+// pendingAddsFromOrders folds an open-order book into per-coin pending-add
+// notionals. A missing/false reduceOnly field counts as exposure-ADDING —
+// conservative: an order we cannot prove reductive is treated as a future add.
+func pendingAddsFromOrders(orders []hl.FrontendOpenOrder) map[string]pendingAdd {
+	out := map[string]pendingAdd{}
+	for _, o := range orders {
+		n := pendingContribution(o)
+		if n <= 0 {
+			continue
+		}
+		p := out[o.Coin]
+		if o.Side == hl.OrderSideBid {
+			p.buy += n
+		} else {
+			p.sell += n
+		}
+		out[o.Coin] = p
+	}
+	return out
+}
+
+// addPendingSide adds n to one side of a coin's pending-add entry.
+func addPendingSide(pending map[string]pendingAdd, coin string, side Side, n float64) {
+	p := pending[coin]
+	if side == Buy {
+		p.buy += n
+	} else {
+		p.sell += n
+	}
+	pending[coin] = p
+}
+
+// applyModifyReplacement updates a WORKING pending map for one modify leg: the
+// old resting order's worst-case contribution (existing.PendingNotional, zero
+// for reduce-only) comes out and the replacement's newNotional goes in — after
+// a modify the resting book contains the NEW order INSTEAD OF the old one. The
+// side never changes across a modify. Floored at zero to absorb float dust
+// (the subtraction mirrors the exact value the fold added).
+func applyModifyReplacement(pending map[string]pendingAdd, existing restingOrder, newNotional float64) {
+	p := pending[existing.Coin]
+	if existing.Side == Buy {
+		p.buy += newNotional - existing.PendingNotional
+		if p.buy < 0 {
+			p.buy = 0
+		}
+	} else {
+		p.sell += newNotional - existing.PendingNotional
+		if p.sell < 0 {
+			p.sell = 0
+		}
+	}
+	pending[existing.Coin] = p
+}
+
+// pendingSideNotional sums the pending-add notional for coin on one side,
+// tolerant of the HIP-3 "<dex>:" prefix on either side of the comparison.
+func pendingSideNotional(pending map[string]pendingAdd, coin string, side Side) float64 {
+	var sum float64
+	for oc, p := range pending {
+		if !coinMatches(oc, coin) && !coinMatches(coin, oc) {
+			continue
+		}
+		if side == Buy {
+			sum += p.buy
+		} else {
+			sum += p.sell
+		}
+	}
+	return sum
+}
+
+// gateBook is ONE write invocation's open-order state, fetched once
+// (fail-closed — see fetchGateBook) and threaded through every gate that needs
+// it, so a write with both risk.max_position_notional_usd AND portfolio gates
+// configured performs a single weight-20 open-orders read instead of one per
+// gate. pending is normally pendingAddsFromOrders(orders); the modify paths
+// substitute the adjusted fold — the book with the modified order(s) REPLACED
+// at their new size/price (see Modify / ModifyBatch).
+type gateBook struct {
+	orders  []hl.FrontendOpenOrder
+	pending map[string]pendingAdd
+}
+
+// portfolioEquitySnapshot is the live account state the gates evaluate against.
+type portfolioEquitySnapshot struct {
+	equity  float64               // perp account_value, or available USDC collateral when flat/unified
+	perCoin map[string]float64    // signed notional per coin, across all dexes
+	pending map[string]pendingAdd // resting non-reduce-only orders' worst-case adds per coin
+}
+
+// portfolioEquitySnapshot builds the gate inputs. book, when non-nil, is the
+// invocation's already-fetched (complete, fail-closed) open-order state: its
+// orders feed the portfolio read (no second weight-20 fetch) and its pending
+// fold is used verbatim — possibly modify-adjusted. book==nil fetches inside.
+func (c *Client) portfolioEquitySnapshot(ctx context.Context, book *gateBook) (*portfolioEquitySnapshot, error) {
+	var preOrders []hl.FrontendOpenOrder
+	if book != nil {
+		preOrders = book.orders
+		if preOrders == nil {
+			preOrders = []hl.FrontendOpenOrder{} // fetched-and-empty must not re-fetch
+		}
+	}
+	pf, err := c.portfolioWith(ctx, preOrders)
 	if err != nil {
 		return nil, err
+	}
+	// FAIL CLOSED on a PARTIAL snapshot too: a silently-skipped sub-dex read, an
+	// unreadable spot state, or unvalued outcome holdings under-count the book the
+	// gates evaluate — the gate would run "successfully" against a smaller account.
+	// Portfolio() stays tolerant for the read surfaces; only gating refuses.
+	if len(pf.degraded) > 0 {
+		return nil, fmt.Errorf("partial account snapshot — unreadable: %s", strings.Join(pf.degraded, ", "))
 	}
 	// Equity = the TRUE total account equity (see accountEquity): on a unified
 	// account, spot USDC + perp uPnL + outcome value; on a pure-perp account, the
@@ -184,7 +326,21 @@ func (c *Client) portfolioEquitySnapshot(ctx context.Context) (*portfolioEquityS
 	// available_collateral) heuristic DROPPED by the margin reserved when a position
 	// opened, manufacturing a phantom drawdown/daily-loss.
 	equity := accountEquity(pf)
-	snap := &portfolioEquitySnapshot{equity: equity, perCoin: map[string]float64{}}
+	// Resting orders are worst-case future exposure: without them, sequential
+	// single orders (each passing against the FILLED book) tunnel arbitrarily
+	// far past every cap. The book was fetched exactly once this invocation —
+	// either by the caller (book != nil, whose fold may carry a modify's
+	// replacement) or by portfolioWith just above — so counting it adds no
+	// API weight.
+	pending := pendingAddsFromOrders(pf.OpenOrders)
+	if book != nil {
+		pending = book.pending
+	}
+	snap := &portfolioEquitySnapshot{
+		equity:  equity,
+		perCoin: map[string]float64{},
+		pending: pending,
+	}
 	for _, p := range pf.Positions {
 		n := parseFloatSafe(p.PositionValue)
 		if p.Side == "short" {
@@ -196,9 +352,10 @@ func (c *Client) portfolioEquitySnapshot(ctx context.Context) (*portfolioEquityS
 }
 
 // portfolioMetrics is the pure book arithmetic the account-wide gates and the
-// read-only risk status share — gross/net notional, the largest single-coin
-// notional, and the open-position count (dust-filtered). No caps, no equity, no
-// I/O, so the gate evaluator and the status view can never drift.
+// read-only risk status share — gross/net notional (net at the per-direction
+// worst case, see computePortfolioMetrics), the largest single-coin notional,
+// and the open-position count (dust-filtered). No caps, no equity, no I/O, so
+// the gate evaluator and the status view can never drift.
 type portfolioMetrics struct {
 	gross, net      float64
 	maxCoinNotional float64
@@ -206,33 +363,74 @@ type portfolioMetrics struct {
 	openPositions   int
 }
 
-func computePortfolioMetrics(perCoin map[string]float64) portfolioMetrics {
+// computePortfolioMetrics folds positions (signed per-coin notional, incl. any
+// proposed deltas) and resting-order pending-adds into the gate metrics. Each
+// coin is valued at its WORST CASE: |position + resting buys| vs |position −
+// resting sells|, whichever is larger — the book the account holds if the
+// adverse side fills. Net exposure is worst-case per DIRECTION the same way:
+// netHigh = Σ(position + resting buys), netLow = Σ(position − resting sells),
+// and the measured net is whichever has the larger magnitude. Pending orders
+// fill independently, so a resting sell must never OFFSET a long book — signed
+// netting (buys − sells) let a parked, never-filling sell read |net| below the
+// filled book and un-gate buys past max_net_exposure; a resting order may only
+// TIGHTEN the measured net. A coin with only resting non-reduce-only orders
+// counts as an open position (it becomes one on fill). pending may be nil
+// (positions only — old behavior, where netHigh == netLow == the signed sum).
+func computePortfolioMetrics(perCoin map[string]float64, pending map[string]pendingAdd) portfolioMetrics {
 	var m portfolioMetrics
-	for coin, v := range perCoin {
-		m.gross += absF(v)
-		m.net += v
-		if absF(v) > m.maxCoinNotional {
-			m.maxCoinNotional, m.maxCoin = absF(v), coin
+	var netHigh, netLow float64 // all resting buys fill / all resting sells fill
+	coins := make(map[string]bool, len(perCoin)+len(pending))
+	for coin := range perCoin {
+		coins[coin] = true
+	}
+	for coin := range pending {
+		coins[coin] = true
+	}
+	for coin := range coins {
+		v, p := perCoin[coin], pending[coin]
+		worst := math.Max(absF(v+p.buy), absF(v-p.sell))
+		m.gross += worst
+		netHigh += v + p.buy
+		netLow += v - p.sell
+		if worst > m.maxCoinNotional {
+			m.maxCoinNotional, m.maxCoin = worst, coin
 		}
-		if absF(v) > 0.005 { // ignore dust / a flip that lands at ~0
+		if worst > 0.005 { // ignore dust / a flip that lands at ~0
 			m.openPositions++
 		}
+	}
+	m.net = netHigh
+	if absF(netLow) > absF(netHigh) {
+		m.net = netLow
 	}
 	return m
 }
 
 // checkPortfolioGates enforces the configured account-wide gates against the
-// resulting book (live positions + the proposed new-exposure deltas). It is a
-// no-op unless a portfolio gate is set. It FAILS CLOSED: when the account snapshot
-// cannot be read, the order is refused rather than allowed to bypass the gate.
-func (c *Client) checkPortfolioGates(ctx context.Context, deltas []exposureDelta) error {
+// resulting book (live positions + resting non-reduce-only orders' worst-case
+// adds + the proposed new-exposure deltas). It is a no-op unless a portfolio
+// gate is set. It FAILS CLOSED: when the account snapshot cannot be read —
+// fully or partially — the order is refused (retryable, exit 40) rather than
+// allowed to bypass the gate. The returned warnings (e.g. freshly initialized
+// drawdown/daily-loss anchors) must reach the result envelope.
+func (c *Client) checkPortfolioGates(ctx context.Context, deltas []exposureDelta) ([]string, error) {
+	return c.checkPortfolioGatesBook(ctx, deltas, nil)
+}
+
+// checkPortfolioGatesBook is checkPortfolioGates with the invocation's
+// already-fetched open-order state threaded through (see gateBook): the gates
+// re-use that single weight-20 read — and, on the modify paths, its
+// replacement-adjusted pending fold — instead of fetching the book again.
+// book==nil behaves exactly like checkPortfolioGates.
+func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureDelta, book *gateBook) ([]string, error) {
 	if !c.portfolioGuardsActive() {
-		return nil
+		return nil, nil
 	}
-	snap, err := c.portfolioEquitySnapshot(ctx)
+	snap, err := c.portfolioEquitySnapshot(ctx, book)
 	if err != nil {
-		return output.Network("portfolio_state",
-			"cannot read account state to enforce portfolio risk gates: "+err.Error()).Retry()
+		return nil, output.Network("portfolio_state",
+			"cannot read account state to enforce portfolio risk gates: "+err.Error()).Retry().
+			WithHint("transient read failure — back off and retry; the gates fail closed rather than assume a smaller book")
 	}
 
 	resulting := make(map[string]float64, len(snap.perCoin)+len(deltas))
@@ -242,80 +440,127 @@ func (c *Client) checkPortfolioGates(ctx context.Context, deltas []exposureDelta
 	for _, d := range deltas {
 		resulting[d.coin] += d.signedNotional
 	}
-	m := computePortfolioMetrics(resulting)
+	m := computePortfolioMetrics(resulting, snap.pending)
 	gross, net, maxCoinNotional, maxCoin := m.gross, m.net, m.maxCoinNotional, m.maxCoin
 
 	r := c.cfg.Risk
 	// Net exposure needs no equity, so it is always checkable.
 	if cap := r.MaxNetExposureUSD; cap > 0 && absF(net) > cap {
-		return output.Risk("max_net_exposure",
-			fmt.Sprintf("resulting net exposure $%.2f exceeds cap $%.2f", net, cap)).
-			WithHint(fmt.Sprintf("trim the heavier side so |long − short| <= $%.2f", cap))
+		return nil, output.Risk("max_net_exposure",
+			fmt.Sprintf("resulting net exposure $%.2f exceeds cap $%.2f (worst case: resting orders count on their own side, they never offset)", net, cap)).
+			WithHint(fmt.Sprintf("trim the heavier side (or cancel resting orders) so |long − short| <= $%.2f", cap))
 	}
 	// Open-position count: opening a NEW coin while at the cap is rejected; adding
-	// to an existing position (count unchanged) is not. Needs no equity.
+	// to an existing position (count unchanged) is not. A coin holding only
+	// resting non-reduce-only orders counts — it becomes a position on fill.
 	if cap := r.MaxOpenPositions; cap > 0 {
 		count := m.openPositions
 		if count > cap {
-			return output.Risk("max_open_positions",
-				fmt.Sprintf("this would make %d open positions, over the max of %d", count, cap)).
-				WithHint(fmt.Sprintf("close a position or add to an existing one (cap %d concurrent)", cap))
+			return nil, output.Risk("max_open_positions",
+				fmt.Sprintf("this would make %d open positions (resting orders on a coin count), over the max of %d", count, cap)).
+				WithHint(fmt.Sprintf("close a position, cancel resting orders on unopened coins, or add to an existing one (cap %d concurrent)", cap))
 		}
 	}
 
 	equityGates := r.MaxAccountLeverage > 0 || r.MaxConcentrationPctPerCoin > 0 ||
 		r.MaxDrawdownPct > 0 || r.MaxDailyLossUSD > 0 || r.MaxDailyLossPct > 0
 	if equityGates && snap.equity <= 0 {
-		return output.Risk("account_equity_unavailable",
+		return nil, output.Risk("account_equity_unavailable",
 			"account equity is 0 or unreadable — cannot enforce leverage/drawdown/daily-loss gates").
 			WithHint("fund the account or set wallet.master_address; these gates fail closed without equity")
 	}
 	if cap := r.MaxAccountLeverage; cap > 0 {
 		if lev := gross / snap.equity; lev > cap {
-			return output.Risk("max_account_leverage",
-				fmt.Sprintf("resulting account leverage %.2fx exceeds cap %.2fx (gross $%.2f / equity $%.2f)",
+			return nil, output.Risk("max_account_leverage",
+				fmt.Sprintf("resulting account leverage %.2fx exceeds cap %.2fx (gross $%.2f incl. resting orders / equity $%.2f)",
 					lev, cap, gross, snap.equity)).
-				WithHint(fmt.Sprintf("reduce size so gross notional <= $%.2f", cap*snap.equity))
+				WithHint(fmt.Sprintf("reduce size (or cancel resting orders) so gross notional <= $%.2f", cap*snap.equity))
 		}
 	}
 	if cap := r.MaxConcentrationPctPerCoin; cap > 0 && maxCoinNotional > 0 {
 		if pct := maxCoinNotional / snap.equity * 100; pct > cap {
-			return output.Risk("max_concentration",
-				fmt.Sprintf("%s would be %.1f%% of equity, over the %.1f%% per-coin cap", maxCoin, pct, cap)).
-				WithHint(fmt.Sprintf("reduce %s so its notional <= $%.2f", maxCoin, cap/100*snap.equity))
+			return nil, output.Risk("max_concentration",
+				fmt.Sprintf("%s would be %.1f%% of equity (resting orders count), over the %.1f%% per-coin cap", maxCoin, pct, cap)).
+				WithHint(fmt.Sprintf("reduce %s (or cancel its resting orders) so its notional <= $%.2f", maxCoin, cap/100*snap.equity))
 		}
 	}
 
 	// Trajectory gates: record the latest equity into the persistent high-water /
-	// daily-anchor state and gate on the resulting drawdown / daily loss.
+	// daily-anchor state (keyed per network+account) and gate on the resulting
+	// drawdown / daily loss.
+	var warnings []string
 	if r.MaxDrawdownPct > 0 || r.MaxDailyLossUSD > 0 || r.MaxDailyLossPct > 0 {
-		dd, dlUSD, dlPct, oerr := observeEquity(snap.equity)
+		dd, dlUSD, dlPct, fresh, oerr := observeEquity(c.network, c.queryAddr, snap.equity)
 		if oerr != nil {
-			return output.Network("risk_state", "cannot update drawdown/daily-loss state: "+oerr.Error()).Retry()
+			return nil, output.Network("risk_state", "cannot update drawdown/daily-loss state: "+oerr.Error()).Retry()
+		}
+		if fresh {
+			// The operator must know: fresh anchors under-protect (no drawdown/daily
+			// loss is measurable) until a new peak forms / the next UTC day anchors.
+			warnings = append(warnings, fmt.Sprintf(
+				"drawdown/daily-loss anchors (re)initialized at current equity for %s/%s — these gates measure nothing until the anchors move (next UTC day / new equity peak); anchors from other networks/accounts are never reused",
+				c.network, riskStateComponent(c.queryAddr)))
 		}
 		if cap := r.MaxDrawdownPct; cap > 0 && dd > cap {
-			return output.Risk("max_drawdown",
+			return warnings, output.Risk("max_drawdown",
 				fmt.Sprintf("drawdown %.1f%% from peak exceeds the %.1f%% cap — trading paused", dd, cap)).
-				WithHint("recover above the threshold, raise the cap, or clear risk_state.json to reset the peak")
+				WithHint("recover above the threshold, raise the cap, or clear this network+account's risk_state file to reset the peak")
 		}
 		if cap := r.MaxDailyLossUSD; cap > 0 && dlUSD > cap {
-			return output.Risk("max_daily_loss",
+			return warnings, output.Risk("max_daily_loss",
 				fmt.Sprintf("today's loss $%.2f exceeds the $%.2f daily cap — trading paused", dlUSD, cap)).
 				WithHint("the daily anchor resets at UTC midnight; or raise risk.max_daily_loss_usd")
 		}
 		if cap := r.MaxDailyLossPct; cap > 0 && dlPct > cap {
-			return output.Risk("max_daily_loss_pct",
+			return warnings, output.Risk("max_daily_loss_pct",
 				fmt.Sprintf("today's loss %.1f%% exceeds the %.1f%% daily cap — trading paused", dlPct, cap)).
 				WithHint("the daily anchor resets at UTC midnight; or raise risk.max_daily_loss_pct")
 		}
 	}
-	return nil
+	return warnings, nil
 }
 
 // ---- persistent drawdown / daily-loss state (high-water + UTC-day anchor) ----
 
-func riskStatePath() string     { return filepath.Join(config.Dir(), "risk_state.json") }
-func riskStateLockPath() string { return filepath.Join(config.Dir(), "risk_state.lock") }
+// The state is keyed PER NETWORK+ACCOUNT (one file each, like meta.json is
+// network-tagged): the anchors describe one account's equity trajectory, so a
+// shared unkeyed file let a testnet faucet peak read as a 90% mainnet drawdown
+// (bricking trading) and let multi-account use silently neuter the daily-loss
+// gate (whichever account was observed first each UTC day set the anchor).
+//
+// The LEGACY unkeyed risk_state.json is deliberately IGNORED — never read,
+// never written, left on disk. Its anchors belong to an unknowable mix of
+// contexts, and wrong anchors are worse than fresh ones; leaving the file
+// untouched also keeps a downgrade working exactly as before. Each
+// network+account instead anchors fresh on first observation, with a loud
+// envelope warning (see checkPortfolioGates).
+
+// riskStateComponent sanitizes a network/account string for use in a state
+// filename: lowercased, [a-z0-9] kept, everything else dropped; empty => "default".
+func riskStateComponent(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "default"
+	}
+	return b.String()
+}
+
+func riskStateFile(network, account string) string {
+	return "risk_state_" + riskStateComponent(network) + "_" + riskStateComponent(account)
+}
+
+func riskStatePath(network, account string) string {
+	return filepath.Join(config.Dir(), riskStateFile(network, account)+".json")
+}
+
+func riskStateLockPath(network, account string) string {
+	return filepath.Join(config.Dir(), riskStateFile(network, account)+".lock")
+}
 
 type riskState struct {
 	PeakEquity      float64 `json:"peak_equity"`
@@ -325,24 +570,28 @@ type riskState struct {
 }
 
 // observeEquity records equity into the persistent high-water / daily-anchor state
-// (serialized across processes by a flock, like the rate cap) and returns the
-// resulting drawdown-from-peak and daily-loss figures. A new UTC day re-anchors the
-// daily figure; a missing or corrupt state file is treated as a fresh start (no
-// drawdown yet) rather than a hard error, so a bad file never bricks trading.
-func observeEquity(equity float64) (drawdownPct, dailyLossUSD, dailyLossPct float64, err error) {
-	lk, err := state.Lock(riskStateLockPath())
+// for one network+account (serialized across processes by a flock, like the rate
+// cap) and returns the resulting drawdown-from-peak and daily-loss figures. A new
+// UTC day re-anchors the daily figure; a missing or corrupt state file is treated
+// as a fresh start (no drawdown yet) rather than a hard error, so a bad file never
+// bricks trading. fresh=true reports that the anchors were (re)initialized from
+// the current equity — the caller must surface that as a warning, because fresh
+// anchors measure nothing until they move.
+func observeEquity(network, account string, equity float64) (drawdownPct, dailyLossUSD, dailyLossPct float64, fresh bool, err error) {
+	lk, err := state.Lock(riskStateLockPath(network, account))
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, false, err
 	}
 	defer lk.Unlock()
 
 	var st riskState
-	if b, e := os.ReadFile(riskStatePath()); e == nil {
+	if b, e := os.ReadFile(riskStatePath(network, account)); e == nil {
 		_ = json.Unmarshal(b, &st) // corrupt => treated as fresh
 	}
 	if st.Basis != currentEquityBasis {
 		st = riskState{} // equity basis changed: re-anchor instead of comparing stale figures
 	}
+	fresh = st.PeakEquity <= 0 // no usable prior anchors for THIS network+account
 	today := time.Now().UTC().Format("2006-01-02")
 	if st.Day != today || st.DayAnchorEquity <= 0 {
 		st.Day = today
@@ -360,25 +609,27 @@ func observeEquity(equity float64) (drawdownPct, dailyLossUSD, dailyLossPct floa
 	}
 	st.Basis = currentEquityBasis
 	if b, e := json.Marshal(st); e == nil {
-		_ = os.MkdirAll(filepath.Dir(riskStatePath()), 0o700)
+		_ = os.MkdirAll(filepath.Dir(riskStatePath(network, account)), 0o700)
 		// Atomic+fsync: a crash mid-write must not zero the drawdown/daily-loss
 		// anchors that gate signing (audit #91 / S12).
-		_ = state.WriteFileAtomic(riskStatePath(), b, 0o600)
+		_ = state.WriteFileAtomic(riskStatePath(network, account), b, 0o600)
 	}
-	return drawdownPct, dailyLossUSD, dailyLossPct, nil
+	return drawdownPct, dailyLossUSD, dailyLossPct, fresh, nil
 }
 
-// ReadRiskState reads the persistent drawdown/daily-loss state WITHOUT mutating it
-// and computes the drawdown-from-peak + daily-loss figures against the supplied live
-// equity — the read-only counterpart to observeEquity, for status/monitoring
-// surfaces (`deliverator risk`, the console TUI). It NEVER updates the high-water
-// mark or the day anchor: a passive monitor must not move the figures the agent's
-// gates depend on. found=false means there is no usable state file yet (fresh box
-// or corrupt file → zeroed figures, never an error). The daily figure is reported
-// only when the stored anchor is from the current UTC day (a new day re-anchors on
-// the next observeEquity write); drawdown uses the stored peak as-is.
-func ReadRiskState(equity float64) (st riskState, drawdownPct, dailyLossUSD, dailyLossPct float64, found bool) {
-	b, e := os.ReadFile(riskStatePath())
+// ReadRiskState reads the persistent drawdown/daily-loss state of one
+// network+account WITHOUT mutating it and computes the drawdown-from-peak +
+// daily-loss figures against the supplied live equity — the read-only
+// counterpart to observeEquity, for status/monitoring surfaces (`deliverator
+// risk`, the console TUI). It NEVER updates the high-water mark or the day
+// anchor: a passive monitor must not move the figures the agent's gates depend
+// on. found=false means there is no usable state file yet for this context
+// (fresh box or corrupt file → zeroed figures, never an error). The daily
+// figure is reported only when the stored anchor is from the current UTC day
+// (a new day re-anchors on the next observeEquity write); drawdown uses the
+// stored peak as-is. The legacy unkeyed risk_state.json is never consulted.
+func ReadRiskState(network, account string, equity float64) (st riskState, drawdownPct, dailyLossUSD, dailyLossPct float64, found bool) {
+	b, e := os.ReadFile(riskStatePath(network, account))
 	if e != nil {
 		return riskState{}, 0, 0, 0, false
 	}

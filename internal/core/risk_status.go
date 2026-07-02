@@ -77,8 +77,12 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 		}
 		perCoin[p.Coin] += n
 	}
-	m := computePortfolioMetrics(perCoin)
-	st, ddPct, dlUSD, dlPct, found := ReadRiskState(equity)
+	// Include resting non-reduce-only orders' worst-case adds, so the view shows
+	// exactly the utilization the gates enforce (they count resting orders too).
+	m := computePortfolioMetrics(perCoin, pendingAddsFromOrders(pf.OpenOrders))
+	// The drawdown/daily-loss anchors are keyed per network+account (a testnet
+	// peak must never shadow a mainnet account, or one account another's).
+	st, ddPct, dlUSD, dlPct, found := ReadRiskState(c.network, c.queryAddr, equity)
 
 	// Read caps from disk, not the in-memory snapshot: a long-running console (and
 	// `risk` after a `config set`) must reflect edits to config.toml. The client's

@@ -15,7 +15,7 @@ import (
 func approxEq(a, b float64) bool { return math.Abs(a-b) < 0.01 }
 
 func TestComputePortfolioMetrics(t *testing.T) {
-	m := computePortfolioMetrics(map[string]float64{"BTC": 1000, "ETH": -600, "DUST": 0.001})
+	m := computePortfolioMetrics(map[string]float64{"BTC": 1000, "ETH": -600, "DUST": 0.001}, nil)
 	if m.openPositions != 2 {
 		t.Errorf("openPositions=%d want 2 (DUST below the 0.005 dust filter)", m.openPositions)
 	}
@@ -27,17 +27,43 @@ func TestComputePortfolioMetrics(t *testing.T) {
 	}
 }
 
+// Net exposure is evaluated at the per-direction WORST CASE: pending orders
+// fill independently, so a resting sell may tighten the measured net but must
+// never OFFSET a long book (signed netting let a parked, never-filling sell
+// read |net| below the filled book and un-gate buys past the cap). The same
+// figure feeds the `risk` status view, which must not under-report utilization.
+func TestComputePortfolioMetricsNetWorstCase(t *testing.T) {
+	// Long $100k with a resting $30k sell: net stays $100k, never $70k.
+	m := computePortfolioMetrics(map[string]float64{"BTC": 100000}, map[string]pendingAdd{"BTC": {sell: 30000}})
+	if !approxEq(m.net, 100000) {
+		t.Errorf("net=%v want 100000 (a resting sell may tighten, never loosen)", m.net)
+	}
+	// Flat book with only a resting sell: worst case is the sell filling → -$30k.
+	m = computePortfolioMetrics(map[string]float64{}, map[string]pendingAdd{"BTC": {sell: 30000}})
+	if !approxEq(m.net, -30000) {
+		t.Errorf("net=%v want -30000 (flat book, worst case = the sell fills)", m.net)
+	}
+	// Mixed book: netHigh = (50k+20k) − 60k = +10k, netLow = 50k − (60k+10k) = −20k
+	// → the larger-magnitude direction (−20k) is the measured net.
+	m = computePortfolioMetrics(
+		map[string]float64{"BTC": 50000, "ETH": -60000},
+		map[string]pendingAdd{"BTC": {buy: 20000}, "ETH": {sell: 10000}})
+	if !approxEq(m.net, -20000) {
+		t.Errorf("net=%v want -20000 (worst direction wins)", m.net)
+	}
+}
+
 func TestReadRiskStateNoMutationAndCompute(t *testing.T) {
 	testHome(t)
 	_ = os.MkdirAll(config.Dir(), 0o700)
 	today := time.Now().UTC().Format("2006-01-02")
 	content := []byte(`{"peak_equity":1000,"day":"` + today + `","day_anchor_equity":900,"basis":2}`)
-	if err := os.WriteFile(riskStatePath(), content, 0o600); err != nil {
+	if err := os.WriteFile(riskStatePath("testnet", testMaster), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	before, _ := os.ReadFile(riskStatePath())
+	before, _ := os.ReadFile(riskStatePath("testnet", testMaster))
 
-	st, dd, dlUSD, dlPct, found := ReadRiskState(800)
+	st, dd, dlUSD, dlPct, found := ReadRiskState("testnet", testMaster, 800)
 	if !found {
 		t.Fatal("want found=true")
 	}
@@ -50,7 +76,7 @@ func TestReadRiskStateNoMutationAndCompute(t *testing.T) {
 	if !approxEq(dlUSD, 100) || !approxEq(dlPct, 100.0/900*100) { // 900-800
 		t.Errorf("dailyLoss=%v/%v want 100 / ~11.1", dlUSD, dlPct)
 	}
-	after, _ := os.ReadFile(riskStatePath())
+	after, _ := os.ReadFile(riskStatePath("testnet", testMaster))
 	if !bytes.Equal(before, after) {
 		t.Fatal("ReadRiskState MUTATED risk_state.json — it must be strictly read-only")
 	}
@@ -58,12 +84,12 @@ func TestReadRiskStateNoMutationAndCompute(t *testing.T) {
 
 func TestReadRiskStateFreshAndCorrupt(t *testing.T) {
 	testHome(t)
-	if _, _, _, _, found := ReadRiskState(1000); found {
+	if _, _, _, _, found := ReadRiskState("testnet", testMaster, 1000); found {
 		t.Error("missing file should yield found=false")
 	}
 	_ = os.MkdirAll(config.Dir(), 0o700)
-	_ = os.WriteFile(riskStatePath(), []byte("{not json"), 0o600)
-	if _, _, _, _, found := ReadRiskState(1000); found {
+	_ = os.WriteFile(riskStatePath("testnet", testMaster), []byte("{not json"), 0o600)
+	if _, _, _, _, found := ReadRiskState("testnet", testMaster, 1000); found {
 		t.Error("corrupt file should yield found=false")
 	}
 }
@@ -74,8 +100,8 @@ func TestReadRiskStateStaleDayNoDailyLoss(t *testing.T) {
 	// Anchor from a different UTC day: a new day re-anchors on the next write, so a
 	// read-only view reports no daily loss; drawdown (from the stored peak) still computes.
 	content := []byte(`{"peak_equity":1000,"day":"2000-01-01","day_anchor_equity":900,"basis":2}`)
-	_ = os.WriteFile(riskStatePath(), content, 0o600)
-	_, dd, dlUSD, _, found := ReadRiskState(800)
+	_ = os.WriteFile(riskStatePath("testnet", testMaster), content, 0o600)
+	_, dd, dlUSD, _, found := ReadRiskState("testnet", testMaster, 800)
 	if !found || !approxEq(dd, 20) {
 		t.Errorf("drawdown should still compute: dd=%v found=%v", dd, found)
 	}
@@ -212,8 +238,8 @@ func TestReadRiskStateStaleBasisResets(t *testing.T) {
 	_ = os.MkdirAll(config.Dir(), 0o700)
 	today := time.Now().UTC().Format("2006-01-02")
 	// No "basis" field => old basis (0) => must be treated as fresh, not compared.
-	_ = os.WriteFile(riskStatePath(), []byte(`{"peak_equity":1000,"day":"`+today+`","day_anchor_equity":1000}`), 0o600)
-	if _, dd, _, _, found := ReadRiskState(800); found || dd != 0 {
+	_ = os.WriteFile(riskStatePath("testnet", testMaster), []byte(`{"peak_equity":1000,"day":"`+today+`","day_anchor_equity":1000}`), 0o600)
+	if _, dd, _, _, found := ReadRiskState("testnet", testMaster, 800); found || dd != 0 {
 		t.Errorf("stale-basis state must read as fresh (found=false, dd=0); got found=%v dd=%v", found, dd)
 	}
 }

@@ -220,16 +220,16 @@ landed. Wait briefly and re-check (or query by `--oid`) before resubmitting.
 |---|---|---|
 | Coin allowlist | `automation.allowed_coins` | reject non-listed (20); empty = allow all |
 | Max order notional | `risk.max_order_notional_usd` | reject (20) |
-| Max position notional | `risk.max_position_notional_usd` | reject (20); per-coin |
+| Max position notional | `risk.max_position_notional_usd` | reject (20); per-coin, counts position **+ resting non-reduce-only orders** (worst-case adds) |
 | Min order notional | `risk.min_order_notional_usd` | reject sub-minimum orders pre-flight (10); default $10, mirrors HL's floor |
-| Limit-only | `automation.limit_only` | block market orders (20) |
+| Limit-only | `automation.limit_only` | block market orders **and `--trigger-market` orders** (they execute as market when fired) (20); exits/reduce-only exempt |
 | Max leverage | `risk.max_leverage` | cap leverage changes (20) |
 | **Account leverage** | `risk.max_account_leverage` | reject if resulting gross notional / equity exceeds it (20) |
-| **Net exposure** | `risk.max_net_exposure_usd` | reject if resulting \|long − short\| exceeds it (20) |
+| **Net exposure** | `risk.max_net_exposure_usd` | reject if resulting \|long − short\| exceeds it at the per-direction worst case (20) — resting non-reduce-only orders count on their own side, never offset |
 | **Per-coin concentration** | `risk.max_concentration_pct_per_coin` | reject if one coin exceeds that % of equity (20) |
-| **Drawdown** | `risk.max_drawdown_pct` | reject new exposure once equity is that % below its high-water (20) |
-| **Daily loss** | `risk.max_daily_loss_usd` / `_pct` | reject new exposure once loss since UTC-midnight anchor exceeds it (20) |
-| **Max open positions** | `risk.max_open_positions` | reject opening a new coin once at the concurrent-position cap (20) |
+| **Drawdown** | `risk.max_drawdown_pct` | reject new exposure once equity is that % below its high-water (20); anchors keyed per network+account |
+| **Daily loss** | `risk.max_daily_loss_usd` / `_pct` | reject new exposure once loss since UTC-midnight anchor exceeds it (20); anchors keyed per network+account |
+| **Max open positions** | `risk.max_open_positions` | reject opening a new coin once at the concurrent-position cap (20); a coin with only a resting non-reduce-only order counts |
 | **Reduce-only guard** | (always on) | reject a reduce-only order that cannot reduce: no open position, same side as the position, or larger than it (20) |
 | Local rate cap | `automation.max_orders_per_min` | throttle before the exchange limit |
 | Global halt | `deliverator halt on` | reject all new orders (21); `panic` still works — its flatten bypasses the halt core-internally (no flag), plain `close`/orders stay rejected |
@@ -241,6 +241,31 @@ The **bold** account-wide gates bound *new exposure*: reduce-only/close orders
 are exempt — including a `batch`/`grid --reduce-only` whose every leg is
 reduce-only (one exposure-adding leg keeps the whole batch gated) — so a tripped
 gate never blocks de-risking.
+
+`modify`/`modify-batch` are gated too: a modify that **grows** an order's
+worst-case exposure (larger size, or larger size×limit notional) passes the
+per-coin caps and every account-wide gate, evaluated with the old order
+*replaced* by the new one (a routine re-price never double-counts itself); a
+modify that shrinks or holds exposure is de-risking and stays exempt, so a
+tripped gate never blocks shrinking. A small compliant order cannot be
+modified up past a cap.
+
+All notional/portfolio caps count **resting (unfilled) non-reduce-only orders**
+as worst-case future exposure — sequential orders cannot ladder past a cap by
+each looking small against the filled book; reduce-only resting orders (TP/SL)
+count zero. When `risk.max_position_notional_usd` is set, each gated write costs
+at most one extra open-orders info read (weight 20) — the per-coin cap and the
+portfolio gates share a single fetch. If the account state a configured
+cap needs cannot be read (position, resting orders, equity — e.g. a 429 burst
+or a silently-degraded sub-dex read),
+an exposure-**adding** order fails **closed with a retryable exit 40** (back off
+and retry — not an exit-20 cap breach), while reduce-only orders still pass:
+they carry reduce-only on the wire, so the exchange guarantees they only reduce.
+The drawdown/daily-loss anchors persist **per network+account** (a testnet peak
+never gates mainnet; accounts never share a daily anchor); the first gated write
+of a new network+account context anchors fresh at current equity and emits a
+warning, since fresh anchors under-protect until they move. Legacy unkeyed
+`risk_state.json` files from older versions are ignored (left on disk).
 
 **Alerting:** set `alerting.webhook_url` (or `DELIVERATOR_ALERT_WEBHOOK`) to POST a JSON event on RED-state failures (halt/auth/timeout by default; add `risk` etc. via `alerting.categories`) — best-effort, never blocks the command. Wire it to Slack/Discord/a relay so an away operator hears within seconds.
 

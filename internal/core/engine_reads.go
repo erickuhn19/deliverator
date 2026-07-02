@@ -80,6 +80,14 @@ type PortfolioView struct {
 	// surfaced here to keep the snapshot internally consistent (parity with
 	// `balance`, which already breaks out per-dex collateral).
 	PerpDexs map[string]PerpBalance `json:"perp_dexs,omitempty"`
+
+	// degraded (core-internal, not serialized) lists the gate-relevant inputs
+	// this snapshot silently could NOT read: spot state, a configured sub-dex
+	// clearinghouse or open-orders sweep, or the data needed to value held
+	// outcome tokens. Read surfaces stay tolerant of a partial snapshot, but the
+	// account-wide risk gates FAIL CLOSED on it — a partial book would let an
+	// order pass a gate the full book breaches (see portfolioEquitySnapshot).
+	degraded []string
 }
 
 // sharedCollateralNote annotates a per-dex (or main perp) balance block on a
@@ -369,6 +377,15 @@ func (c *Client) outcomePositionsFromSpot(ctx context.Context, coin string) []Po
 
 // Portfolio returns the full snapshot in one logical call (§9).
 func (c *Client) Portfolio(ctx context.Context) (*PortfolioView, error) {
+	return c.portfolioWith(ctx, nil)
+}
+
+// portfolioWith is Portfolio with an optionally PRE-FETCHED open-orders book:
+// a gated write that already swept the book this invocation (fail-closed,
+// every dex — see fetchGateBook) passes it here so ONE weight-20 fetch serves
+// both the per-coin cap and the portfolio gates. preOrders==nil fetches as
+// usual; a non-nil (possibly empty) slice is trusted as the COMPLETE sweep.
+func (c *Client) portfolioWith(ctx context.Context, preOrders []hl.FrontendOpenOrder) (*PortfolioView, error) {
 	if err := c.requireQueryAddr(); err != nil {
 		return nil, err
 	}
@@ -376,9 +393,19 @@ func (c *Client) Portfolio(ctx context.Context) (*PortfolioView, error) {
 	if err != nil {
 		return nil, mapNetwork("clearinghouse_state", err)
 	}
-	orders, err := c.allOpenOrders(ctx)
-	if err != nil {
-		return nil, mapNetwork("open_orders", err)
+	// degraded collects the inputs that silently fail below; the read surfaces
+	// tolerate a partial snapshot, the risk gates fail closed on it.
+	var degraded []string
+	orders := preOrders
+	if orders == nil {
+		var staleOrderDexs []string
+		orders, staleOrderDexs, err = c.allOpenOrdersStale(ctx)
+		if err != nil {
+			return nil, mapNetwork("open_orders", err)
+		}
+		for _, d := range staleOrderDexs {
+			degraded = append(degraded, "open orders ("+d+")")
+		}
 	}
 	if orders == nil {
 		orders = []hl.FrontendOpenOrder{}
@@ -388,6 +415,8 @@ func (c *Client) Portfolio(ctx context.Context) (*PortfolioView, error) {
 	if ss, serr := c.info.SpotUserState(ctx, c.queryAddr); serr == nil && ss != nil {
 		spot = ss.Balances
 		collateral = usdcCollateral(ss)
+	} else {
+		degraded = append(degraded, "spot state")
 	}
 	if spot == nil {
 		spot = []hl.SpotBalance{}
@@ -405,6 +434,7 @@ func (c *Client) Portfolio(ctx context.Context) (*PortfolioView, error) {
 		}
 		dst, derr := c.info.UserStateForDex(ctx, c.queryAddr, d)
 		if derr != nil {
+			degraded = append(degraded, "sub-dex state ("+d+")")
 			continue
 		}
 		positions = append(positions, normalizedDexPositions(dst, d, "")...)
@@ -432,8 +462,13 @@ func (c *Client) Portfolio(ctx context.Context) (*PortfolioView, error) {
 			_ = c.EnsureOutcomes(ctx)
 		}
 		if c.meta.OutcomeMeta() != nil {
-			mids, _ := c.info.AllMids(ctx)
+			mids, merr := c.info.AllMids(ctx)
+			if merr != nil {
+				degraded = append(degraded, "outcome mids") // held outcome tokens can't be valued
+			}
 			positions = append(positions, c.outcomePositionViews(spot, mids, "")...)
+		} else {
+			degraded = append(degraded, "outcome universe") // held outcome tokens invisible
 		}
 	}
 	// Account-level liquidation health: total maintenance margin across positions
@@ -466,6 +501,7 @@ func (c *Client) Portfolio(ctx context.Context) (*PortfolioView, error) {
 		MaintenanceMargin:   maintStr,
 		MarginRatio:         ratioStr,
 		PerpDexs:            perpDexs,
+		degraded:            degraded,
 	}, nil
 }
 
@@ -543,24 +579,34 @@ func (c *Client) subDexPositionsTimeout(ctx context.Context, coin string, timeou
 // HIP-3 sub-dex. frontendOpenOrders is per-dex (like positions), so without this
 // sweep sub-dex resting orders are invisible to orders / cancel / modify / panic.
 func (c *Client) allOpenOrders(ctx context.Context) ([]hl.FrontendOpenOrder, error) {
-	orders, err := c.info.FrontendOpenOrders(ctx, c.queryAddr)
+	orders, _, err := c.allOpenOrdersStale(ctx)
+	return orders, err
+}
+
+// allOpenOrdersStale is allOpenOrders with the silently-skipped sub-dexes
+// REPORTED: stale lists each configured sub-dex whose sweep failed (its resting
+// orders are missing from the result). Read surfaces stay tolerant of a partial
+// sweep (one slow sub-dex must not hide main-dex orders), but the risk gates
+// consume stale to FAIL CLOSED — invisible resting orders are invisible
+// exposure (see fetchGateBook / portfolioEquitySnapshot).
+func (c *Client) allOpenOrdersStale(ctx context.Context) (orders []hl.FrontendOpenOrder, stale []string, err error) {
+	orders, err = c.info.FrontendOpenOrders(ctx, c.queryAddr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, dex := range c.cfg.PerpDexs {
 		d := strings.ToLower(strings.TrimSpace(dex))
 		if d == "" {
 			continue
 		}
-		// Best-effort, like subDexPositions: one slow sub-dex must not hide main-dex
-		// orders, but a successful sweep must include every sub-dex order.
 		sub, serr := c.info.FrontendOpenOrdersForDex(ctx, c.queryAddr, d)
 		if serr != nil {
+			stale = append(stale, d)
 			continue
 		}
 		orders = append(orders, sub...)
 	}
-	return orders, nil
+	return orders, stale, nil
 }
 
 // Orders returns resting orders, optionally filtered by coin.

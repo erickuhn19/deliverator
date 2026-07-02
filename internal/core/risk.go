@@ -62,7 +62,11 @@ func (c *Client) coinAllowed(coin string) bool {
 
 // riskCheck carries the values a pre-trade gate evaluates.
 type riskCheck struct {
-	Coin                string
+	Coin string
+	// IsMarket marks an order that EXECUTES at market — a plain market order OR
+	// a trigger order with is_market=true, which fires as a market order
+	// (possibly instantly if the trigger price is already crossed). Callers set
+	// it accordingly so automation.limit_only cannot be bypassed via --trigger-market.
 	IsMarket            bool
 	NotionalUSD         float64
 	PositionNotionalUSD float64 // resulting/current position notional for the coin
@@ -114,8 +118,8 @@ func (c *Client) staticChecks(rc riskCheck) error {
 	}
 	if rc.IsMarket && !exit && c.cfg.Automation.LimitOnly {
 		return output.Risk("limit_only",
-			"automation.limit_only is set — market orders are blocked").
-			WithHint("place a limit order with --limit/--alo")
+			"automation.limit_only is set — market orders (including trigger orders that execute as market) are blocked").
+			WithHint("place a limit order with --limit/--alo, or a trigger-limit instead of --trigger-market")
 	}
 	// Notional caps bound NEW exposure. A reduce-only order can only shrink the
 	// position, so it is exempt — otherwise a legitimate close/bracket gets
@@ -140,8 +144,8 @@ func (c *Client) staticChecks(rc riskCheck) error {
 			}
 			if cap := c.cfg.Risk.MaxPositionNotionalUSD; cap > 0 && rc.PositionNotionalUSD > cap {
 				return output.Risk("max_position_notional",
-					fmt.Sprintf("resulting position notional ~$%.2f exceeds cap $%.2f", rc.PositionNotionalUSD, cap)).
-					WithHint(fmt.Sprintf("reduce size so position notional <= $%.2f", cap))
+					fmt.Sprintf("resulting position notional ~$%.2f (position + resting orders + this order) exceeds cap $%.2f", rc.PositionNotionalUSD, cap)).
+					WithHint(fmt.Sprintf("reduce size or cancel resting orders in %s so position notional <= $%.2f", rc.Coin, cap))
 			}
 		}
 	}
