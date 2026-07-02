@@ -57,9 +57,11 @@ func TestPlaceLimitAboveMinPasses(t *testing.T) {
 	}
 }
 
-// A dust close (reduce-only, < $10) must place — the floor must never strand dust.
+// A dust close (reduce-only, < $10) must place — the floor must never strand
+// dust. The long position makes the sell a genuine reduce (the flip guard
+// rejects reduce-only with no opposing position).
 func TestPlaceReduceOnlyDustPasses(t *testing.T) {
-	c, ctx := newTestClient(t, config.Default(), Options{}, engineResp("", "", "", okOrder(`{"resting":{"oid":3}}`)))
+	c, ctx := newTestClient(t, config.Default(), Options{}, engineResp(btcLong, "", "", okOrder(`{"resting":{"oid":3}}`)))
 	_, _, err := c.Place(ctx, OrderReq{Coin: "BTC", Side: Sell, Size: "0.0001", Limit: "64000", Tif: "Gtc", ReduceOnly: true})
 	if err != nil {
 		t.Fatalf("reduce-only dust must place, got %v", err)

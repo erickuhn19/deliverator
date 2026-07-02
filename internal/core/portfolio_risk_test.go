@@ -192,26 +192,40 @@ func TestGateMaxOpenPositions(t *testing.T) {
 
 // ---- reduce-only flip guard ----
 
+// The guard must reject any reduce-only order that cannot actually reduce:
+// oversized on the reducing side (crosses zero), SAME side as the position
+// (adds exposure), or flat (nothing to reduce). Only an opposite-side order
+// sized within the position passes.
 func TestReduceOnlyFlipGuard(t *testing.T) {
 	clearing := clearingWith("100000", posWith("BTC", "0.1", "5000")) // long 0.1 BTC
 	c, ctx := newTestClient(t, riskCfg(config.Risk{}), Options{}, gateResp(&clearing, noSpot))
-	// Within the position → ok.
-	if err := c.reduceOnlyFlipErr(ctx, "BTC", 0.05); err != nil {
+	// Opposite side (sell vs long), within the position → ok.
+	if err := c.reduceOnlyFlipErr(ctx, "BTC", Sell, 0.05); err != nil {
 		t.Fatalf("a reduce within the position must pass: %v", err)
 	}
-	// Exceeds the position → would cross zero → reject.
-	assertRiskCode(t, c.reduceOnlyFlipErr(ctx, "BTC", 0.2), "reduce_only_flip")
-	// Flat coin → skipped, so a bracket tp/sl or pre-armed stop placed before the
-	// position exists is never false-rejected.
-	if err := c.reduceOnlyFlipErr(ctx, "ETH", 0.5); err != nil {
-		t.Fatalf("reduce-only when flat must be allowed (bracket/pre-armed stop): %v", err)
+	// Opposite side but exceeds the position → would cross zero → reject.
+	assertRiskCode(t, c.reduceOnlyFlipErr(ctx, "BTC", Sell, 0.2), "reduce_only_flip")
+	// SAME side as the position (buy on a long) → adds exposure → reject.
+	assertRiskCode(t, c.reduceOnlyFlipErr(ctx, "BTC", Buy, 0.05), "reduce_only_same_side")
+	// Flat coin → nothing to reduce → reject (the flag is a mislabel; the wire
+	// order would not be reduce-only in any meaningful sense).
+	assertRiskCode(t, c.reduceOnlyFlipErr(ctx, "ETH", Sell, 0.5), "reduce_only_flat")
+
+	// Mirror image on a short: only a BUY within the position reduces.
+	clearing = clearingWith("100000", posWith("BTC", "-0.1", "5000")) // short 0.1 BTC
+	if err := c.reduceOnlyFlipErr(ctx, "BTC", Buy, 0.1); err != nil {
+		t.Fatalf("a buy reducing a short must pass: %v", err)
 	}
+	assertRiskCode(t, c.reduceOnlyFlipErr(ctx, "BTC", Sell, 0.05), "reduce_only_same_side")
 }
 
 // ---- wiring: Place trips the gate; reduce-only is exempt ----
 
 func TestPlaceGateWiringAndReduceOnlyExempt(t *testing.T) {
-	clearing := clearingWith("1000") // flat, equity 1000
+	// Short 0.1 BTC so a reduce-only BUY is a genuine reduce (the flip guard
+	// rejects same-side/flat reduce-only); equity 1000 with the $6000 short means
+	// the leverage gate is ALREADY breached — a reduce must still pass.
+	clearing := clearingWith("1000", posWith("BTC", "-0.1", "6000"))
 	resp := func(path, typ string, _ map[string]any) (int, string) {
 		switch typ {
 		case "clearinghouseState":
@@ -230,7 +244,8 @@ func TestPlaceGateWiringAndReduceOnlyExempt(t *testing.T) {
 	}
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxAccountLeverage: 1}), Options{}, resp)
 
-	// Market buy 0.05 BTC @ ~60000 = $3000 notional, equity 1000 => 3x > 1x cap.
+	// Market buy 0.05 BTC @ ~60000 = $3000 notional, equity 1000: the resulting
+	// book (|-6000+3000| gross $3000) is 3x > 1x cap.
 	if _, _, err := c.Place(ctx, OrderReq{Coin: "BTC", Side: Buy, Size: "0.05"}); err == nil {
 		t.Fatal("a 3x order must be rejected by the account-leverage gate")
 	} else {

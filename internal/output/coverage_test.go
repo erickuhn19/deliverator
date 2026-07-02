@@ -54,6 +54,27 @@ func TestRetryFieldPropagation(t *testing.T) {
 	}
 }
 
+// error.cloids (additive, schema v1) carries the write's client order id(s) so
+// the §5.4 retry protocol is runnable from the envelope; it must serialize on
+// failure envelopes and stay omitted when not applicable.
+func TestCloidsFieldPropagation(t *testing.T) {
+	e := Timeout("outcome_unknown", "unknown").WithCloids("0xab", "0xcd")
+	if len(e.Cloids) != 2 || e.Cloids[0] != "0xab" || e.Cloids[1] != "0xcd" {
+		t.Fatalf("WithCloids should set cloids: %+v", e)
+	}
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"cloids":["0xab","0xcd"]`) {
+		t.Fatalf("cloids must serialize on the error payload: %s", b)
+	}
+	b, _ = json.Marshal(Timeout("t", "m"))
+	if strings.Contains(string(b), "cloids") {
+		t.Fatalf("cloids must be omitted when unset (additive): %s", b)
+	}
+}
+
 func TestRenderHumanSuccessAndError(t *testing.T) {
 	var buf bytes.Buffer
 	Configure(false, &buf)

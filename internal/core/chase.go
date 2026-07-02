@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	hl "github.com/erickuhn19/deliverator/internal/hl"
+
 	"github.com/erickuhn19/deliverator/internal/output"
 )
 
@@ -46,6 +48,12 @@ type ChaseEvent struct {
 	Detail      string `json:"detail,omitempty"`
 	Ts          int64  `json:"ts"`
 }
+
+// chaseUnknownRecheckDelay is the wait before re-checking an absent cloid after
+// an outcome-unknown placement — Hyperliquid takes ~1-2s to index a new order by
+// cloid, so an immediate "absent" is not authoritative. Package-level so tests
+// don't sit through the real delay.
+var chaseUnknownRecheckDelay = 2 * time.Second
 
 // pegPrice computes the passive peg for a side: a buy sits at bid-offset, a sell
 // at ask+offset (offset>=0 keeps it behind the touch; <0 improves into the
@@ -115,6 +123,14 @@ func (c *Client) Chase(ctx context.Context, p ChaseParams, onEvent func(ChaseEve
 	}
 	res, _, err := c.Place(ctx, OrderReq{Coin: mk.Coin, Side: p.Side, Size: p.Size, Limit: pegStr, Tif: tif, Cloid: cloid})
 	if err != nil {
+		// An outcome-unknown placement (post-send transport failure, or an
+		// interrupt that cancelled the round trip mid-flight) may have left the
+		// pegged order live on the book with no loop managing it. Honor the
+		// cancel-on-exit contract even here: status-check the cloid, sweep it,
+		// and surface the cloid — Place already attached it to the error.
+		if isUnknownOutcome(err) {
+			c.chaseSweepUnknown(mk.Coin, p, cloid, onEvent)
+		}
 		return err
 	}
 	onEvent(ChaseEvent{
@@ -255,6 +271,51 @@ func (c *Client) classifyGoneOrder(ctx context.Context, cloid string) string {
 		return "filled"
 	}
 	return "canceled"
+}
+
+// chaseSweepUnknown recovers from an initial placement whose outcome is unknown
+// (exit 42): the post-only limit may be resting with nothing managing it. It
+// status-checks the cloid — with one delayed re-check, since HL takes ~1-2s to
+// index a new order — then cancels unless the order already filled (or
+// LeaveResting). The cancel runs even when the cloid stays absent: canceling a
+// never-landed cloid is a benign reject, while skipping it can orphan a live
+// order (fail closed for new exposure). Every outcome is reported in an event
+// that carries the cloid.
+func (c *Client) chaseSweepUnknown(coin string, p ChaseParams, cloid string, onEvent func(ChaseEvent)) {
+	// Fresh bounded context — the run ctx may already be cancelled (an interrupt
+	// landing mid-placement), and the sweep must still run.
+	ctx, cancel := context.WithTimeout(context.Background(), c.opts.Timeout+5*time.Second+2*chaseUnknownRecheckDelay)
+	defer cancel()
+	status := "absent"
+	for attempt := 0; attempt < 2; attempt++ {
+		if q, qerr := c.OrderStatus(ctx, nil, cloid); qerr == nil && q != nil && q.Status == hl.OrderQueryStatusSuccess {
+			status = strings.ToLower(string(q.Order.Status))
+			break
+		}
+		if attempt == 0 {
+			select {
+			case <-ctx.Done():
+				attempt++ // context exhausted — skip the re-check
+			case <-time.After(chaseUnknownRecheckDelay):
+			}
+		}
+	}
+	detail := "initial placement outcome UNKNOWN; order status by cloid: " + status
+	ev := ChaseEvent{Event: "error", Cloid: cloid, Ts: output.Now()}
+	switch {
+	case p.LeaveResting:
+		ev.Detail = detail + "; left as-is (--leave-resting)"
+	case status == "filled":
+		ev.Detail = detail + "; order landed and filled — nothing to cancel"
+	default:
+		if _, cerr := c.Cancel(ctx, CancelReq{Coin: coin, Cloid: cloid}); cerr != nil {
+			ev.Detail = detail + "; cancel failed: " + cerr.Error() +
+				" — run `deliverator reconcile --cloid " + cloid + "`"
+		} else {
+			ev.Detail = detail + "; canceled"
+		}
+	}
+	onEvent(ev)
 }
 
 // chaseFinish cancels the still-resting order (unless LeaveResting) and emits the

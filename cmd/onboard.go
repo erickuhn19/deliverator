@@ -78,26 +78,37 @@ var onboardCmd = &cobra.Command{
 		}
 
 		// Store the API wallet key in the OS keychain (never written to config).
-		account := flagAccount
+		// Canonicalized so the master synonyms (--account master/default/…) store
+		// under the same "main" entry core loads for writes.
+		account := config.CanonicalAccount(flagAccount)
 		ag, err := wallet.Store(account, keyHex)
 		if err != nil {
 			return fail("onboard", output.Auth("store_key", "could not store the key: "+err.Error()))
 		}
 
-		// Persist master + keychain source on a FRESHLY-loaded config so a transient
-		// global flag isn't written through. Onboarding a real (referral) account
-		// defaults to mainnet; --network testnet overrides.
+		// Network: onboarding a real (referral) account defaults to MAINNET — the
+		// opinionated shipped default; `--network testnet` overrides for a
+		// paper-funds dry run, and the console / `config set network` (which warns
+		// loudly) can flip it any time.
 		net := config.NetworkMainnet
 		if flagNetwork != "" {
 			net = flagNetwork
 		}
+
+		// Persist master + network on a FRESHLY-loaded config so a transient
+		// global flag isn't written through, and save back to the SAME file we
+		// loaded from so --config / $DELIVERATOR_CONFIG is honored (#110).
 		fresh, err := config.Load(flagConfig)
 		if err != nil {
 			return fail("onboard", output.Validation("config", err.Error()))
 		}
 		fresh.Network = net
 		fresh.Wallet.MasterAddress = master
-		if err := fresh.Save(config.Path()); err != nil {
+		target := fresh.SourcePath()
+		if target == "" {
+			target = config.Path()
+		}
+		if err := fresh.Save(target); err != nil {
 			return fail("onboard", output.Unknown("save", err.Error()))
 		}
 		// Point the in-memory config at the new setup so the verify below uses it.

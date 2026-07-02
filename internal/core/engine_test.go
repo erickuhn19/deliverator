@@ -72,6 +72,7 @@ func TestModifyWarnsBuilderDropped(t *testing.T) {
 const (
 	emptyState  = `{"assetPositions":[],"marginSummary":{"accountValue":"100000","totalMarginUsed":"0","totalNtlPos":"0","totalRawUsd":"100000"},"crossMarginSummary":{"accountValue":"100000","totalMarginUsed":"0","totalNtlPos":"0","totalRawUsd":"100000"},"withdrawable":"100000"}`
 	btcShort    = `{"assetPositions":[{"position":{"coin":"BTC","szi":"-0.01","positionValue":"640","unrealizedPnl":"0","returnOnEquity":"0","marginUsed":"100","leverage":{"type":"isolated","value":5}},"type":"oneWay"}],"marginSummary":{"accountValue":"100000","totalMarginUsed":"100","totalNtlPos":"640","totalRawUsd":"100000"},"crossMarginSummary":{"accountValue":"100000","totalMarginUsed":"100","totalNtlPos":"640","totalRawUsd":"100000"},"withdrawable":"99000"}`
+	btcLong     = `{"assetPositions":[{"position":{"coin":"BTC","szi":"0.01","positionValue":"640","unrealizedPnl":"0","returnOnEquity":"0","marginUsed":"100","leverage":{"type":"isolated","value":5}},"type":"oneWay"}],"marginSummary":{"accountValue":"100000","totalMarginUsed":"100","totalNtlPos":"640","totalRawUsd":"100000"},"crossMarginSummary":{"accountValue":"100000","totalMarginUsed":"100","totalNtlPos":"640","totalRawUsd":"100000"},"withdrawable":"99000"}`
 	defaultEx   = `{"status":"ok","response":{"type":"default"}}`
 	cancelOk    = `{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}`
 	twapRunning = `{"status":"ok","response":{"type":"twapOrder","data":{"status":{"running":{"twapId":99}}}}}`

@@ -38,17 +38,42 @@ func (c *Client) portfolioGuardsActive() bool {
 		r.MaxOpenPositions > 0
 }
 
-// reduceOnlyFlipErr rejects a reduce-only order whose size exceeds the CURRENT
-// open position in that coin: it could only fill by crossing zero into opposite
-// exposure (which HL prevents, silently dropping the excess), so an oversize
-// request is a sizing mistake worth surfacing as a clear error (#44). It is
-// SKIPPED when flat — a reduce-only order may legitimately be placed before its
-// position exists (a bracket's tp/sl, a pre-armed stop) and reduces whatever
-// exists at fill time.
-func (c *Client) reduceOnlyFlipErr(ctx context.Context, coin string, orderSzAbs float64) error {
-	szi, ok := c.positionSzi(ctx, coin)
-	if !ok || szi == 0 {
+// reduceOnlyFlipErr rejects a reduce-only order that cannot actually REDUCE the
+// current open position in that coin (#44, review P0-A):
+//
+//   - flat (no open position): there is nothing to reduce — the flag is a
+//     mislabel (hallucinated, or the position was already closed by another
+//     fill), and the wire order would only be rejected/no-op'd by HL anyway;
+//   - same side as the position: a "reduce-only" buy on a long (or sell on a
+//     short) adds exposure, it never reduces;
+//   - oversized on the reducing side: it could only fill by crossing zero into
+//     opposite exposure (which HL prevents, silently dropping the excess).
+//
+// All three reject as risk (CatRisk, exit 20), matching the original flip
+// guard: the reduce-only flag exempts an order from every notional/portfolio
+// cap, so a reduce-only order that is not actually reducing is a risk-gate
+// breach, not merely malformed input. The check is SKIPPED only when the
+// position cannot be read at all (no query address / read error) — that
+// fail-open is a known, separately-tracked gap.
+func (c *Client) reduceOnlyFlipErr(ctx context.Context, coin string, side Side, orderSzAbs float64) error {
+	szi, ok := c.positionSziRead(ctx, coin)
+	if !ok {
 		return nil
+	}
+	if szi == 0 {
+		return output.Risk("reduce_only_flat",
+			"reduce-only "+side.String()+" rejected: no open position in "+coin+" — there is nothing to reduce").
+			WithHint("open a position first, or drop reduce-only to open new exposure under the risk caps")
+	}
+	posSide, reducing := "long", Sell
+	if szi < 0 {
+		posSide, reducing = "short", Buy
+	}
+	if side != reducing {
+		return output.Risk("reduce_only_same_side",
+			fmt.Sprintf("reduce-only %s rejected: the open %s position is %s — a same-side order adds exposure, it cannot reduce",
+				side, coin, posSide)).
+			WithHint("reduce a " + posSide + " with a " + reducing.String() + ", or drop reduce-only to add exposure under the risk caps")
 	}
 	if orderSzAbs > absF(szi)+1e-9 {
 		return output.Risk("reduce_only_flip",

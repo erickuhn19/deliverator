@@ -20,11 +20,13 @@ trades, never drain funds. Do not try to defeat that; it's the point.
 2. **Every write carries a `cloid`.** Hyperliquid does **not** dedup a repeated
    cloid — a blind resend places a *second* order. Idempotency is *your* job via the
    retry protocol below.
-3. **Retry protocol (exit 42 = timeout, outcome unknown):** run
+3. **Retry protocol (exit 42 = outcome unknown):** run
    `deliverator order status --cloid <id>` (or `--oid`). If the order exists, it
    landed — do **not** resend. If absent, wait briefly (HL takes ~1–2s to index) and
    re-check before resubmitting the **same** cloid. This is the #1 way naive agents
-   double-fill.
+   double-fill. The failure envelope's `error.cloids` carries the cloid(s) — even
+   auto-generated ones — and exit 42 covers any post-send transport failure, not
+   just timeouts (pre-send failures are exit 40, safe to retry).
 4. **Respect the risk caps (exit 20).** They are enforced in core; switching how you
    invoke the binary cannot bypass them. A cap rejection means stop, not retry.
 5. **Stop on halt (exit 21).** A global halt or armed dead-man's switch is rejecting
@@ -45,7 +47,8 @@ trades, never drain funds. Do not try to defeat that; it's the point.
 ```
 
 Prices and sizes are **strings**. On failure: `ok=false`, `data=null`, and `error`
-is `{code, category, message, retryable, retry_after_ms, hint}`.
+is `{code, category, message, retryable, retry_after_ms, hint}` — plus `cloids`
+(the signed client order id(s)) on write failures.
 
 ## Exit codes (the contract)
 
@@ -63,6 +66,8 @@ is `{code, category, message, retryable, retry_after_ms, hint}`.
   approval — it's master-only.
 - **Risk caps may be changed** via `deliverator config set risk.*`, but the CLI will
   remind whoever runs it to keep the human in the loop. Don't silently widen a cap.
+  `config set network` warns the same loud way — flipping the testnet/mainnet
+  boundary retargets every subsequent command, so never do it mid-loop on your own.
 
 ## Contributing to this repo
 

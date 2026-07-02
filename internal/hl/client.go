@@ -18,10 +18,12 @@ package hl
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 )
 
@@ -57,6 +59,49 @@ type APIError struct {
 }
 
 func (e APIError) Error() string { return fmt.Sprintf("API error %d: %s", e.Code, e.Message) }
+
+// TransportError is a transport-level failure from post (no HTTP response was
+// decoded). Sent records whether the request could have reached the exchange:
+// false ONLY when the failure is provably pre-send (payload marshal / request
+// build, dial, DNS resolution, TLS handshake); true for everything else —
+// client timeouts, resets mid-response, body-read failures, unparseable 200
+// bodies, and non-JSON error pages from a gateway/edge in front of the API.
+// For a signed write, Sent=true means the action's outcome is
+// UNKNOWN. The default is deliberately conservative: a false "unknown" costs
+// the caller one harmless status check, while a false "never sent" invites a
+// blind resubmit that double-fills (the exchange does not dedup cloids).
+type TransportError struct {
+	Sent bool // false => the request provably never left this host
+	Err  error
+}
+
+func (e *TransportError) Error() string { return e.Err.Error() }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// requestNeverSent reports whether an http.Client.Do error provably occurred
+// BEFORE the request bytes went out: dial failures (connection refused /
+// unreachable), DNS resolution, or a TLS handshake that never completed.
+// Anything else — timeouts, resets, EOFs mid-exchange, write errors after the
+// connection was up — may have delivered the request and must stay "possibly
+// sent".
+func requestNeverSent(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	// TLS handshake failures: the server never spoke TLS (RecordHeaderError) or
+	// its certificate failed verification (which wraps the x509 errors).
+	var recErr tls.RecordHeaderError
+	if errors.As(err, &recErr) {
+		return true
+	}
+	var certErr *tls.CertificateVerificationError
+	return errors.As(err, &certErr)
+}
 
 // ---- options (mirror the SDK's functional-option surface so the consumer's
 // constructor calls change only their import path) ----
@@ -106,20 +151,23 @@ func newTransport(baseURL string, opts ...ClientOpt) *httpTransport {
 
 // post sends a JSON body to path (e.g. "/info" or "/exchange") and returns the
 // raw response body. A >=400 status is decoded into APIError when possible.
+// Transport-level failures are wrapped in TransportError so callers can
+// distinguish provably-never-sent (safe to retry) from possibly-sent (a signed
+// write's outcome is UNKNOWN) — never by matching message substrings.
 func (t *httpTransport) post(ctx context.Context, path string, payload any) ([]byte, error) {
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+		return nil, &TransportError{Sent: false, Err: fmt.Errorf("failed to marshal payload: %w", err)}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.baseURL+path, bytes.NewReader(jsonData))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, &TransportError{Sent: false, Err: fmt.Errorf("failed to create request: %w", err)}
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := t.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, &TransportError{Sent: !requestNeverSent(err), Err: fmt.Errorf("request failed: %w", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -127,22 +175,23 @@ func (t *httpTransport) post(ctx context.Context, path string, payload any) ([]b
 	// oversized body and fail closed (audit #91 / S8).
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBodyBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, &TransportError{Sent: true, Err: fmt.Errorf("failed to read response body: %w", err)}
 	}
 	if len(body) > maxHTTPBodyBytes {
-		return nil, fmt.Errorf("response body exceeded %d-byte limit", maxHTTPBodyBytes)
+		return nil, &TransportError{Sent: true, Err: fmt.Errorf("response body exceeded %d-byte limit", maxHTTPBodyBytes)}
 	}
 
 	if resp.StatusCode >= httpErrorStatusCode {
-		if !json.Valid(body) {
-			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
-		}
 		var apiErr APIError
-		if err := json.Unmarshal(body, &apiErr); err != nil {
-			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+		if json.Valid(body) && json.Unmarshal(body, &apiErr) == nil {
+			apiErr.Status = resp.StatusCode
+			return nil, apiErr
 		}
-		apiErr.Status = resp.StatusCode
-		return nil, apiErr
+		// A non-JSON error body is a gateway/edge page (Cloudflare/nginx HTML,
+		// WAF block), not the exchange's API handler speaking. The request
+		// reached that edge and may have been forwarded upstream, so a signed
+		// write's outcome is UNKNOWN — never a definitive rejection.
+		return nil, &TransportError{Sent: true, Err: fmt.Errorf("status %d: %s", resp.StatusCode, string(body))}
 	}
 	return body, nil
 }

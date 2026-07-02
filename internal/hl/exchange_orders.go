@@ -302,7 +302,10 @@ func (e *Exchange) ModifyOrder(ctx context.Context, req ModifyOrderRequest) (res
 		Response json.RawMessage `json:"response"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return result, fmt.Errorf("failed to parse modify response: %w", err)
+		// A 200 whose envelope we can't parse: the modify reached the exchange —
+		// the cancel+replace may have landed (and even filled). Outcome UNKNOWN,
+		// never a definitive rejection.
+		return result, &TransportError{Sent: true, Err: fmt.Errorf("failed to parse modify response: %w", err)}
 	}
 	if env.Status != "ok" {
 		var msg string
@@ -331,6 +334,9 @@ func (e *Exchange) ModifyOrder(ctx context.Context, req ModifyOrderRequest) (res
 }
 
 // MarketOpen places an aggressive IOC order at the slippage-adjusted price.
+// reduceOnly is carried onto the wire: a reduce-only market order must actually
+// be reduce-only ("r":true) or the exchange treats it as new exposure — while
+// the caller's risk layer has already exempted it from every cap (review P0-A).
 func (e *Exchange) MarketOpen(
 	ctx context.Context,
 	name string,
@@ -340,6 +346,7 @@ func (e *Exchange) MarketOpen(
 	slippage float64,
 	cloid *string,
 	builder *BuilderInfo,
+	reduceOnly bool,
 ) (OrderStatus, error) {
 	slippagePrice, err := e.SlippagePrice(ctx, name, isBuy, slippage, px)
 	if err != nil {
@@ -351,7 +358,7 @@ func (e *Exchange) MarketOpen(
 		Size:          sz,
 		Price:         slippagePrice,
 		OrderType:     OrderType{Limit: &LimitOrderType{Tif: TifIoc}},
-		ReduceOnly:    false,
+		ReduceOnly:    reduceOnly,
 		ClientOrderID: cloid,
 	}, builder, 0)
 }

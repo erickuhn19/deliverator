@@ -117,7 +117,10 @@ bad call can do is place a bad trade, never move funds.
 - **ALWAYS supply a unique `--cloid` you generate per intent** (hex, `0x` + 32 chars).
   The cloid is your idempotency key for the retry rule below. The exchange does
   NOT reject a duplicate cloid — a blind resend places a *second* order — so never
-  resend without first checking order status by cloid.
+  resend without first checking order status by cloid. If you omit it, Deliverator
+  generates one; on any write failure the envelope's **`error.cloids`** carries the
+  cloid(s) that were signed (all legs for a batch/grid), so the retry rule stays
+  runnable — read it from there, don't parse the hint text.
 - Orders below ~$10 notional are rejected pre-flight (exit 10, `risk.min_order_notional_usd`).
 - Preview without sending: add `--dry-run` (validates, rounds, attaches builder, shows the exact action).
 
@@ -148,7 +151,7 @@ bad call can do is place a bad trade, never move funds.
 - **Scaling:** `--scale-mode equity` (default) sizes each position to `your_equity / leader_equity * scale`; `--scale-mode fixed` uses `leader_size * scale`. `--scale <x>` and `--coins BTC,ETH` (restrict) shape it.
 - **Stateless / your loop owns the state.** Pass the coins you're currently mirroring via `--mirrored BTC,ETH` (from your `STATE.md`); copy returns `data.mirrored_now` (the leader's current coins) — persist it and pass it back next tick. This is what makes the leader's **exits** mirror: a coin in `--mirrored` that the leader has since closed gets a `close` leg; a coin in neither the leader's book nor `--mirrored` is **ignored** (your own positions are never touched).
 - **Loop:** each tick → `copy <leader> --mirrored <saved> --execute --yes` → save `data.mirrored_now`. On **exit 42** (a leg's outcome is unknown), copy returns `data.unknown_cloids` and stops — feed those to `reconcile --cloid …` next tick, do **not** blind-resubmit.
-- **Exit codes:** 10 bad leader / missing `--yes`; 20 a leg hit a risk gate (reported per-leg in `data.legs`, others still run); 42 outcome-unknown leg (reconcile next); 60 some legs rejected/deferred.
+- **Exit codes:** 10 bad leader / missing `--yes`; 42 outcome-unknown leg (reconcile next); 60 some legs rejected or deferred — **including legs stopped by a risk gate** (each is reported per-leg in `data.legs` with `status:"rejected"` and the gate's message; the other legs still run). Copy never exits 20 as a whole: inspect `data.legs[].error` to tell a gate rejection (shrink size / respect the cap) from an exchange rejection.
 - **Honest caveats:** you are always *late* to the leader's trades; the leader's leverage liquidates you too; v1 is **perps + main dex only**; mirroring a short fund opens **shorts**. Preview with the default diff (or `--execute --dry-run`) before committing.
 
 ## Managing
@@ -187,6 +190,20 @@ On **exit 42** (timeout, outcome unknown):
 2. If the order exists (resting or filled) → it landed; **do not resend.**
 3. If it is absent → resubmit with the **same** `--cloid`.
 
+The cloid(s) to check are in the failure envelope's `error.cloids` (and the
+hint) — including auto-generated ones you never supplied. For a multi-leg
+failure (batch/grid), pass them all to `reconcile --cloid 0x..,0x..` instead.
+
+Exit 42 covers every write whose signed action **may have reached the
+exchange** — not just literal timeouts, but also connection resets, EOFs,
+unreadable responses after send, and HTTP 5xx answers from a gateway/edge in
+front of the API (a Cloudflare/nginx 502/504 means the request may have been
+forwarded before the intermediary gave up). A write that provably never left
+your host (connection refused, DNS failure) is exit **40** instead: nothing was
+sent, so retrying with backoff is safe. Exit **50** means the exchange
+definitively rejected the order — only then is the order certainly not on the
+book.
+
 The exchange can take ~1–2s to index a new order by cloid. If status is "absent"
 within a couple seconds of placing, **wait briefly and re-check** (or query by
 `--oid` if you have it) before resubmitting — a too-eager recheck can report an
@@ -206,6 +223,14 @@ as `--cloid 0x..,0x..` and reconcile resolves each against live state with a
 recommended `action`: `resting`/`filled` → **adopt** (don't resend), `absent` →
 **resubmit** the same cloid, terminal/`error` → **inspect**. This is the batch
 form of the exit-42 retry rule above — use it to clear all suspects in one read.
+
+Every order-creating write (`buy`/`sell`/`order` — brackets included —
+`position-tpsl`, `batch`/grid, `close`, `modify`/`modify-batch`, `twap`) also
+appends a minimal pre-send `intent` row (`cmd`, coin, cloid(s)) to the audit
+trail *before* the exchange round trip, so even a hard kill mid-write leaves
+the cloid on disk: a landed order is then attributed to this instance rather
+than reported as a foreign orphan. Non-order writes (cancel, leverage/margin,
+schedule-cancel) carry no cloid to lose and append only their post-outcome row.
 
 ## Rate limits
 Actions are rate-limited **per address** (~1 request per 1 USDC traded; 10,000 initial buffer;
@@ -251,13 +276,14 @@ heartbeat lapse), `--action panic` actually flattens.
 
 ## Safety levers
 - `deliverator dms set 60` arms a dead-man's switch; refresh with `deliverator dms heartbeat` (cron).
-  If the heartbeat lapses, the exchange auto-cancels your resting orders.
+  If the heartbeat lapses, the exchange auto-cancels your resting orders — it never
+  closes a position: open exposure stays open (arm `watch --action panic` for that).
 - `deliverator watch …` (above) is the reactive failsafe — it *acts* on a live metric breach, not on a heartbeat lapse.
-- `deliverator halt on` rejects all new orders instantly (exit 21). `deliverator halt off` resumes.
-- `deliverator panic --yes` cancels all orders, cancels running TWAPs, and flattens all positions (every dex). It then re-verifies: `complete:false` (and a non-zero exit) + a `degraded:[dex]` list mean the teardown could NOT be confirmed flat — re-run / inspect that dex.
+- `deliverator halt on` rejects all new orders instantly (exit 21). `deliverator halt off` resumes. A halt never blocks `panic` (below) — the emergency exit works while everything else is stopped.
+- `deliverator panic --yes` cancels all orders, cancels running TWAPs, and flattens all positions (every dex). It **works during a global halt**: its flatten legs bypass the halt gate core-internally (there is no flag for it — a plain `close` or order under a halt still rejects exit 21). It then re-verifies: `complete:false` (and a non-zero exit) + a `degraded:[dex]` list mean the teardown could NOT be confirmed flat — re-run / inspect that dex.
 
 ## Account-wide risk gates (core-enforced, exit 20)
-Beyond the per-order caps, the operator may set **portfolio-level** gates that bound the whole book — you cannot bypass them by switching command. They evaluate the *resulting* book (current positions + this order); reduce-only/close orders are exempt. A breach is exit 20 with a concrete message — **respect it, don't retry as-is** (reduce size or stop):
+Beyond the per-order caps, the operator may set **portfolio-level** gates that bound the whole book — you cannot bypass them by switching command. They evaluate the *resulting* book (current positions + this order); reduce-only/close orders are exempt, including a `batch`/`grid --reduce-only` whose **every** leg is reduce-only (one exposure-adding leg keeps the whole batch gated) — so you can always de-risk even while a tripped gate is pausing new exposure. A breach is exit 20 with a concrete message — **respect it, don't retry as-is** (reduce size or stop):
 - `risk.max_account_leverage` — resulting gross notional / equity.
 - `risk.max_net_exposure_usd` — resulting |long − short|.
 - `risk.max_concentration_pct_per_coin` — one coin as a % of equity.
@@ -267,7 +293,7 @@ Beyond the per-order caps, the operator may set **portfolio-level** gates that b
 
 These are the account's survival floor — when one trips, the loop should stop opening risk, not size around it.
 
-**Reduce-only flip (always on):** a reduce-only order whose size exceeds the current open position is rejected (`reduce_only_flip`, exit 20) — it could only fill by crossing zero into opposite exposure. Size a reduce-only/close at most to the open position; drop reduce-only to open the opposite side deliberately.
+**Reduce-only guard (always on):** a reduce-only order must actually reduce the open position, or it is rejected (exit 20): no open position in the coin → `reduce_only_flat` (nothing to reduce — e.g. your TP already flattened it); same side as the position (a "reduce-only" buy on a long) → `reduce_only_same_side`; size exceeding the position → `reduce_only_flip` (it could only fill by crossing zero into opposite exposure). Place a reduce-only on the opposite side of the position, sized at most to it; drop reduce-only to open exposure deliberately (subject to all caps).
 
 ## Hard rules
 - **Never attempt withdrawals or transfers** — unsupported by design (non-custodial guarantee).

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -130,7 +131,17 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Client, error)
 	}
 
 	// Reads target the master (or sub-account) address — never the agent (§4).
-	c.queryAddr, _ = cfg.ResolveAddress(opts.Account)
+	// An explicitly-passed account that does not resolve is a HARD error: with a
+	// silently-empty queryAddr, reads mis-target and env-key writes would sign
+	// for the MASTER account with the per-coin position/flip gates blinded to
+	// the live book. Only the master synonyms stay tolerant when the master is
+	// unset (the no-flag case requireQueryAddr already guards with exit 30).
+	addr, aerr := cfg.ResolveAddress(opts.Account)
+	if aerr != nil && !config.IsMasterSynonym(opts.Account) {
+		return nil, output.Validation("unknown_account", aerr.Error()).
+			WithHint(accountsHint(cfg))
+	}
+	c.queryAddr = addr
 	if c.queryAddr != "" && !strings.EqualFold(c.queryAddr, cfg.Wallet.MasterAddress) {
 		c.vaultAddr = c.queryAddr // a sub-account/vault, not the master
 	}
@@ -180,6 +191,22 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Client, error)
 	c.nonce = state.NewNonceLock(filepath.Join(config.Dir(), "nonce.lock"))
 	c.audit = state.NewAudit(config.ExpandPath(cfg.State.AuditPath), cfg.State.Audit && !opts.NoAudit)
 	return c, nil
+}
+
+// accountsHint lists the configured [accounts] aliases (alias lookup is
+// case-sensitive) so a typo'd --account is correctable straight from the
+// failure envelope.
+func accountsHint(cfg *config.Config) string {
+	aliases := make([]string, 0, len(cfg.Accounts))
+	for a := range cfg.Accounts {
+		aliases = append(aliases, a)
+	}
+	sort.Strings(aliases)
+	if len(aliases) == 0 {
+		return "no [accounts] aliases are configured — omit --account for the master, or add one: `deliverator account add`"
+	}
+	return "configured aliases (case-sensitive): " + strings.Join(aliases, ", ") +
+		" — or omit --account for the master; `deliverator account ls`"
 }
 
 // isPerpDexWildcard reports whether a perp_dexs entry is the "opt into everything"
@@ -347,7 +374,11 @@ func (c *Client) exchange(ctx context.Context) (*hl.Exchange, error) {
 	if c.ex != nil {
 		return c.ex, nil
 	}
-	ag, err := wallet.Load(c.opts.Account)
+	// Canonicalize the master synonyms (""/main/master/default, any case) to the
+	// "main" alias onboard/init store the default key under — a raw "--account
+	// master" must not miss the keychain entry "agent:main" and fail exit 30 on
+	// a correctly onboarded box.
+	ag, err := wallet.Load(config.CanonicalAccount(c.opts.Account))
 	if err != nil {
 		if errors.Is(err, wallet.ErrNoAgentKey) {
 			return nil, output.Auth("no_agent_key", err.Error()).
