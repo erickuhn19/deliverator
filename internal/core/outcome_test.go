@@ -177,7 +177,10 @@ func TestOutcomeRiskCapAtStake(t *testing.T) {
 	cfg := config.Default()
 	cfg.Risk.MaxOrderNotionalUSD = 30 // cap interpreted as at-stake (size×price)
 	cfg.Risk.MinOrderNotionalUSD = 10
-	c, ctx := newTestClient(t, cfg, Options{DryRun: true}, func(_, _ string, _ map[string]any) (int, string) {
+	c, ctx := newTestClient(t, cfg, Options{DryRun: true}, func(_, typ string, _ map[string]any) (int, string) {
+		if typ == "frontendOpenOrders" {
+			return 200, `[]` // the position cap counts resting orders (fail-closed read)
+		}
 		return 200, `{}`
 	})
 	c.Meta().AddOutcomes(&hl.OutcomeMeta{Outcomes: []hl.OutcomeInfo{

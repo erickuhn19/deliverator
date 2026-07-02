@@ -51,6 +51,9 @@ func riskCfg(r config.Risk) *config.Config {
 	return c
 }
 
+// gateErr discards checkPortfolioGates' warnings so gate assertions read cleanly.
+func gateErr(_ []string, err error) error { return err }
+
 func assertRiskCode(t *testing.T, err error, code string) {
 	t.Helper()
 	var oe *output.Error
@@ -69,29 +72,29 @@ const noSpot = `{"balances":[]}`
 func TestGateAccountLeverage(t *testing.T) {
 	clearing := clearingWith("1000", posWith("BTC", "0.02", "1000")) // long $1000, equity 1000 => 1x
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxAccountLeverage: 2}), Options{}, gateResp(&clearing, noSpot))
-	if err := c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 400}}); err != nil {
+	if err := gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 400}})); err != nil {
 		t.Fatalf("1.4x within the 2x cap must pass: %v", err)
 	}
-	assertRiskCode(t, c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1500}}), "max_account_leverage") // 2.5x
+	assertRiskCode(t, gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1500}})), "max_account_leverage") // 2.5x
 }
 
 func TestGateNetExposure(t *testing.T) {
 	clearing := clearingWith("100000") // flat, high equity so leverage never trips
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxNetExposureUSD: 1000}), Options{}, gateResp(&clearing, noSpot))
 	// A hedged book nets out: +1500 long, -800 short => |net| 700, within cap.
-	if err := c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1500}, {"ETH", -800}}); err != nil {
+	if err := gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1500}, {"ETH", -800}})); err != nil {
 		t.Fatalf("net 700 within 1000 cap must pass: %v", err)
 	}
-	assertRiskCode(t, c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1500}}), "max_net_exposure")
+	assertRiskCode(t, gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1500}})), "max_net_exposure")
 }
 
 func TestGateConcentration(t *testing.T) {
 	clearing := clearingWith("1000")
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxConcentrationPctPerCoin: 100}), Options{}, gateResp(&clearing, noSpot))
-	if err := c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 800}}); err != nil {
+	if err := gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 800}})); err != nil {
 		t.Fatalf("80%% of equity within the 100%% cap must pass: %v", err)
 	}
-	assertRiskCode(t, c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1500}}), "max_concentration") // 150%
+	assertRiskCode(t, gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1500}})), "max_concentration") // 150%
 }
 
 // ---- trajectory gates (persistent peak / daily anchor) ----
@@ -99,31 +102,34 @@ func TestGateConcentration(t *testing.T) {
 func TestGateDrawdown(t *testing.T) {
 	clearing := clearingWith("1000")
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxDrawdownPct: 20}), Options{}, gateResp(&clearing, noSpot))
-	if err := c.checkPortfolioGates(ctx, nil); err != nil { // peak = 1000
+	if err := gateErr(c.checkPortfolioGates(ctx, nil)); err != nil { // peak = 1000
 		t.Fatalf("first observation sets the peak, must pass: %v", err)
 	}
 	clearing = clearingWith("700") // 30% below peak
-	assertRiskCode(t, c.checkPortfolioGates(ctx, nil), "max_drawdown")
+	assertRiskCode(t, gateErr(c.checkPortfolioGates(ctx, nil)), "max_drawdown")
 }
 
 func TestGateDailyLoss(t *testing.T) {
 	clearing := clearingWith("1000")
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxDailyLossUSD: 100}), Options{}, gateResp(&clearing, noSpot))
-	if err := c.checkPortfolioGates(ctx, nil); err != nil { // anchor = 1000
+	if err := gateErr(c.checkPortfolioGates(ctx, nil)); err != nil { // anchor = 1000
 		t.Fatalf("first observation sets the daily anchor, must pass: %v", err)
 	}
 	clearing = clearingWith("850") // $150 loss > $100 cap
-	assertRiskCode(t, c.checkPortfolioGates(ctx, nil), "max_daily_loss")
+	assertRiskCode(t, gateErr(c.checkPortfolioGates(ctx, nil)), "max_daily_loss")
 }
 
 func TestObserveEquityDayRolloverAndPeak(t *testing.T) {
 	testHome(t)
 	seed, _ := json.Marshal(riskState{PeakEquity: 5000, Day: "1970-01-01", DayAnchorEquity: 5000, Basis: currentEquityBasis})
-	_ = os.MkdirAll(filepath.Dir(riskStatePath()), 0o700)
-	if err := os.WriteFile(riskStatePath(), seed, 0o600); err != nil {
+	_ = os.MkdirAll(filepath.Dir(riskStatePath("testnet", testMaster)), 0o700)
+	if err := os.WriteFile(riskStatePath("testnet", testMaster), seed, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	dd, dlUSD, dlPct, err := observeEquity(1000)
+	dd, dlUSD, dlPct, fresh, err := observeEquity("testnet", testMaster, 1000)
+	if fresh {
+		t.Fatal("a valid persisted peak must not report fresh anchors")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +151,7 @@ func TestGateFailsClosedOnUnreadableState(t *testing.T) {
 		return 200, `[]`
 	}
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxAccountLeverage: 2}), Options{}, resp)
-	if err := c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 100}}); err == nil {
+	if err := gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 100}})); err == nil {
 		t.Fatal("an unreadable account snapshot must fail closed (reject), not pass")
 	}
 }
@@ -156,11 +162,11 @@ func TestGateEquityFallsBackToCollateralWhenFlat(t *testing.T) {
 	spot := `{"balances":[{"coin":"USDC","token":0,"hold":"0","total":"500","entryNtl":"0"}],"tokenToAvailableAfterMaintenance":[[0,"500"]]}`
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxAccountLeverage: 2}), Options{}, gateResp(&clearing, spot))
 	// equity falls back to 500: +800 => 1.6x, within 2x.
-	if err := c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 800}}); err != nil {
+	if err := gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 800}})); err != nil {
 		t.Fatalf("equity should fall back to $500 collateral (1.6x ok): %v", err)
 	}
 	// +1200 => 2.4x > 2x.
-	assertRiskCode(t, c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1200}}), "max_account_leverage")
+	assertRiskCode(t, gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1200}})), "max_account_leverage")
 }
 
 // Live-found bug: a unified account WITH a position reads a tiny perp
@@ -172,7 +178,7 @@ func TestGateEquityUsesGreaterOfAccountValueAndCollateral(t *testing.T) {
 	spot := `{"balances":[{"coin":"USDC","token":0,"hold":"0","total":"145","entryNtl":"0"}],"tokenToAvailableAfterMaintenance":[[0,"145.11"]]}`
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxAccountLeverage: 0.5}), Options{}, gateResp(&clearing, spot))
 	// Add ~$15.2: resulting SOL ~$30.4 / equity max(3.04,145.11)=145.11 = 0.21x < 0.5 => pass.
-	if err := c.checkPortfolioGates(ctx, []exposureDelta{{"SOL", 15.2}}); err != nil {
+	if err := gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"SOL", 15.2}})); err != nil {
 		t.Fatalf("equity must use the $145 collateral (0.21x), not the $3 margin slice: %v", err)
 	}
 }
@@ -183,11 +189,11 @@ func TestGateMaxOpenPositions(t *testing.T) {
 	clearing := clearingWith("100000", posWith("BTC", "0.1", "5000"), posWith("ETH", "1", "3000")) // 2 open
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxOpenPositions: 2}), Options{}, gateResp(&clearing, noSpot))
 	// Adding to an existing coin keeps the count at 2 → allowed.
-	if err := c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1000}}); err != nil {
+	if err := gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"BTC", 1000}})); err != nil {
 		t.Fatalf("adding to an existing position must pass: %v", err)
 	}
 	// Opening a 3rd distinct coin → 3 > cap 2 → reject.
-	assertRiskCode(t, c.checkPortfolioGates(ctx, []exposureDelta{{"SOL", 1000}}), "max_open_positions")
+	assertRiskCode(t, gateErr(c.checkPortfolioGates(ctx, []exposureDelta{{"SOL", 1000}})), "max_open_positions")
 }
 
 // ---- reduce-only flip guard ----

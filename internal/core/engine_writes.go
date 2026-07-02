@@ -399,6 +399,7 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 	// Notional + risk gate. Reduce-only orders can't increase exposure, so they
 	// skip the notional caps entirely (and need no reference price for them).
 	notional, posNotional := 0.0, 0.0
+	var book *gateBook // the invocation's ONE open-orders read, shared cap → gates
 	if !req.ReduceOnly {
 		refPx := limitF
 		switch {
@@ -435,18 +436,41 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 			refPx = c.marketableGuardPx(ctx, mk.Coin, req.Side, limitF)
 		}
 		notional = refPx * szF
-		if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
-			posNotional = notional + c.currentPositionNotional(ctx, mk.Coin)
+		// The cap basis is read only when the cap will actually be evaluated: a
+		// Closing (spot exit) order is exempt from the max caps in staticChecks,
+		// and de-risking must never be blocked by the fail-closed read below.
+		if c.cfg.Risk.MaxPositionNotionalUSD > 0 && !req.Closing {
+			// Position + same-side resting pending-adds, fail-CLOSED on any read
+			// failure: an unreadable book must reject an exposure-adding order
+			// (retryable exit 40), never evaluate the cap as if flat. The book is
+			// fetched ONCE and re-used by the portfolio gates below (one weight-20
+			// read per write, not one per gate).
+			b, berr := c.fetchGateBook(ctx)
+			if berr != nil {
+				return nil, nil, berr
+			}
+			book = b
+			base, berr := c.positionCapBase(ctx, mk.Coin, req.Side, book)
+			if berr != nil {
+				return nil, nil, berr
+			}
+			posNotional = notional + base
 		}
 	}
-	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: isMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly, Closing: req.Closing, HaltExempt: req.panicFlatten}); err != nil {
+	// limit_only must treat a trigger that EXECUTES as a market order when it
+	// fires (is_market=true — possibly instantly, if the trigger px is already
+	// crossed) as a market order; exits (reduce-only/closing) stay exempt.
+	gateIsMarket := isMarket || (req.Trigger != nil && req.Trigger.IsMarket)
+	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: gateIsMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly, Closing: req.Closing, HaltExempt: req.panicFlatten}); err != nil {
 		return nil, nil, err
 	}
 	// Account-wide gates run against the resulting book; a reduce-only/closing
 	// order adds no exposure, so it is exempt (it can only shrink the book).
 	if !req.ReduceOnly && !req.Closing {
-		if perr := c.checkPortfolioGates(ctx, []exposureDelta{{coin: mk.Coin, signedNotional: signedNotional(req.Side, notional)}}); perr != nil {
-			return nil, nil, perr
+		gw, perr := c.checkPortfolioGatesBook(ctx, []exposureDelta{{coin: mk.Coin, signedNotional: signedNotional(req.Side, notional)}}, book)
+		warnings = append(warnings, gw...)
+		if perr != nil {
+			return nil, warnings, perr
 		}
 	} else if req.ReduceOnly {
 		if ferr := c.reduceOnlyFlipErr(ctx, mk.Coin, req.Side, szF); ferr != nil {
@@ -723,14 +747,28 @@ func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResu
 	}
 	notional := refPx * szF
 	posNotional := 0.0
+	var book *gateBook // one open-orders read, shared cap → gates (parity with Place)
 	if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
-		posNotional = notional + c.currentPositionNotional(ctx, mk.Coin)
+		// Position + same-side resting pending-adds, fail-CLOSED on read failure
+		// (see positionCapBase) — parity with Place.
+		b, berr := c.fetchGateBook(ctx)
+		if berr != nil {
+			return nil, warnings, berr
+		}
+		book = b
+		base, berr := c.positionCapBase(ctx, mk.Coin, req.Side, book)
+		if berr != nil {
+			return nil, warnings, berr
+		}
+		posNotional = notional + base
 	}
 	if rerr := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: isMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD}); rerr != nil {
 		return nil, warnings, rerr
 	}
 	// The bracket ENTRY is the only new-exposure leg (tp/sl are reduce-only).
-	if perr := c.checkPortfolioGates(ctx, []exposureDelta{{coin: mk.Coin, signedNotional: signedNotional(req.Side, notional)}}); perr != nil {
+	gw, perr := c.checkPortfolioGatesBook(ctx, []exposureDelta{{coin: mk.Coin, signedNotional: signedNotional(req.Side, notional)}}, book)
+	warnings = append(warnings, gw...)
+	if perr != nil {
 		return nil, warnings, perr
 	}
 
@@ -1025,15 +1063,17 @@ func roundPxF(px float64, mk Market) (float64, error) {
 const maxBatchOrders = 100
 
 // batchLegErr prefixes a pre-flight leg failure with its order index, preserving
-// the error's category/code/hint so the exit code and remediation are unchanged.
+// EVERYTHING else about the error: category/code/hint keep the exit code and
+// remediation unchanged, and retryable/retry_after_ms/cloids are agent contract —
+// a fail-closed gate-input read error must stay "back off and retry" (exit 40,
+// retryable:true), not degrade into a permanent-looking failure that stops an
+// agent keying on the envelope's retryable field.
 func batchLegErr(i int, err error) error {
 	var oe *output.Error
 	if errors.As(err, &oe) {
-		ne := output.NewError(oe.Category, oe.Code, fmt.Sprintf("order %d: %s", i, oe.Message))
-		if oe.Hint != "" {
-			ne.WithHint(oe.Hint)
-		}
-		return ne
+		ne := *oe // shallow copy; only the message changes
+		ne.Message = fmt.Sprintf("order %d: %s", i, oe.Message)
+		return &ne
 	}
 	return fmt.Errorf("order %d: %w", i, err)
 }
@@ -1058,7 +1098,9 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 	warnings := []string{}
 	orders := make([]hl.CreateOrderRequest, 0, len(reqs))
 	results := make([]*PlaceResult, 0, len(reqs))
-	posSeed := map[string]float64{} // running resulting-position notional per coin
+	posSeed := map[string]float64{}  // live position notional per coin, fetched once per coin
+	batchAdd := map[string]float64{} // running intra-batch add notional per coin (both sides — conservative)
+	var book *gateBook               // resting-order book, fetched once per batch (shared with the portfolio gates)
 	seenCloid := map[string]bool{}
 	var builder *hl.BuilderInfo
 	builderResolved := false
@@ -1132,16 +1174,41 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 				refPx = c.marketableGuardPx(ctx, mk.Coin, req.Side, pxF)
 			}
 			notional = refPx * ro.szF
-			if _, seeded := posSeed[mk.Coin]; !seeded {
-				posSeed[mk.Coin] = c.currentPositionNotional(ctx, mk.Coin)
+			if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
+				// Cumulative cap basis: live position (fetched once per coin) + THIS
+				// LEG'S side's resting pending-adds (order book fetched ONCE for the
+				// whole batch — never per leg or per coin — and re-used by the
+				// portfolio gates below) + earlier same-coin legs (both sides —
+				// conservative). The pending term must use the leg's OWN side,
+				// never the side of the first leg that touched the coin: otherwise
+				// a tiny opposite-side leg prepended to the batch hides every
+				// resting same-side order from the cap. Fail-CLOSED on any read
+				// failure, exactly like single Place (retryable exit 40).
+				if book == nil {
+					b, perr := c.fetchGateBook(ctx)
+					if perr != nil {
+						return nil, warnings, batchLegErr(i, perr)
+					}
+					book = b
+				}
+				if _, seeded := posSeed[mk.Coin]; !seeded {
+					cur, cerr := c.currentPositionNotional(ctx, mk.Coin)
+					if cerr != nil {
+						return nil, warnings, batchLegErr(i, cerr)
+					}
+					posSeed[mk.Coin] = cur
+				}
+				batchAdd[mk.Coin] += notional
+				posNotional = posSeed[mk.Coin] + pendingSideNotional(book.pending, mk.Coin, req.Side) + batchAdd[mk.Coin]
 			}
-			posSeed[mk.Coin] += notional
-			posNotional = posSeed[mk.Coin]
 			portfolioDeltas = append(portfolioDeltas, exposureDelta{coin: mk.Coin, signedNotional: signedNotional(req.Side, notional)})
 		} else if ferr := c.reduceOnlyFlipErr(ctx, mk.Coin, req.Side, ro.szF); ferr != nil {
 			return nil, warnings, batchLegErr(i, ferr)
 		}
-		if rerr := c.staticChecks(riskCheck{Coin: mk.Coin, IsMarket: ro.isMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly}); rerr != nil {
+		// limit_only: a trigger leg with is_market=true EXECUTES as a market order
+		// when it fires — gate it as market, like single Place (exits stay exempt).
+		gateIsMarket := ro.isMarket || (req.Trigger != nil && req.Trigger.IsMarket)
+		if rerr := c.staticChecks(riskCheck{Coin: mk.Coin, IsMarket: gateIsMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly}); rerr != nil {
 			return nil, warnings, batchLegErr(i, rerr)
 		}
 
@@ -1209,7 +1276,9 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 	// whole batch fully gated, and every reduce-only leg has already passed the
 	// flip guard above.
 	if len(portfolioDeltas) > 0 {
-		if perr := c.checkPortfolioGates(ctx, portfolioDeltas); perr != nil {
+		gw, perr := c.checkPortfolioGatesBook(ctx, portfolioDeltas, book)
+		warnings = append(warnings, gw...)
+		if perr != nil {
 			return nil, warnings, perr
 		}
 	}
@@ -1866,7 +1935,7 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 		return nil, nil, err
 	}
 	// Normalize the cloid to its canonical 0x+lowercase form before matching, so
-	// findResting (which compares against frontendOpenOrders) and the rebuilt
+	// matchResting (which compares against frontendOpenOrders) and the rebuilt
 	// order agree — a bare 32-hex cloid is valid input but would otherwise miss.
 	if oid == nil && cloid != "" {
 		norm, err := normalizeCloid(cloid)
@@ -1876,8 +1945,28 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 		}
 		cloid = norm
 	}
-	existing, ok := c.findResting(ctx, oid, cloid)
+	// ONE open-orders fetch for the whole invocation (weight 20): it resolves
+	// the target AND supplies the resting book the risk gates evaluate below.
+	// Sourced from frontendOpenOrders — the only query that reliably carries
+	// the order's TIF and trigger flag (orderStatus-by-cloid returns an empty
+	// tif), and a modify only ever targets a resting order. A FULL read failure
+	// rejects retryably (exit 40, parity with ModifyBatch); a degraded sub-dex
+	// sweep is tolerated HERE (matching stays possible on the readable dexes)
+	// and re-checked below, where an exposure-INCREASING modify needs the
+	// COMPLETE book.
+	orders, staleDexs, oerr := c.allOpenOrdersStale(ctx)
+	if oerr != nil {
+		return nil, nil, mapNetwork("open_orders", oerr)
+	}
+	existing, ok := matchResting(orders, oid, cloid)
 	if !ok {
+		if len(staleDexs) > 0 {
+			// The order may live on the unreadable dex — reject retryably, not as
+			// a terminal validation error the agent would give up on.
+			return nil, nil, output.Network("open_orders_read",
+				"no resting order matches that oid/cloid on the readable dexes, and sub-dex(es) "+strings.Join(staleDexs, ", ")+" could not be read — the order may live there").Retry().
+				WithHint("transient read failure — back off and retry, or list with `deliverator orders`")
+		}
 		return nil, nil, output.Validation("order_not_found", "no resting order matches that oid/cloid").
 			WithHint("list with `deliverator orders`")
 	}
@@ -1930,10 +2019,26 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 	pxF, _ := strconv.ParseFloat(pxOut, 64)
 
 	// A modify can grow a resting order to any size/price — gate it with the
-	// same gauntlet Place uses (halt, allowlist, notional caps, rate cap). A
-	// reduce-only order can't increase exposure, so it skips the notional caps.
+	// same gauntlet Place uses (halt, allowlist, notional caps, rate cap) AND
+	// the account-wide portfolio gates (#43). Exposure basis: after the modify
+	// the resting book contains the REPLACEMENT (new size @ new limit, same
+	// side and reduce-only flag) INSTEAD OF the old order — the old order's
+	// worst-case contribution comes out of the pending-adds fold and the
+	// replacement's goes in, so an order never double-counts itself on a
+	// routine re-price. A reduce-only order keeps contributing zero on both
+	// sides of the swap and skips the notional caps, as before. A modify that
+	// does not RAISE the order's worst-case contribution (size AND
+	// limit-valued notional both <= the old resting order's) is de-risking —
+	// parity with the all-reduce-only batch exemption — and skips the position
+	// cap and portfolio gates entirely: shrinking must never be blocked by an
+	// already-tripped drawdown/daily-loss pause or an unreadable book. The
+	// per-order caps/floor (max_order_notional, min floor) apply as before.
 	notional, posNotional := 0.0, 0.0
+	increase := false
+	var book *gateBook
 	if !existing.ReduceOnly {
+		newPendingN := szF * pxF // limit-valued, exactly like the resting-book fold
+		increase = szF > existing.RemainingSz+1e-9 || newPendingN > existing.PendingNotional+1e-6
 		// A modify to a crossing limit fills at the market — price the guard at the
 		// mid (the wire pxF still carries the new limit), same as Place/PlaceBatch.
 		refPx := pxF
@@ -1941,12 +2046,41 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 			refPx = c.marketableGuardPx(ctx, mk.Coin, side, pxF)
 		}
 		notional = refPx * szF
-		if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
-			posNotional = notional + c.currentPositionNotional(ctx, mk.Coin)
+		if increase && (c.cfg.Risk.MaxPositionNotionalUSD > 0 || c.portfolioGuardsActive()) {
+			// An exposure-INCREASING modify needs the COMPLETE resting book: the
+			// partial sweep tolerated above is not enough once exposure grows.
+			if len(staleDexs) > 0 {
+				return nil, warnings, staleOrdersErr(staleDexs)
+			}
+			pending := pendingAddsFromOrders(orders)
+			applyModifyReplacement(pending, existing, 0) // old order out; the replacement is added below
+			book = &gateBook{orders: orders, pending: pending}
+			if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
+				// Fail-CLOSED position read (retryable exit 40 on failure). Basis:
+				// filled position + the OTHER resting same-side orders + this
+				// replacement (via notional) — never the old order.
+				cur, cerr := c.currentPositionNotional(ctx, mk.Coin)
+				if cerr != nil {
+					return nil, warnings, cerr
+				}
+				posNotional = notional + cur + pendingSideNotional(pending, mk.Coin, side)
+			}
+			addPendingSide(book.pending, existing.Coin, side, newPendingN) // the replacement, at its new worst case
 		}
 	}
 	if rerr := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: false, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: existing.ReduceOnly}); rerr != nil {
 		return nil, warnings, rerr
+	}
+	// Account-wide gates (#43) on the resulting book — the replacement is in
+	// the pending fold, so no extra delta is passed; the book threads the one
+	// open-orders read through (no second fetch). Skipped when the modify does
+	// not increase worst-case exposure (de-risking, see above).
+	if increase {
+		gw, perr := c.checkPortfolioGatesBook(ctx, nil, book)
+		warnings = append(warnings, gw...)
+		if perr != nil {
+			return nil, warnings, perr
+		}
 	}
 
 	// Preserve the order's client id across the modify. A modify cancels the old
@@ -2041,7 +2175,11 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 	if err := c.requireQueryAddr(); err != nil {
 		return nil, nil, err
 	}
-	orders, err := c.allOpenOrders(ctx)
+	// ONE open-orders fetch for the whole batch (weight 20): it resolves every
+	// leg AND supplies the resting book the risk gates evaluate. A degraded
+	// sub-dex sweep is tolerated for resolution and fails CLOSED below only
+	// when a leg INCREASES exposure (parity with single Modify).
+	orders, staleDexs, err := c.allOpenOrdersStale(ctx)
 	if err != nil {
 		return nil, nil, mapNetwork("open_orders", err)
 	}
@@ -2055,6 +2193,13 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 	results := make([]*PlaceResult, 0, len(reqs))
 	posSeed := map[string]float64{}
 	seen := map[string]bool{}
+	capActive := c.cfg.Risk.MaxPositionNotionalUSD > 0
+	gatesActive := c.portfolioGuardsActive()
+	// pendingWork is the WORKING resting book: each leg's replacement is applied
+	// as the loop advances, so later legs (and the portfolio gates, run once at
+	// the end) see the book with all earlier modifies already in effect.
+	var pendingWork map[string]pendingAdd
+	anyIncrease := false
 	for i, req := range reqs {
 		cloid := req.Cloid
 		if req.Oid == nil {
@@ -2069,6 +2214,12 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 		}
 		existing, ok := matchResting(orders, req.Oid, cloid)
 		if !ok {
+			if len(staleDexs) > 0 {
+				// The order may live on the unreadable dex — reject retryably.
+				return nil, warnings, batchLegErr(i, output.Network("open_orders_read",
+					"no resting order matches that oid/cloid on the readable dexes, and sub-dex(es) "+strings.Join(staleDexs, ", ")+" could not be read — the order may live there").Retry().
+					WithHint("transient read failure — back off and retry, or list with `deliverator orders`"))
+			}
 			return nil, warnings, batchLegErr(i, output.Validation("order_not_found", "no resting order matches that oid/cloid"))
 		}
 		// Reject a duplicate target — dedup on the RESOLVED order's oid so the oid
@@ -2116,17 +2267,43 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 			}
 			notional = refPx * szF
 			// A modify REPLACES a resting order — unlike PlaceBatch, legs are NOT
-			// summed, or a same-coin grid re-price would be rejected though exposure
-			// is unchanged. Each leg is evaluated against the filled position alone,
-			// exactly like a single Modify. Cache the position per coin, fetched only
-			// when the cap is active.
-			if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
-				base, seeded := posSeed[mk.Coin]
-				if !seeded {
-					base = c.currentPositionNotional(ctx, mk.Coin)
-					posSeed[mk.Coin] = base
+			// summed on top of the old book, or a same-coin grid re-price would
+			// double-count itself. Each leg sees the working book with all
+			// EARLIER legs' replacements applied and its OWN old order removed
+			// (the replacement enters via notional). A leg that does not raise
+			// its order's worst-case contribution is de-risking and skips the
+			// cap, exactly like a single Modify; its replacement still updates
+			// the working book for the later legs and the portfolio gates.
+			newPendingN := szF * pxF
+			increase := szF > existing.RemainingSz+1e-9 || newPendingN > existing.PendingNotional+1e-6
+			if increase {
+				anyIncrease = true
+			}
+			if capActive || gatesActive {
+				if increase && len(staleDexs) > 0 {
+					// An exposure-INCREASING leg needs the COMPLETE resting book.
+					return nil, warnings, batchLegErr(i, staleOrdersErr(staleDexs))
 				}
-				posNotional = notional + base
+				if pendingWork == nil {
+					pendingWork = pendingAddsFromOrders(orders)
+				}
+				applyModifyReplacement(pendingWork, existing, 0) // own old order out
+				if capActive && increase {
+					base, seeded := posSeed[mk.Coin]
+					if !seeded {
+						// Fail-CLOSED on a read failure (retryable exit 40), like everywhere.
+						var cerr error
+						base, cerr = c.currentPositionNotional(ctx, mk.Coin)
+						if cerr != nil {
+							return nil, warnings, batchLegErr(i, cerr)
+						}
+						posSeed[mk.Coin] = base
+					}
+					posNotional = notional + base + pendingSideNotional(pendingWork, mk.Coin, existing.Side)
+				}
+				// The replacement, at its new limit-valued worst case — later legs
+				// and the portfolio gates below see the post-modify book.
+				addPendingSide(pendingWork, existing.Coin, existing.Side, newPendingN)
 			}
 		}
 		if gerr := c.staticChecks(riskCheck{Coin: mk.Coin, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: existing.ReduceOnly}); gerr != nil {
@@ -2170,6 +2347,21 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 			r.Rounded = rounding
 		}
 		results = append(results, r)
+	}
+
+	// Account-wide gates (#43) run ONCE against the resulting book: every
+	// modified order REPLACED at its new size/price in pendingWork (reduce-only
+	// legs keep contributing zero). A batch whose every leg shrinks-or-holds
+	// adds no worst-case exposure and is exempt — parity with the
+	// all-reduce-only batch rule, so a tripped drawdown/daily-loss pause never
+	// blocks a de-risking re-price. One increasing leg gates the whole batch.
+	// The threaded book means no second open-orders fetch.
+	if anyIncrease && gatesActive {
+		gw, perr := c.checkPortfolioGatesBook(ctx, nil, &gateBook{orders: orders, pending: pendingWork})
+		warnings = append(warnings, gw...)
+		if perr != nil {
+			return nil, warnings, perr
+		}
 	}
 
 	// One signed action = one rate-cap charge, after the batch fully validates.
@@ -2535,6 +2727,7 @@ func (c *Client) Twap(ctx context.Context, req TwapReq) (*TwapResult, []string, 
 	// TWAPs only shrink a position, so — like reduce-only Place/Modify — they skip
 	// the notional math entirely and need no reference price to unwind.
 	notional, posNotional := 0.0, 0.0
+	var book *gateBook // one open-orders read, shared cap → gates (parity with Place)
 	if !req.ReduceOnly {
 		refPx, hasMid := c.midPrice(ctx, mk.Coin)
 		if !hasMid {
@@ -2547,14 +2740,27 @@ func (c *Client) Twap(ctx context.Context, req TwapReq) (*TwapResult, []string, 
 		}
 		notional = refPx * szF
 		if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
-			posNotional = notional + c.currentPositionNotional(ctx, mk.Coin)
+			// Position + same-side resting pending-adds, fail-CLOSED on read
+			// failure (see positionCapBase) — parity with Place.
+			b, berr := c.fetchGateBook(ctx)
+			if berr != nil {
+				return nil, warnings, berr
+			}
+			book = b
+			base, berr := c.positionCapBase(ctx, mk.Coin, req.Side, book)
+			if berr != nil {
+				return nil, warnings, berr
+			}
+			posNotional = notional + base
 		}
 	}
 	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: false, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly}); err != nil {
 		return nil, warnings, err
 	}
 	if !req.ReduceOnly {
-		if perr := c.checkPortfolioGates(ctx, []exposureDelta{{coin: mk.Coin, signedNotional: signedNotional(req.Side, notional)}}); perr != nil {
+		gw, perr := c.checkPortfolioGatesBook(ctx, []exposureDelta{{coin: mk.Coin, signedNotional: signedNotional(req.Side, notional)}}, book)
+		warnings = append(warnings, gw...)
+		if perr != nil {
 			return nil, warnings, perr
 		}
 	}
@@ -2899,33 +3105,131 @@ func (c *Client) positionSziRead(ctx context.Context, coin string) (float64, boo
 	return 0, true
 }
 
-func (c *Client) currentPositionNotional(ctx context.Context, coin string) float64 {
+// positionReadErr is the FAIL-CLOSED shape for a gate input that cannot be
+// read while a configured cap needs it: category network (exit 40),
+// retryable:true — "back off and retry", NOT exit 20's "respect the cap, stop
+// trying". Exposure-ADDING orders are rejected with it; reduce-only orders
+// never hit it (they skip the notional caps, and post-P0-A they carry r:true
+// on the wire so the exchange itself guarantees they only reduce).
+func positionReadErr(what, coin, detail string) error {
+	return output.Network("position_read",
+		"cannot read "+what+" for "+coin+" to enforce the configured risk caps: "+detail).Retry().
+		WithHint("transient read failure — back off and retry; the caps fail closed rather than assume a flat book")
+}
+
+// currentPositionNotional returns the coin's live position notional for the
+// per-coin max_position_notional cap. It FAILS CLOSED: a failed (429/500) or
+// address-less read returns an error instead of silently reporting a
+// phantom-flat book — callers gate exposure-ADDING orders on it and must
+// reject retryably (exit 40) when it errors.
+func (c *Client) currentPositionNotional(ctx context.Context, coin string) (float64, error) {
 	if c.queryAddr == "" {
-		return 0
+		return 0, output.Network("position_read",
+			"cannot read the current "+coin+" position to enforce the configured risk caps: no query address").Retry().
+			WithHint("set wallet.master_address (deliverator config set wallet.master_address 0x...) — the caps fail closed without position state")
 	}
 	// A HIP-4 outcome holding is a spot "+<enc>" token, not a perp AssetPosition, so
 	// the perp clearinghouse below reports 0 for it — letting an agent accumulate an
 	// unbounded outcome stake by splitting buys each under max_position_notional.
 	// Count the existing outcome holding's current value so the per-coin cap sees it
-	// (audit S3).
+	// (audit S3). Each read failure fails closed like the perp path: an unreadable
+	// or unvaluable holding must not evaluate as flat.
 	if strings.HasPrefix(coin, "#") {
+		ss, err := c.info.SpotUserState(ctx, c.queryAddr)
+		if err != nil {
+			return 0, positionReadErr("the spot outcome holdings", coin, err.Error())
+		}
+		if ss == nil || !hasOutcomeBalance(ss.Balances) {
+			return 0, nil // genuinely flat: no outcome tokens held
+		}
+		if c.meta.OutcomeMeta() == nil {
+			if err := c.EnsureOutcomes(ctx); err != nil || c.meta.OutcomeMeta() == nil {
+				detail := "universe unavailable"
+				if err != nil {
+					detail = err.Error()
+				}
+				return 0, positionReadErr("the outcome universe (needed to value held outcome tokens)", coin, detail)
+			}
+		}
+		mids, err := c.info.AllMids(ctx)
+		if err != nil {
+			return 0, positionReadErr("the mids (needed to value held outcome tokens)", coin, err.Error())
+		}
 		var sum float64
-		for _, pv := range c.outcomePositionsFromSpot(ctx, coin) {
+		for _, pv := range c.outcomePositionViews(ss.Balances, mids, coin) {
 			sum += absF(parseFloatSafe(pv.PositionValue))
 		}
-		return sum
+		return sum, nil
 	}
 	st, err := c.info.UserStateForDex(ctx, c.queryAddr, dexOf(coin))
 	if err != nil {
-		return 0
+		return 0, positionReadErr("the current position", coin, err.Error())
 	}
 	for _, ap := range st.AssetPositions {
 		if coinMatches(ap.Position.Coin, coin) {
 			f, _ := strconv.ParseFloat(ap.Position.PositionValue, 64)
-			return absF(f)
+			return absF(f), nil
 		}
 	}
-	return 0
+	return 0, nil
+}
+
+// staleOrdersErr is the fail-closed shape for an open-orders sweep whose
+// sub-dex leg(s) silently degraded while a configured cap/gate needs the
+// COMPLETE book — invisible resting orders are invisible exposure.
+func staleOrdersErr(stale []string) error {
+	return output.Network("open_orders_read",
+		"cannot read resting orders on sub-dex(es) "+strings.Join(stale, ", ")+" to enforce the configured risk caps").Retry().
+		WithHint("transient read failure — back off and retry; the caps fail closed rather than ignore resting exposure")
+}
+
+// fetchGateBook fetches the account's open-order book ONCE (one weight-20 info
+// call — never per coin, never per gate) for a write invocation's risk gates:
+// orders is threaded through to the portfolio snapshot (so the account-wide
+// gates never re-fetch the book) and pending is the per-coin worst-case
+// pending-add fold (see pendingAddsFromOrders). Resting non-reduce-only orders
+// are worst-case future exposure: without them, sequential single orders —
+// each passing the per-coin cap against the FILLED position — tunnel
+// arbitrarily far past it. FAILS CLOSED like currentPositionNotional,
+// including on a silently-failed sub-dex sweep (its resting orders would
+// otherwise be invisible to the cap).
+func (c *Client) fetchGateBook(ctx context.Context) (*gateBook, error) {
+	if c.queryAddr == "" {
+		return nil, output.Network("open_orders_read",
+			"cannot read resting orders to enforce the configured risk caps: no query address").Retry().
+			WithHint("set wallet.master_address (deliverator config set wallet.master_address 0x...) — the caps fail closed without order state")
+	}
+	orders, stale, err := c.allOpenOrdersStale(ctx)
+	if err != nil {
+		return nil, output.Network("open_orders_read",
+			"cannot read resting orders to enforce the configured risk caps: "+err.Error()).Retry().
+			WithHint("transient read failure — back off and retry; the caps fail closed rather than ignore resting exposure")
+	}
+	if len(stale) > 0 {
+		return nil, staleOrdersErr(stale)
+	}
+	if orders == nil {
+		orders = []hl.FrontendOpenOrder{} // fetched-and-empty (portfolioWith must not re-fetch)
+	}
+	return &gateBook{orders: orders, pending: pendingAddsFromOrders(orders)}, nil
+}
+
+// positionCapBase is the per-coin exposure base the max_position_notional cap
+// evaluates a NEW order against: live position notional + the worst-case
+// pending-add notional of resting non-reduce-only orders on the order's side.
+// Callers pre-fetch the book (fetchGateBook) so the same read also serves the
+// portfolio gates; a nil book fetches here (defensive fallback).
+func (c *Client) positionCapBase(ctx context.Context, coin string, side Side, book *gateBook) (float64, error) {
+	cur, err := c.currentPositionNotional(ctx, coin)
+	if err != nil {
+		return 0, err
+	}
+	if book == nil {
+		if book, err = c.fetchGateBook(ctx); err != nil {
+			return 0, err
+		}
+	}
+	return cur + pendingSideNotional(book.pending, coin, side), nil
 }
 
 // restingOrder is a normalized view of an existing order, sourced from
@@ -2941,6 +3245,11 @@ type restingOrder struct {
 	Cloid      string // the order's client id, if it carries one (preserved across a modify)
 	Tif        string // Gtc | Ioc | Alo — preserved across a modify ("" => Gtc)
 	IsTrigger  bool   // trigger orders cannot be modified in place (HL rejects it)
+	// RemainingSz / PendingNotional are the order's live unfilled size and its
+	// worst-case pending-add contribution to the risk gates' book fold (zero
+	// for reduce-only) — what a modify must swap OUT for its replacement.
+	RemainingSz     float64
+	PendingNotional float64
 }
 
 func sideOf(s hl.OrderSide) Side {
@@ -2950,20 +3259,10 @@ func sideOf(s hl.OrderSide) Side {
 	return Buy
 }
 
-func (c *Client) findResting(ctx context.Context, oid *int64, cloid string) (restingOrder, bool) {
-	// Source from frontendOpenOrders for both the oid and cloid paths: it is the
-	// only query that reliably carries the order's TIF and trigger flag
-	// (orderStatus-by-cloid returns an empty tif), and modify only ever targets a
-	// resting order, so the open-orders set is the right place to look.
-	orders, err := c.allOpenOrders(ctx)
-	if err != nil {
-		return restingOrder{}, false
-	}
-	return matchResting(orders, oid, cloid)
-}
-
-// matchResting resolves an oid/cloid against an already-fetched open-orders set,
-// so a batch can resolve every leg from a single read.
+// matchResting resolves an oid/cloid against an already-fetched open-orders set
+// (frontendOpenOrders — the only query that reliably carries the order's TIF
+// and trigger flag), so Modify/ModifyBatch resolve every target from the ONE
+// read that also feeds their risk gates.
 func matchResting(orders []hl.FrontendOpenOrder, oid *int64, cloid string) (restingOrder, bool) {
 	for _, o := range orders {
 		match := (oid != nil && o.Oid == *oid) ||
@@ -2974,12 +3273,14 @@ func matchResting(orders []hl.FrontendOpenOrder, oid *int64, cloid string) (rest
 		return restingOrder{
 			Oid:  o.Oid,
 			Coin: o.Coin, Side: sideOf(o.Side),
-			OrigSz:     strconv.FormatFloat(o.OrigSz, 'f', -1, 64),
-			LimitPx:    strconv.FormatFloat(o.LimitPx, 'f', -1, 64),
-			ReduceOnly: o.ReduceOnly,
-			Cloid:      derefStr(o.Cloid),
-			Tif:        string(o.Tif),
-			IsTrigger:  o.IsTrigger,
+			OrigSz:          strconv.FormatFloat(o.OrigSz, 'f', -1, 64),
+			LimitPx:         strconv.FormatFloat(o.LimitPx, 'f', -1, 64),
+			ReduceOnly:      o.ReduceOnly,
+			Cloid:           derefStr(o.Cloid),
+			Tif:             string(o.Tif),
+			IsTrigger:       o.IsTrigger,
+			RemainingSz:     o.Sz,
+			PendingNotional: pendingContribution(o),
 		}, true
 	}
 	return restingOrder{}, false
