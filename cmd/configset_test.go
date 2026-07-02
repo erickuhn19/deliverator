@@ -81,3 +81,54 @@ func TestConfigSetRiskCapReminder(t *testing.T) {
 		}
 	}
 }
+
+// `config set network mainnet` flips the single most safety-critical default of
+// a real-money tool: it must SUCCEED (never block automation) but surface a
+// loud before→after warning, like the risk.* caps do.
+func TestConfigSetNetworkChangeWarns(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DELIVERATOR_HOME", home)
+	if err := config.Default().Save(config.Path()); err != nil { // seeds network=testnet
+		t.Fatal(err)
+	}
+	saveFlag := flagConfig
+	flagConfig = ""
+	t.Cleanup(func() { flagConfig = saveFlag })
+
+	env, err := runCmd(t, configSetCmd, []string{"network", "mainnet"})
+	if err != nil {
+		t.Fatalf("config set network must not be blocked: %v", err)
+	}
+	if !env.OK {
+		t.Fatalf("config set network should succeed, got %+v", env)
+	}
+	warned := false
+	for _, w := range env.Warnings {
+		if strings.Contains(w, "network changed") && strings.Contains(w, "testnet → mainnet") &&
+			strings.Contains(w, "REAL-MONEY") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("a network change must surface a loud warning, got warnings: %v", env.Warnings)
+	}
+	// The change itself persisted (non-blocking, agent-in-the-loop policy).
+	got, err := config.Load(config.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Network != config.NetworkMainnet {
+		t.Fatalf("network change must persist, got %q", got.Network)
+	}
+
+	// Setting network to its CURRENT value is not a change — no warning.
+	env, err = runCmd(t, configSetCmd, []string{"network", "mainnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range env.Warnings {
+		if strings.Contains(w, "network changed") {
+			t.Fatalf("a no-op network set must not warn, got: %v", env.Warnings)
+		}
+	}
+}

@@ -320,10 +320,12 @@ func TestWriteConfigTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("template must be a valid loadable config: %v", err)
 	}
-	// Shipped defaults (opinionated onboarding): mainnet, xyz sub-dex, outcomes on,
-	// limit-only on. Locked here so a future template edit can't silently drop them.
+	// Shipped defaults (opinionated onboarding): MAINNET (testnet stays one
+	// `config set network` / console edit away — both warn), xyz sub-dex,
+	// outcomes on, limit-only on. Locked here so a future template edit can't
+	// silently drop them.
 	if loaded.Network != config.NetworkMainnet {
-		t.Errorf("shipped network = %q, want mainnet", loaded.Network)
+		t.Errorf("shipped network = %q, want mainnet (opinionated shipped default)", loaded.Network)
 	}
 	if !loaded.Outcomes {
 		t.Error("shipped default should enable outcomes")

@@ -90,7 +90,12 @@ func (e *Exchange) executeAction(ctx context.Context, action, result any) error 
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(resp, result)
+	if err := json.Unmarshal(resp, result); err != nil {
+		// A 200 whose body we can't parse (truncated by a dying connection, or
+		// wire drift): the action reached the exchange — outcome UNKNOWN.
+		return &TransportError{Sent: true, Err: err}
+	}
+	return nil
 }
 
 // executeChecked signs and posts an action whose SUCCESS response carries no
@@ -113,7 +118,8 @@ func (e *Exchange) executeChecked(ctx context.Context, action any) error {
 		Response json.RawMessage `json:"response"`
 	}
 	if err := json.Unmarshal(resp, &env); err != nil {
-		return err
+		// Unparseable 200 body: the action reached the exchange — outcome UNKNOWN.
+		return &TransportError{Sent: true, Err: err}
 	}
 	if env.Status != "ok" {
 		var msg string

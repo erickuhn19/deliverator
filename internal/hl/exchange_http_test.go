@@ -131,12 +131,75 @@ func TestMarketOpenUsesMids(t *testing.T) {
 	ex, ctx := testExchange(t, info, func(string, map[string]any) (int, string) {
 		return 200, `{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.1","avgPx":"68250","oid":50}}]}}}`
 	})
-	st, err := ex.MarketOpen(ctx, "BTC", true, 0.1, nil, 0.05, nil, nil)
+	st, err := ex.MarketOpen(ctx, "BTC", true, 0.1, nil, 0.05, nil, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Filled == nil || st.Filled.Oid != 50 {
 		t.Fatalf("market open: %+v", st)
+	}
+}
+
+// wireReduceOnly extracts the r flag of the first order in a posted /exchange
+// body; seen=false means no order action was captured.
+func wireReduceOnly(body map[string]any) (r, seen bool) {
+	action, _ := body["action"].(map[string]any)
+	orders, _ := action["orders"].([]any)
+	if len(orders) == 0 {
+		return false, false
+	}
+	o, _ := orders[0].(map[string]any)
+	r, _ = o["r"].(bool)
+	return r, true
+}
+
+// MarketOpen must carry the caller's reduce-only flag onto the wire — it was
+// hard-coded to r:false, silently dropping reduce-only from every single-order
+// market place (review P0-A).
+func TestMarketOpenWiresReduceOnly(t *testing.T) {
+	info := func(typ string, _ map[string]any) (int, string) {
+		if typ == "allMids" {
+			return 200, `{"BTC":"65000"}`
+		}
+		return 200, `{}`
+	}
+	for _, want := range []bool{true, false} {
+		var r, seen bool
+		ex, ctx := testExchange(t, info, func(_ string, body map[string]any) (int, string) {
+			r, seen = wireReduceOnly(body)
+			return 200, `{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.1","avgPx":"65000","oid":50}}]}}}`
+		})
+		if _, err := ex.MarketOpen(ctx, "BTC", false, 0.1, nil, 0.05, nil, nil, want); err != nil {
+			t.Fatal(err)
+		}
+		if !seen || r != want {
+			t.Fatalf("MarketOpen(reduceOnly=%v) wired r=%v (seen=%v)", want, r, seen)
+		}
+	}
+}
+
+// MarketClose flattens via a reduce-only IOC — pin r:true on the wire so the
+// close/panic paths can never regress into opening exposure (review P0-A).
+func TestMarketCloseWiresReduceOnly(t *testing.T) {
+	info := func(typ string, _ map[string]any) (int, string) {
+		switch typ {
+		case "clearinghouseState":
+			return 200, `{"assetPositions":[{"position":{"coin":"BTC","szi":"-0.5","positionValue":"32500","unrealizedPnl":"0","returnOnEquity":"0","marginUsed":"100","leverage":{"type":"isolated","value":5}},"type":"oneWay"}],"marginSummary":{"accountValue":"1000","totalMarginUsed":"100","totalNtlPos":"32500","totalRawUsd":"1000"},"crossMarginSummary":{"accountValue":"1000","totalMarginUsed":"100","totalNtlPos":"32500","totalRawUsd":"1000"},"withdrawable":"900"}`
+		case "allMids":
+			return 200, `{"BTC":"65000"}`
+		}
+		return 200, `{}`
+	}
+	var r, seen bool
+	ex, ctx := testExchange(t, info, func(_ string, body map[string]any) (int, string) {
+		r, seen = wireReduceOnly(body)
+		return 200, `{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.5","avgPx":"65000","oid":60}}]}}}`
+	})
+	if _, err := ex.MarketClose(ctx, "BTC", nil, nil, 0.05, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !seen || !r {
+		t.Fatalf("MarketClose must wire a reduce-only order (seen=%v r=%v)", seen, r)
 	}
 }
 

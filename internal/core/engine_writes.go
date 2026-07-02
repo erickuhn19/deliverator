@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +61,11 @@ type OrderReq struct {
 	// caps) like a perp reduce-only close, while keeping the $10 min floor. Set
 	// only by closeSpot — never from CLI/JSON input.
 	Closing bool
+	// panicFlatten marks a leg of Panic's emergency flatten: it bypasses the
+	// global-halt gate, because panic must work DURING a halt (see Panic).
+	// Unexported on purpose — only the core-internal panic path can set it, so
+	// no CLI flag or JSON input can dodge a halt on an ordinary order.
+	panicFlatten bool
 }
 
 // BuilderApplied reports the builder fee attached to an order.
@@ -433,7 +439,7 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 			posNotional = notional + c.currentPositionNotional(ctx, mk.Coin)
 		}
 	}
-	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: isMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly, Closing: req.Closing}); err != nil {
+	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: isMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly, Closing: req.Closing, HaltExempt: req.panicFlatten}); err != nil {
 		return nil, nil, err
 	}
 	// Account-wide gates run against the resulting book; a reduce-only/closing
@@ -443,7 +449,7 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 			return nil, nil, perr
 		}
 	} else if req.ReduceOnly {
-		if ferr := c.reduceOnlyFlipErr(ctx, mk.Coin, szF); ferr != nil {
+		if ferr := c.reduceOnlyFlipErr(ctx, mk.Coin, req.Side, szF); ferr != nil {
 			return nil, nil, ferr
 		}
 	}
@@ -500,12 +506,17 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 		return res, warnings, nil
 	}
 
+	// Persist the cloid BEFORE the exchange round trip: a crash/kill mid-flight
+	// must never lose the only copy of the idempotency key for a possibly-landed
+	// order (§5.4). The post-outcome row below still follows.
+	c.auditIntent(map[string]any{"cmd": "order", "coin": mk.Coin, "cloid": cloid})
+
 	isBuy := req.Side == Buy
 	var st hl.OrderStatus
 	serr := c.signed(ctx, func(ex *hl.Exchange) error {
 		var e error
 		if isMarket {
-			st, e = ex.MarketOpen(ctx, mk.Coin, isBuy, szF, nil, effSlip, &cloid, builder)
+			st, e = ex.MarketOpen(ctx, mk.Coin, isBuy, szF, nil, effSlip, &cloid, builder, req.ReduceOnly)
 		} else {
 			cr := hl.CreateOrderRequest{
 				Coin: mk.Coin, IsBuy: isBuy, Price: limitF, Size: szF,
@@ -534,7 +545,7 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 			"action": "order", "cloid": cloid, "coin": mk.Coin, "side": req.Side.String(),
 			"size": szOut, "limit_px": limitOut, "type": typ, "status": "error", "error": serr.Error(),
 		})
-		return nil, warnings, mapExchangeErr(serr)
+		return nil, warnings, withWriteCloids(mapExchangeErr(serr), cloid)
 	}
 	applyStatus(res, st)
 	c.audit.Append(withFill(map[string]any{
@@ -606,6 +617,28 @@ func auditLegs(results []*PlaceResult) []map[string]any {
 	legs := make([]map[string]any, len(results))
 	for i, r := range results {
 		legs[i] = auditLeg(r)
+	}
+	return legs
+}
+
+// auditIntent appends a minimal pre-send "intent" row — {action:"intent", cmd,
+// coin(s), cloid(s), ts} — immediately before a signed exchange round trip. If
+// the process dies mid-flight (SIGKILL, crash, supervisor watchdog) the trail
+// still carries the action's cloid(s), so the §5.4 status-check / reconcile
+// recovery stays runnable and a landed order is attributable to this instance
+// instead of surfacing as a foreign orphan. Readers of the trail skip unknown
+// action kinds, and the normal post-outcome row still follows on every path.
+func (c *Client) auditIntent(m map[string]any) {
+	m["action"] = "intent"
+	c.audit.Append(m)
+}
+
+// intentLegs distills multi-order legs into the minimal {coin, cloid} maps an
+// intent row carries (nested under "legs", where reconcile's id harvest looks).
+func intentLegs(results []*PlaceResult) []map[string]any {
+	legs := make([]map[string]any, len(results))
+	for i, r := range results {
+		legs[i] = map[string]any{"coin": r.Coin, "cloid": r.Cloid}
 	}
 	return legs
 }
@@ -744,6 +777,7 @@ func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResu
 		return out, warnings, nil
 	}
 
+	c.auditIntent(map[string]any{"cmd": "bracket", "coin": mk.Coin, "cloid": cloid})
 	var resp *hl.APIResponse[hl.OrderResponse]
 	serr := c.signed(ctx, func(ex *hl.Exchange) error {
 		var e error
@@ -751,10 +785,10 @@ func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResu
 		return e
 	})
 	if serr != nil {
-		return nil, warnings, mapExchangeErr(serr)
+		return nil, warnings, withWriteCloids(mapExchangeErr(serr), cloid)
 	}
 	if resp == nil || len(resp.Data.Statuses) == 0 {
-		return nil, warnings, output.Exchange("rejected", "bracket returned no statuses")
+		return nil, warnings, output.Exchange("rejected", "bracket returned no statuses").WithCloids(cloid)
 	}
 	results := make([]*PlaceResult, 0, len(resp.Data.Statuses))
 	for i, st := range resp.Data.Statuses {
@@ -912,6 +946,7 @@ func (c *Client) PlacePositionTpsl(ctx context.Context, req PositionTpslReq) ([]
 		return out, warnings, nil
 	}
 
+	c.auditIntent(map[string]any{"cmd": "position_tpsl", "coin": mk.Coin, "cloid": cloid})
 	var resp *hl.APIResponse[hl.OrderResponse]
 	serr := c.signed(ctx, func(ex *hl.Exchange) error {
 		var e error
@@ -919,10 +954,10 @@ func (c *Client) PlacePositionTpsl(ctx context.Context, req PositionTpslReq) ([]
 		return e
 	})
 	if serr != nil {
-		return nil, warnings, mapExchangeErr(serr)
+		return nil, warnings, withWriteCloids(mapExchangeErr(serr), cloid)
 	}
 	if resp == nil || len(resp.Data.Statuses) == 0 {
-		return nil, warnings, output.Exchange("rejected", "position tp/sl returned no statuses")
+		return nil, warnings, output.Exchange("rejected", "position tp/sl returned no statuses").WithCloids(cloid)
 	}
 	results := make([]*PlaceResult, 0, len(resp.Data.Statuses))
 	for i, st := range resp.Data.Statuses {
@@ -1103,7 +1138,7 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 			posSeed[mk.Coin] += notional
 			posNotional = posSeed[mk.Coin]
 			portfolioDeltas = append(portfolioDeltas, exposureDelta{coin: mk.Coin, signedNotional: signedNotional(req.Side, notional)})
-		} else if ferr := c.reduceOnlyFlipErr(ctx, mk.Coin, ro.szF); ferr != nil {
+		} else if ferr := c.reduceOnlyFlipErr(ctx, mk.Coin, req.Side, ro.szF); ferr != nil {
 			return nil, warnings, batchLegErr(i, ferr)
 		}
 		if rerr := c.staticChecks(riskCheck{Coin: mk.Coin, IsMarket: ro.isMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly}); rerr != nil {
@@ -1166,9 +1201,17 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 
 	// Account-wide gates run ONCE against the aggregate new exposure of the whole
 	// batch (a grid is a batch), so a book-leverage/net-exposure cap can't be
-	// tunneled under by fragmenting one position across many legs.
-	if perr := c.checkPortfolioGates(ctx, portfolioDeltas); perr != nil {
-		return nil, warnings, perr
+	// tunneled under by fragmenting one position across many legs. A batch whose
+	// EVERY leg is reduce-only contributes no deltas and is exempt — parity with
+	// Place/Twap's reduce-only exemption — so de-risking (grid --reduce-only, a
+	// multi-leg reduce) still works when an already-tripped drawdown/daily-loss/
+	// leverage gate is pausing NEW exposure. One exposure-adding leg keeps the
+	// whole batch fully gated, and every reduce-only leg has already passed the
+	// flip guard above.
+	if len(portfolioDeltas) > 0 {
+		if perr := c.checkPortfolioGates(ctx, portfolioDeltas); perr != nil {
+			return nil, warnings, perr
+		}
 	}
 
 	// All legs passed pre-flight. One signed action = one rate-cap charge — taken
@@ -1211,6 +1254,11 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 		return results, warnings, nil
 	}
 
+	// Persist every generated leg cloid BEFORE the round trip — for a batch the
+	// results slice is the only place they exist, and a landed-but-crashed batch
+	// with no trail row would surface as N foreign orphans (§5.4 unrunnable).
+	c.auditIntent(map[string]any{"cmd": "batch", "legs": intentLegs(results)})
+
 	var resp *hl.APIResponse[hl.OrderResponse]
 	serr := c.signed(ctx, func(ex *hl.Exchange) error {
 		var e error
@@ -1223,16 +1271,17 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 	// a network/signing error (serr != nil), or HL rejecting the WHOLE action at
 	// the envelope level ({"status":"err","response":"<reason>"} → Ok=false, Err
 	// set, no statuses), or an ok-but-empty body. Map serr if present; otherwise
-	// surface resp.Err (the action reason) — never deref a nil serr.
+	// surface resp.Err (the action reason) — never deref a nil serr. Either way
+	// the error carries ALL leg cloids so the batch retry protocol is runnable.
 	if resp == nil || len(resp.Data.Statuses) == 0 {
 		if serr != nil {
-			return nil, warnings, mapExchangeErr(serr)
+			return nil, warnings, withWriteCloids(mapExchangeErr(serr), legCloids(results)...)
 		}
 		msg := "batch returned no statuses"
 		if resp != nil && resp.Err != "" {
 			msg = resp.Err
 		}
-		return nil, warnings, mapOrderReject(msg)
+		return nil, warnings, withWriteCloids(mapOrderReject(msg), legCloids(results)...)
 	}
 	// Map each status back to its leg. HL returns 1:1 statuses for GroupingNA; if
 	// it ever returns FEWER, the unmatched trailing legs are flagged "unknown"
@@ -1307,6 +1356,15 @@ func (c *Client) BuildGrid(req GridReq) ([]OrderReq, error) {
 // Close flattens (or reduces) a position. Market close uses MarketClose; a limit
 // close places a reduce-only limit on the opposite side of the current position.
 func (c *Client) Close(ctx context.Context, coin, size string, market bool, limit, cloidIn string) (*PlaceResult, []string, error) {
+	return c.close(ctx, coin, size, market, limit, cloidIn, false)
+}
+
+// close is Close's implementation. panicFlatten is set ONLY by Panic's flatten
+// path: it bypasses the global-halt gate so the emergency flatten works during
+// a halt (the documented panic contract). It is core-internal — no CLI flag or
+// JSON input reaches it — so a plain close and every other write stay
+// halt-gated (exit 21).
+func (c *Client) close(ctx context.Context, coin, size string, market bool, limit, cloidIn string, panicFlatten bool) (*PlaceResult, []string, error) {
 	mk, ok := c.meta.Lookup(coin)
 	if !ok {
 		return nil, nil, unknownCoin(coin)
@@ -1315,19 +1373,19 @@ func (c *Client) Close(ctx context.Context, coin, size string, market bool, limi
 	if err != nil {
 		return nil, nil, err
 	}
-	if c.Halted() {
+	if !panicFlatten && c.Halted() {
 		return nil, nil, output.Halt("halted", "global halt active — close rejected").WithHint("deliverator halt off")
 	}
 
 	// A HIP-4 outcome "close" sells the held Yes/No side back (a token balance, no
 	// reduce-only concept) — like a spot close.
 	if mk.IsOutcome {
-		return c.closeOutcome(ctx, mk, size, market, limit, cloid)
+		return c.closeOutcome(ctx, mk, size, market, limit, cloid, panicFlatten)
 	}
 
 	// Spot has no position / reduce-only: a "close" sells the base token for USDC.
 	if mk.IsSpot {
-		return c.closeSpot(ctx, mk, size, market, limit, cloid)
+		return c.closeSpot(ctx, mk, size, market, limit, cloid, panicFlatten)
 	}
 
 	// Limit close: derive side from the live position, place reduce-only limit.
@@ -1344,7 +1402,7 @@ func (c *Client) Close(ctx context.Context, coin, size string, market bool, limi
 		if sz == "" {
 			sz = strconv.FormatFloat(absF(szi), 'f', -1, 64)
 		}
-		return c.Place(ctx, OrderReq{Coin: mk.Coin, Side: side, Size: sz, Limit: limit, ReduceOnly: true, Cloid: cloid})
+		return c.Place(ctx, OrderReq{Coin: mk.Coin, Side: side, Size: sz, Limit: limit, ReduceOnly: true, Cloid: cloid, panicFlatten: panicFlatten})
 	}
 
 	// Market close via the internal/hl MarketClose helper.
@@ -1376,6 +1434,7 @@ func (c *Client) Close(ctx context.Context, coin, size string, market bool, limi
 		res.Status = "dry_run"
 		return res, warnings, nil
 	}
+	c.auditIntent(map[string]any{"cmd": "close", "coin": mk.Coin, "cloid": cloid})
 	var st hl.OrderStatus
 	serr := c.signed(ctx, func(ex *hl.Exchange) error {
 		var e error
@@ -1386,7 +1445,7 @@ func (c *Client) Close(ctx context.Context, coin, size string, market bool, limi
 		return nil, warnings, mapOrderReject(*st.Error)
 	}
 	if serr != nil {
-		return nil, warnings, mapExchangeErr(serr)
+		return nil, warnings, withWriteCloids(mapExchangeErr(serr), cloid)
 	}
 	applyStatus(res, st)
 	c.audit.Append(withFill(map[string]any{"action": "close", "cloid": cloid, "coin": mk.Coin, "size": res.Size, "status": res.Status, "oid": res.Oid}, res))
@@ -1397,7 +1456,7 @@ func (c *Client) Close(ctx context.Context, coin, size string, market bool, limi
 // position/reduce-only concept, so the sell size comes from the (Total − Hold)
 // balance and the order is a plain sell — subject to the full risk gauntlet,
 // including the $10 floor (HL rejects sub-minimum spot orders too).
-func (c *Client) closeSpot(ctx context.Context, mk Market, size string, market bool, limit, cloid string) (*PlaceResult, []string, error) {
+func (c *Client) closeSpot(ctx context.Context, mk Market, size string, market bool, limit, cloid string, panicFlatten bool) (*PlaceResult, []string, error) {
 	if err := c.requireQueryAddr(); err != nil {
 		return nil, nil, err
 	}
@@ -1432,7 +1491,7 @@ func (c *Client) closeSpot(ctx context.Context, mk Market, size string, market b
 		}
 		sz = sellable.String()
 	}
-	req := OrderReq{Coin: mk.Coin, Side: Sell, Size: sz, Cloid: cloid, Closing: true}
+	req := OrderReq{Coin: mk.Coin, Side: Sell, Size: sz, Cloid: cloid, Closing: true, panicFlatten: panicFlatten}
 	if !market {
 		req.Limit = limit
 	}
@@ -1444,7 +1503,7 @@ func (c *Client) closeSpot(ctx context.Context, mk Market, size string, market b
 // the sell size is its (Total − Hold), and the order is a plain Closing sell —
 // exempt from the new-exposure guards but still subject to the $10 floor (HL rejects
 // sub-minimum orders, so a tiny remaining bet can only settle at expiry).
-func (c *Client) closeOutcome(ctx context.Context, mk Market, size string, market bool, limit, cloid string) (*PlaceResult, []string, error) {
+func (c *Client) closeOutcome(ctx context.Context, mk Market, size string, market bool, limit, cloid string, panicFlatten bool) (*PlaceResult, []string, error) {
 	if err := c.requireQueryAddr(); err != nil {
 		return nil, nil, err
 	}
@@ -1473,7 +1532,7 @@ func (c *Client) closeOutcome(ctx context.Context, mk Market, size string, marke
 		}
 		sz = sellable.String()
 	}
-	req := OrderReq{Coin: mk.Coin, Side: Sell, Size: sz, Cloid: cloid, Closing: true}
+	req := OrderReq{Coin: mk.Coin, Side: Sell, Size: sz, Cloid: cloid, Closing: true, panicFlatten: panicFlatten}
 	if !market {
 		req.Limit = limit
 	}
@@ -1909,6 +1968,7 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 		res.Status = "dry_run"
 		return res, warnings, nil
 	}
+	c.auditIntent(map[string]any{"cmd": "modify", "coin": mk.Coin, "cloid": preservedCloid, "oid": oid})
 	var st hl.OrderStatus
 	serr := c.signed(ctx, func(ex *hl.Exchange) error {
 		newOrder := hl.CreateOrderRequest{
@@ -1943,7 +2003,7 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 		return nil, warnings, mapOrderReject(*st.Error)
 	}
 	if serr != nil {
-		return nil, warnings, mapExchangeErr(serr)
+		return nil, warnings, withWriteCloids(mapExchangeErr(serr), preservedCloid)
 	}
 	applyStatus(res, st)
 	// Log the cloid the REPLACEMENT order actually carries (preservedCloid), not the
@@ -2125,6 +2185,7 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 		return results, warnings, nil
 	}
 
+	c.auditIntent(map[string]any{"cmd": "batch_modify", "legs": intentLegs(results)})
 	var resp *hl.APIResponse[hl.OrderResponse]
 	serr := c.signed(ctx, func(ex *hl.Exchange) error {
 		var e error
@@ -2133,13 +2194,13 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 	})
 	if resp == nil || len(resp.Data.Statuses) == 0 {
 		if serr != nil {
-			return nil, warnings, mapExchangeErr(serr)
+			return nil, warnings, withWriteCloids(mapExchangeErr(serr), legCloids(results)...)
 		}
 		msg := "batch modify returned no statuses"
 		if resp != nil && resp.Err != "" {
 			msg = resp.Err
 		}
-		return nil, warnings, mapOrderReject(msg)
+		return nil, warnings, withWriteCloids(mapOrderReject(msg), legCloids(results)...)
 	}
 	statuses := resp.Data.Statuses
 	for i, r := range results {
@@ -2175,7 +2236,9 @@ type PanicResult struct {
 // after the flatten), flatten ALL positions, then strictly RE-READ every dex to
 // confirm the teardown. Any dex whose read fails is surfaced in Degraded and sets
 // Complete=false, so a partial emergency-flatten is never reported as success. Not
-// halt-gated (panic must work during a halt). Audited as one "panic" row.
+// halt-gated (panic must work during a halt): cancel/twap-cancel never were, and
+// the flatten legs carry the core-internal panicFlatten bypass through close —
+// plain closes and every other write stay halt-rejected. Audited as one "panic" row.
 func (c *Client) Panic(ctx context.Context) (*PanicResult, error) {
 	if err := c.requireQueryAddr(); err != nil {
 		return nil, err
@@ -2213,7 +2276,7 @@ func (c *Client) Panic(ctx context.Context) (*PanicResult, error) {
 			if p.Side == "flat" {
 				continue
 			}
-			if r, _, e := c.Close(ctx, p.Coin, "", true, "", ""); e != nil {
+			if r, _, e := c.close(ctx, p.Coin, "", true, "", "", true); e != nil {
 				res.Complete = false
 				res.Closed = append(res.Closed, map[string]any{"coin": p.Coin, "error": e.Error()})
 			} else {
@@ -2515,6 +2578,9 @@ func (c *Client) Twap(ctx context.Context, req TwapReq) (*TwapResult, []string, 
 		return res, warnings, nil
 	}
 
+	// TWAPs carry no cloid, but the pre-send intent row still records that a
+	// signed twap action went out, for crash-time forensics/reconcile parity.
+	c.auditIntent(map[string]any{"cmd": "twap", "coin": mk.Coin})
 	isBuy := req.Side == Buy
 	var st hl.TwapStatus
 	serr := c.signed(ctx, func(ex *hl.Exchange) error {
@@ -2808,6 +2874,16 @@ func coinMatches(posCoin, want string) bool {
 }
 
 func (c *Client) positionSzi(ctx context.Context, coin string) (float64, bool) {
+	f, ok := c.positionSziRead(ctx, coin)
+	return f, ok && f != 0
+}
+
+// positionSziRead is positionSzi with FLAT distinguished from a failed read: ok
+// reports whether the clearinghouse state was READ (szi is then 0 when there is
+// no open position), while positionSzi's ok means "a nonzero position exists".
+// The reduce-only flip guard needs the distinction: flat is a hard reject
+// (nothing to reduce), an unreadable state is skipped.
+func (c *Client) positionSziRead(ctx context.Context, coin string) (float64, bool) {
 	if c.queryAddr == "" {
 		return 0, false
 	}
@@ -2817,11 +2893,10 @@ func (c *Client) positionSzi(ctx context.Context, coin string) (float64, bool) {
 	}
 	for _, ap := range st.AssetPositions {
 		if coinMatches(ap.Position.Coin, coin) {
-			f, err := strconv.ParseFloat(ap.Position.Szi, 64)
-			return f, err == nil && f != 0
+			return parseFloatSafe(ap.Position.Szi), true
 		}
 	}
-	return 0, false
+	return 0, true
 }
 
 func (c *Client) currentPositionNotional(ctx context.Context, coin string) float64 {
@@ -2954,17 +3029,103 @@ func mapOrderReject(msg string) error {
 	}
 }
 
+// unknownOutcomeErr is the exit-42 result for a write whose signed action may
+// have reached the exchange but whose response was never (fully) read: the
+// order may have landed, so the agent must run the §5.4 status-check protocol,
+// never blind-resubmit. The code stays "timeout" — the string agents already
+// match on for exit 42 — even though the class now covers resets/EOFs too.
+// Callers with the cloid in scope make the hint concrete via withWriteCloids.
+func unknownOutcomeErr(msg string) *output.Error {
+	return output.Timeout("timeout", msg+" — order outcome is UNKNOWN").
+		WithHint("run `deliverator order status --cloid <id>` before resubmitting (§5.4)")
+}
+
+// isUnknownOutcome reports whether a write error means the signed action's
+// outcome is unknown (exit 42): the caller must stop and run the §5.4 protocol
+// rather than treat the write as rejected or retry it blindly.
+func isUnknownOutcome(err error) bool {
+	var oe *output.Error
+	return errors.As(err, &oe) && oe.Category == output.CatTimeout
+}
+
+// withWriteCloids attaches the write's client order id(s) to a mapped failure
+// and, on an outcome-unknown (exit 42) error, makes the §5.4 hint concrete —
+// when the cloid was auto-generated the agent has no other way to run the
+// documented status-check/reconcile recovery.
+func withWriteCloids(err error, cloids ...string) error {
+	ids := make([]string, 0, len(cloids))
+	for _, cl := range cloids {
+		if cl != "" {
+			ids = append(ids, cl)
+		}
+	}
+	var oe *output.Error
+	if len(ids) == 0 || !errors.As(err, &oe) {
+		return err
+	}
+	oe.Cloids = ids
+	if oe.Category == output.CatTimeout {
+		if len(ids) == 1 {
+			oe.Hint = "run `deliverator order status --cloid " + ids[0] + "` before resubmitting (§5.4)"
+		} else {
+			oe.Hint = "run `deliverator reconcile --cloid " + strings.Join(ids, ",") + "` before resubmitting (§5.4)"
+		}
+	}
+	return oe
+}
+
+// legCloids collects the (generated) per-leg cloids of a multi-order write so a
+// failure path can surface them all.
+func legCloids(results []*PlaceResult) []string {
+	out := make([]string, 0, len(results))
+	for _, r := range results {
+		if r.Cloid != "" {
+			out = append(out, r.Cloid)
+		}
+	}
+	return out
+}
+
 func mapExchangeErr(err error) error {
 	var oe *output.Error
 	if errors.As(err, &oe) {
 		return oe
 	}
+	// A write-path 429 carries the HTTP status on hl.APIError (mirrors
+	// mapNetwork): rate-limited is exit 41 + retry_after_ms so the agent backs
+	// off — never exit 50, which reads as an order-level rejection.
+	var apiErr hl.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.Status == http.StatusTooManyRequests {
+			return output.RateLimit("ip_rate_limited", "Hyperliquid returned 429 (per-IP weight exceeded)").
+				WithRetryAfter(2000)
+		}
+		// A JSON-bodied 5xx is a gateway/edge (LB 502/504) or a failing upstream
+		// answering AFTER the signed action was sent — possibly forwarded, so the
+		// outcome is UNKNOWN. Only a 4xx API body is the exchange definitively
+		// rejecting the action (exit 50, via the substring switch below).
+		if apiErr.Status >= http.StatusInternalServerError {
+			return unknownOutcomeErr(err.Error())
+		}
+	}
+	// Typed transport failures (internal/hl): Sent=false means the signed action
+	// provably never left this host → exit 40, safe to retry. EVERYTHING else
+	// post-send — resets, EOFs, truncated/unparseable 200 bodies, client
+	// timeouts — is outcome-UNKNOWN (exit 42): the order may have landed.
+	// Exit 50 "rejected" is reserved for responses where the exchange
+	// definitively spoke (APIError bodies, parsed "status":"err" envelopes).
+	var te *hl.TransportError
+	if errors.As(err, &te) {
+		if !te.Sent {
+			return output.Network("api_unreachable", err.Error()).Retry()
+		}
+		return unknownOutcomeErr(err.Error())
+	}
 	s := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(s, "deadline") || strings.Contains(s, "timeout") || strings.Contains(s, "timed out"):
-		return output.Timeout("timeout", "request timed out — order outcome is UNKNOWN").
-			WithHint("run `deliverator order status --cloid <id>` before resubmitting (§5.4)")
-	case strings.Contains(s, "too many") || strings.Contains(s, "rate limit"):
+		return unknownOutcomeErr("request timed out")
+	case strings.Contains(s, "429") || strings.Contains(s, "too many") || strings.Contains(s, "rate limit"):
 		return output.RateLimit("rate_limited", err.Error()).WithRetryAfter(10000)
 	case strings.Contains(s, "nonce"):
 		// The L1 nonce is derived from local time; HL rejects nonces outside its

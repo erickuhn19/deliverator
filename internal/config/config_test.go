@@ -83,3 +83,30 @@ func TestResolveAddress(t *testing.T) {
 		t.Errorf("unknown account should error")
 	}
 }
+
+// The master synonyms canonicalize to "main" — the alias onboard/init store the
+// default agent key under — so a keychain lookup keyed on the raw flag can't
+// miss (e.g. --account master → agent:main). Real aliases pass through.
+func TestCanonicalAccount(t *testing.T) {
+	for _, syn := range []string{"", "main", "MAIN", "master", "Default"} {
+		if got := CanonicalAccount(syn); got != "main" {
+			t.Errorf("CanonicalAccount(%q) = %q, want main", syn, got)
+		}
+	}
+	if got := CanonicalAccount("treasury"); got != "treasury" {
+		t.Errorf("CanonicalAccount(treasury) = %q, want treasury", got)
+	}
+}
+
+// The synonyms are reserved alias names: an [accounts] entry named
+// main/master/default would silently resolve to the MASTER address.
+func TestIsReservedAlias(t *testing.T) {
+	for _, name := range []string{"main", "MASTER", "Default", ""} {
+		if !IsReservedAlias(name) {
+			t.Errorf("IsReservedAlias(%q) should be true", name)
+		}
+	}
+	if IsReservedAlias("vault1") {
+		t.Error("IsReservedAlias(vault1) should be false")
+	}
+}

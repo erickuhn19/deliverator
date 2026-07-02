@@ -43,7 +43,9 @@ func TestAuditRecordsCloseFillTelemetry(t *testing.T) {
 // so a multi-leg action is reconstructable from the trail alone.
 func TestAuditRecordsBatchLegTelemetry(t *testing.T) {
 	resp := okOrders(`{"resting":{"oid":11}}`, `{"error":"Order must have minimum value of $10."}`)
-	c, ctx := newTestClient(t, config.Default(), Options{}, engineResp("", "", "", resp))
+	// btcLong: the reduce-only sell leg needs an opposing position to pass the
+	// flip guard's same-side/flat rejection.
+	c, ctx := newTestClient(t, config.Default(), Options{}, engineResp(btcLong, "", "", resp))
 	reduce := limitOrder("BTC", Sell, "0.001", "70000")
 	reduce.ReduceOnly = true
 	if _, _, err := c.PlaceBatch(ctx, []OrderReq{limitOrder("BTC", Buy, "0.001", "60000"), reduce}); err != nil {

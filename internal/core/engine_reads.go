@@ -1233,9 +1233,11 @@ func unknownCoin(coin string) error {
 // mapNetwork categorizes a read-path transport error. A bare network failure is
 // exit 40, but a 429 (per-IP rate-limit) and a timeout each get their own code so
 // an agent can react correctly: back off with retry_after on 41, and distinguish
-// "no answer yet" from "unreachable" on 42. The write path does the same via
-// mapExchangeErr; reads were defaulting everything to 40 (codes 41/42 were
-// effectively unreachable across the entire read surface).
+// "no answer yet" from "unreachable" on 42. Reads are side-effect-free, so an
+// hl.TransportError lands here as a plain retryable network error regardless of
+// its Sent phase (it unwraps cleanly through the checks below) — only the WRITE
+// mapper, mapExchangeErr, branches on Sent, because there a possibly-sent
+// failure means the order outcome is unknown (§5.4).
 func mapNetwork(code string, err error) error {
 	var oe *output.Error
 	if errors.As(err, &oe) {

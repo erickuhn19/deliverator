@@ -68,7 +68,7 @@ list the commands with a typed data schema.`,
 				"ts":       "int64 server-aligned unix ms",
 				"cmd":      "string",
 				"data":     "object|array|null (command-specific — `schema <command>` describes it)",
-				"error":    "object|null {code,category,message,retryable,retry_after_ms,hint}",
+				"error":    "object|null {code,category,message,retryable,retry_after_ms,hint,cloids?}",
 				"warnings": "string[] (rounding, builder fee, etc.)",
 				"meta":     "object {network,account,weight_used}",
 			},
@@ -101,8 +101,9 @@ var connectCmd = &cobra.Command{
 		}
 		warnings := []string{}
 
-		// Agent key presence (address only; never the secret).
-		if ag, err := wallet.Load(flagAccount); err == nil {
+		// Agent key presence (address only; never the secret). Canonicalized so
+		// --account master/default reports the same key writes will load.
+		if ag, err := wallet.Load(config.CanonicalAccount(flagAccount)); err == nil {
 			data["agent_address"] = ag.Address
 			data["agent_key"] = "present"
 		} else {
@@ -178,8 +179,10 @@ var configSetCmd = &cobra.Command{
 		if target == "" {
 			target = config.Path()
 		}
-		// Snapshot the prior value of a risk cap so the change can be surfaced loudly.
+		// Snapshot the prior value of a risk cap (and the network) so the change
+		// can be surfaced loudly.
 		oldVal, isRiskCap := riskCapValue(fresh, args[0])
+		oldNetwork := fresh.Network
 		if err := setConfigKey(fresh, args[0], args[1]); err != nil {
 			return fail("config.set", output.Validation("bad_config", err.Error()))
 		}
@@ -195,6 +198,18 @@ var configSetCmd = &cobra.Command{
 				"risk cap changed: %s %s → %s — Deliverator does NOT block this; confirm the account operator approved adjusting this safety limit.",
 				args[0], oldVal, args[1],
 			))
+		}
+		if args[0] == "network" && oldNetwork != fresh.Network {
+			// The testnet/mainnet boundary is the single most safety-critical
+			// default of a real-money tool — same loud-not-blocking policy as the
+			// risk caps (no prompt: automation must stay unobstructed).
+			w := fmt.Sprintf("network changed: %s → %s — EVERY subsequent invocation (including a running agent loop) now targets %s",
+				oldNetwork, fresh.Network, fresh.Network)
+			if fresh.Network == config.NetworkMainnet {
+				w += " and places REAL-MONEY orders"
+			}
+			w += "; confirm the account operator approved this change."
+			warnings = append(warnings, w)
 		}
 		emit("config.set", map[string]any{"key": args[0], "value": args[1], "saved": target}, warnings...)
 		return nil
@@ -466,6 +481,24 @@ var accountLsCmd = &cobra.Command{
 	},
 }
 
+// freshConfigForSave loads a FRESH config from the --config path and resolves
+// the file to save it back to. Account mutations must never persist the
+// flag-mutated in-memory Cfg: PersistentPreRunE applies transient global flags
+// (e.g. --network) onto Cfg, so saving it would silently flip the box's network
+// on disk; and saving to config.Path() would ignore --config (#110) — the exact
+// footguns configSetCmd already guards against.
+func freshConfigForSave() (*config.Config, string, error) {
+	fresh, err := config.Load(flagConfig)
+	if err != nil {
+		return nil, "", err
+	}
+	target := fresh.SourcePath()
+	if target == "" {
+		target = config.Path()
+	}
+	return fresh, target, nil
+}
+
 var accountAddCmd = &cobra.Command{
 	Use:   "add",
 	Short: "Add a sub-account alias → address",
@@ -473,17 +506,28 @@ var accountAddCmd = &cobra.Command{
 		if aAlias == "" || aAddress == "" {
 			return fail("account.add", output.Validation("missing", "pass --alias and --address"))
 		}
-		if Cfg.Accounts == nil {
-			Cfg.Accounts = map[string]string{}
+		// The master synonyms are reserved: ResolveAddress matches them before
+		// [accounts], so an alias named main/master/default would be accepted here
+		// but silently resolve to the MASTER address on every subsequent --account.
+		if config.IsReservedAlias(aAlias) {
+			return fail("account.add", output.Validation("reserved_alias",
+				fmt.Sprintf("alias %q is reserved — it always resolves to the master address; pick another name", aAlias)))
 		}
-		Cfg.Accounts[aAlias] = aAddress
-		if err := Cfg.Validate(); err != nil {
+		fresh, target, err := freshConfigForSave()
+		if err != nil {
+			return fail("account.add", output.Validation("config_invalid", err.Error()))
+		}
+		if fresh.Accounts == nil {
+			fresh.Accounts = map[string]string{}
+		}
+		fresh.Accounts[aAlias] = aAddress
+		if err := fresh.Validate(); err != nil {
 			return fail("account.add", output.Validation("bad_address", err.Error()))
 		}
-		if err := Cfg.Save(config.Path()); err != nil {
+		if err := fresh.Save(target); err != nil {
 			return fail("account.add", output.Unknown("save", err.Error()))
 		}
-		emit("account.add", map[string]any{"alias": aAlias, "address": aAddress})
+		emit("account.add", map[string]any{"alias": aAlias, "address": aAddress, "saved": target})
 		return nil
 	},
 }
@@ -495,12 +539,16 @@ var accountRmCmd = &cobra.Command{
 		if aAlias == "" {
 			return fail("account.rm", output.Validation("missing", "pass --alias"))
 		}
-		delete(Cfg.Accounts, aAlias)
+		fresh, target, err := freshConfigForSave()
+		if err != nil {
+			return fail("account.rm", output.Validation("config_invalid", err.Error()))
+		}
+		delete(fresh.Accounts, aAlias)
 		_ = wallet.Delete(aAlias)
-		if err := Cfg.Save(config.Path()); err != nil {
+		if err := fresh.Save(target); err != nil {
 			return fail("account.rm", output.Unknown("save", err.Error()))
 		}
-		emit("account.rm", map[string]any{"alias": aAlias, "removed": true})
+		emit("account.rm", map[string]any{"alias": aAlias, "removed": true, "saved": target})
 		return nil
 	},
 }
@@ -512,14 +560,18 @@ var accountSetDefaultCmd = &cobra.Command{
 		if aAddress == "" {
 			return fail("account.set-default", output.Validation("missing", "pass --address"))
 		}
-		Cfg.Wallet.MasterAddress = aAddress
-		if err := Cfg.Validate(); err != nil {
+		fresh, target, err := freshConfigForSave()
+		if err != nil {
+			return fail("account.set-default", output.Validation("config_invalid", err.Error()))
+		}
+		fresh.Wallet.MasterAddress = aAddress
+		if err := fresh.Validate(); err != nil {
 			return fail("account.set-default", output.Validation("bad_address", err.Error()))
 		}
-		if err := Cfg.Save(config.Path()); err != nil {
+		if err := fresh.Save(target); err != nil {
 			return fail("account.set-default", output.Unknown("save", err.Error()))
 		}
-		emit("account.set-default", map[string]any{"master_address": aAddress})
+		emit("account.set-default", map[string]any{"master_address": aAddress, "saved": target})
 		return nil
 	},
 }
@@ -537,7 +589,7 @@ var initCmd = &cobra.Command{
 				return fail("init", output.Unknown("config_write", werr.Error()))
 			}
 		}
-		ag, err := wallet.Generate(flagAccount)
+		ag, err := wallet.Generate(config.CanonicalAccount(flagAccount))
 		if err != nil {
 			return fail("init", output.Auth("keygen", err.Error()))
 		}
@@ -568,7 +620,7 @@ func writeConfigTemplate() error {
 }
 
 const configTemplate = `# Deliverator config. Secrets live in the keychain, never here.
-network = "mainnet"            # mainnet | testnet
+network = "mainnet"            # mainnet (REAL money) | testnet — flip via config set network / the console (both warn)
 outcomes = true                # HIP-4 prediction markets tradable as "#<enc>"; false to opt out
 perp_dexs = ["xyz"]            # HIP-3 sub-dexes, tradable as "<dex>:<coin>"; ["all"] = every sub-dex; [] = none
 

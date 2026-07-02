@@ -184,7 +184,7 @@ type Endpoints struct {
 // TOML file on top of this, so any key absent from the file keeps its default.
 func Default() *Config {
 	return &Config{
-		Network: NetworkTestnet, // neutral safe fallback; `config init` writes the opinionated shipped defaults (mainnet, xyz sub-dex, outcomes, limit-only)
+		Network: NetworkTestnet, // neutral safe fallback when NO config file exists; `init`/`onboard` write the opinionated shipped default (mainnet)
 		Builder: Builder{
 			Address:      DefaultBuilderAddress,
 			FeeTenthsBps: DefaultBuilderFeeTenthsBps, // 0.05%; only charged after the one-time master approveBuilderFee (graceful attach)
@@ -447,12 +447,39 @@ func (c *Config) Save(path string) error {
 // SourcePath reports where the config was loaded from.
 func (c *Config) SourcePath() string { return c.path }
 
-// ResolveAddress maps an account alias to an address, falling back to the master
-// address. "main"/"master"/"" all resolve to the master address. All READS use
-// this — never the agent address (§4).
-func (c *Config) ResolveAddress(account string) (string, error) {
+// IsMasterSynonym reports whether account names the default/master account:
+// ""/"main"/"master"/"default", case-insensitively.
+func IsMasterSynonym(account string) bool {
 	switch strings.ToLower(account) {
 	case "", "main", "master", "default":
+		return true
+	}
+	return false
+}
+
+// CanonicalAccount maps the master synonyms to the canonical "main" alias — the
+// name `onboard`/`init` store the default agent key under (wallet keyringUser) —
+// so a keychain lookup keyed on the raw --account value can never miss the
+// onboarded key (e.g. `--account master` → agent:main). Real aliases pass
+// through unchanged.
+func CanonicalAccount(account string) string {
+	if IsMasterSynonym(account) {
+		return "main"
+	}
+	return account
+}
+
+// IsReservedAlias reports whether name collides (case-insensitively) with the
+// master synonyms. ResolveAddress consults the synonyms BEFORE [accounts], so
+// an alias literally named main/master/default would be accepted on add but
+// silently resolve to the MASTER address forever — `account add` rejects it.
+func IsReservedAlias(name string) bool { return IsMasterSynonym(name) }
+
+// ResolveAddress maps an account alias to an address, falling back to the master
+// address. "main"/"master"/"default"/"" all resolve to the master address. All
+// READS use this — never the agent address (§4).
+func (c *Config) ResolveAddress(account string) (string, error) {
+	if IsMasterSynonym(account) {
 		if c.Wallet.MasterAddress == "" {
 			return "", fmt.Errorf("wallet.master_address is not configured")
 		}

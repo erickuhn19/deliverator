@@ -22,8 +22,9 @@ trades — never drain funds. That non-custodial guarantee is the whole point.
 
 No backend. No telemetry. `scp` the binary to a box and go.
 
-> ⚠️ **This places real orders with real money on a live exchange.** Deliverator
-> is **testnet-first** for a reason — flip to `mainnet` only when you mean it.
+> ⚠️ **This places real orders with real money on a live exchange.** `init` and
+> `onboard` configure **mainnet** — switch to `testnet` (`config set network
+> testnet`, or the console's network panel) for a paper-funds dry run first.
 > The non-custodial key means a bug can't *drain* your account, but it can still
 > place trades you didn't intend. Provided under the MIT license, **with no
 > warranty** ([LICENSE](./LICENSE)). You are responsible for what your agent does.
@@ -147,11 +148,12 @@ deliverator buy BTC 0.01 --limit 64000 --alo --cloid 0x...   # for real
 # 6. Safety.
 deliverator dms set 60       # arm the dead-man's switch (refresh via cron: dms heartbeat)
 deliverator halt on          # emergency stop — rejects all new orders
-deliverator panic --yes      # cancel-all + flatten-all
+deliverator panic --yes      # cancel-all + flatten-all (works during a halt)
 ```
 
-Deliverator is **testnet-first** (`network = "testnet"` by default). Flip to
-`mainnet` in the config only when you mean it.
+`init` and `onboard` ship the opinionated default: **mainnet**. For a
+paper-funds dry run first, switch with `deliverator config set network testnet`
+(or the console's network panel) — changing the network warns loudly either way.
 
 ---
 
@@ -173,7 +175,10 @@ Every command emits one JSON envelope:
 ```
 
 **Prices and sizes are always strings.** On failure, `ok=false`, `data=null`,
-and `error` is populated with `{code, category, message, retryable, retry_after_ms, hint}`.
+and `error` is populated with `{code, category, message, retryable, retry_after_ms, hint}`
+plus, on write failures, `cloids` — the client order id(s) the action was signed
+with (all legs for a batch/grid), even when auto-generated — so the retry
+protocol below is always runnable.
 
 ### Exit codes
 | Code | Meaning | Agent action |
@@ -195,6 +200,13 @@ and `error` is populated with `{code, category, message, retryable, retry_after_
 On **exit 42**, run `deliverator order status --cloid <id>`. If the order exists
 → it landed, don't resend. If absent → resubmit the **same** cloid. This is the
 #1 way naive agents double-fill.
+
+The cloid(s) to check are carried in the failure envelope's `error.cloids`.
+Exit 42 covers **every** failure after the signed action may have reached the
+exchange (timeouts, connection resets, EOFs, unreadable responses, and gateway
+5xx pages from an edge/proxy in front of the API); a failure before anything
+was sent (connection refused, DNS) is exit 40 — retrying that is safe. Exit 50
+is reserved for a definitive exchange rejection.
 
 The exchange can take ~1–2s to index a new order by cloid, so a status check
 immediately after a timeout may report "absent" for an order that actually
@@ -218,12 +230,17 @@ landed. Wait briefly and re-check (or query by `--oid`) before resubmitting.
 | **Drawdown** | `risk.max_drawdown_pct` | reject new exposure once equity is that % below its high-water (20) |
 | **Daily loss** | `risk.max_daily_loss_usd` / `_pct` | reject new exposure once loss since UTC-midnight anchor exceeds it (20) |
 | **Max open positions** | `risk.max_open_positions` | reject opening a new coin once at the concurrent-position cap (20) |
-| **Reduce-only flip** | (always on) | reject a reduce-only order larger than the open position — it could only cross zero (20) |
+| **Reduce-only guard** | (always on) | reject a reduce-only order that cannot reduce: no open position, same side as the position, or larger than it (20) |
 | Local rate cap | `automation.max_orders_per_min` | throttle before the exchange limit |
-| Global halt | `deliverator halt on` | reject all new orders (21) |
-| Dead-man's switch | `risk.dead_man_switch_secs` | schedule-cancel; refresh via `dms heartbeat` |
+| Global halt | `deliverator halt on` | reject all new orders (21); `panic` still works — its flatten bypasses the halt core-internally (no flag), plain `close`/orders stay rejected |
+| Dead-man's switch | `risk.dead_man_switch_secs` | schedule-cancel (resting orders only — positions stay open); refresh via `dms heartbeat` |
 | **Real-time failsafe** | `deliverator watch --metric liq_distance_pct --below N --action panic\|dms\|alert` | stream-driven: trigger the action the moment the metric breaches — catches a mid-interval move the DMS/heartbeat can't |
 | Dry-run | `--dry-run` | validate/round/attach, never send |
+
+The **bold** account-wide gates bound *new exposure*: reduce-only/close orders
+are exempt — including a `batch`/`grid --reduce-only` whose every leg is
+reduce-only (one exposure-adding leg keeps the whole batch gated) — so a tripped
+gate never blocks de-risking.
 
 **Alerting:** set `alerting.webhook_url` (or `DELIVERATOR_ALERT_WEBHOOK`) to POST a JSON event on RED-state failures (halt/auth/timeout by default; add `risk` etc. via `alerting.categories`) — best-effort, never blocks the command. Wire it to Slack/Discord/a relay so an away operator hears within seconds.
 

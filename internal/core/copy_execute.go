@@ -2,10 +2,7 @@ package core
 
 import (
 	"context"
-	"errors"
 	"time"
-
-	"github.com/erickuhn19/deliverator/internal/output"
 )
 
 // LegResult is the outcome of one executed diff leg.
@@ -140,7 +137,8 @@ func (c *Client) copyClose(ctx context.Context, leg DiffLeg, size, class string)
 	return []LegResult{r}, ""
 }
 
-func isCopyTimeout(err error) bool {
-	var oe *output.Error
-	return errors.As(err, &oe) && oe.Category == output.CatTimeout
-}
+// isCopyTimeout reports an outcome-unknown leg (exit 42). It delegates to the
+// shared write-path predicate so the copy loop's stop-on-unknown contract can
+// never drift from mapExchangeErr's classification — a post-send transport
+// failure (reset/EOF/truncated body) counts, not just a literal client timeout.
+func isCopyTimeout(err error) bool { return isUnknownOutcome(err) }

@@ -495,7 +495,7 @@ func readDMS() (dmsState, bool) {
 
 var dmsCmd = &cobra.Command{
 	Use:   "dms (set <secs> | heartbeat | clear | status)",
-	Short: "Dead-man's switch: schedule-cancel that auto-flattens if not refreshed",
+	Short: "Dead-man's switch: exchange auto-CANCELS resting orders if not refreshed — positions stay open (use `watch --action panic` to flatten)",
 	Args:  cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		sub := strings.ToLower(args[0])
@@ -609,7 +609,7 @@ func haltedByFile() bool {
 
 var panicCmd = &cobra.Command{
 	Use:   "panic",
-	Short: "Cancel ALL orders, cancel running TWAPs, and flatten ALL positions",
+	Short: "Cancel ALL orders, cancel running TWAPs, and flatten ALL positions (works during a halt)",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !flagYes && !flagDryRun {
 			return fail("panic", output.Validation("confirm", "panic flattens everything — pass --yes to confirm"))

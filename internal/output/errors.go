@@ -28,6 +28,12 @@ type Error struct {
 	Retryable    bool     `json:"retryable"`
 	RetryAfterMs *int64   `json:"retry_after_ms"`
 	Hint         string   `json:"hint,omitempty"`
+	// Cloids carries the client order id(s) of the write this error describes
+	// (all generated leg cloids for a batch), so an agent can run the §5.4
+	// status-check / reconcile protocol without parsing prose — critical on exit
+	// 42, where the cloid may have been auto-generated and would otherwise be
+	// unrecoverable. Additive (schema v1); omitted when not applicable.
+	Cloids []string `json:"cloids,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Message }
@@ -80,6 +86,10 @@ func (e *Error) WithRetryAfter(ms int64) *Error {
 
 // Retry marks the error retryable without a fixed delay (caller backs off).
 func (e *Error) Retry() *Error { e.Retryable = true; return e }
+
+// WithCloids attaches the write's client order id(s) so the §5.4 retry /
+// reconcile protocol is runnable straight from the failure envelope.
+func (e *Error) WithCloids(cloids ...string) *Error { e.Cloids = cloids; return e }
 
 // Per-category constructors — terse call sites at the command layer.
 func Validation(code, msg string) *Error { return NewError(CatValidation, code, msg) }

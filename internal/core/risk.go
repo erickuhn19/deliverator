@@ -69,6 +69,7 @@ type riskCheck struct {
 	MinNotionalUSD      float64 // floor for NEW exposure; 0 = no floor
 	ReduceOnly          bool    // a reduce-only order cannot increase exposure
 	Closing             bool    // a reductive exit (spot close): exempt from NEW-exposure guards, keep the floor
+	HaltExempt          bool    // a Panic flatten leg: skips the halt gate (core-internal only, see OrderReq.panicFlatten)
 }
 
 // pricingGuardsActive reports whether any guard that needs a PRICED order is
@@ -95,7 +96,9 @@ func (c *Client) preTradeChecks(rc riskCheck) error {
 // rate cap is kept separate (see preTradeChecks) so a batch — one signed action —
 // charges it ONCE rather than once per leg, which would self-trip mid-batch.
 func (c *Client) staticChecks(rc riskCheck) error {
-	if c.Halted() {
+	// Panic's internal flatten legs skip the halt gate: the emergency flatten
+	// must work DURING a halt (see Panic). Every other write stays halt-gated.
+	if !rc.HaltExempt && c.Halted() {
 		return output.Halt("halted", "global halt is active — new orders rejected").
 			WithHint("deliverator halt off  (to resume)")
 	}
