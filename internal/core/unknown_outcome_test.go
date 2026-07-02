@@ -198,6 +198,9 @@ func TestPlaceRateLimited429(t *testing.T) {
 		if path == "/exchange" {
 			return 429, `{"code":429,"msg":""}` // no "rate limit" words in the message
 		}
+		if typ == "frontendOpenOrders" {
+			return 200, `[]` // the position cap counts resting orders (fail-closed read)
+		}
 		return 200, `{}`
 	}
 	c, ctx := newTestClient(t, config.Default(), Options{}, resp)
@@ -217,9 +220,12 @@ func TestPlaceRateLimited429(t *testing.T) {
 // outcome UNKNOWN — exit 42 with the cloid surfaced, never exit 50, which the
 // contract documents as a definitive exchange rejection (fix-up round, P0-B).
 func TestPlaceGateway502HTMLIsOutcomeUnknown(t *testing.T) {
-	resp := func(path, _ string, _ map[string]any) (int, string) {
+	resp := func(path, typ string, _ map[string]any) (int, string) {
 		if path == "/exchange" {
 			return 502, `<html><body><h1>502 Bad Gateway</h1>cloudflare</body></html>`
+		}
+		if typ == "frontendOpenOrders" {
+			return 200, `[]` // the position cap counts resting orders (fail-closed read)
 		}
 		return 200, `{}`
 	}
@@ -239,9 +245,12 @@ func TestPlaceGateway502HTMLIsOutcomeUnknown(t *testing.T) {
 // timeout substring rescues it) is the same post-send hazard: the LB timed out
 // waiting on the upstream that may have accepted the order. Exit 42, not 50.
 func TestPlaceGatewayJSON504IsOutcomeUnknown(t *testing.T) {
-	resp := func(path, _ string, _ map[string]any) (int, string) {
+	resp := func(path, typ string, _ map[string]any) (int, string) {
 		if path == "/exchange" {
 			return 504, `{"code":504,"msg":"Gateway Time-out"}`
+		}
+		if typ == "frontendOpenOrders" {
+			return 200, `[]` // the position cap counts resting orders (fail-closed read)
 		}
 		return 200, `{}`
 	}

@@ -155,8 +155,8 @@ func trippedDrawdownClient(t *testing.T) (*Client, context.Context) {
 	}
 	c, ctx := newTestClient(t, riskCfg(config.Risk{MaxDrawdownPct: 20}), Options{}, resp)
 	seed, _ := json.Marshal(riskState{PeakEquity: 5000, Day: "1970-01-01", DayAnchorEquity: 5000, Basis: currentEquityBasis})
-	_ = os.MkdirAll(filepath.Dir(riskStatePath()), 0o700)
-	if err := os.WriteFile(riskStatePath(), seed, 0o600); err != nil {
+	_ = os.MkdirAll(filepath.Dir(riskStatePath("testnet", testMaster)), 0o700)
+	if err := os.WriteFile(riskStatePath("testnet", testMaster), seed, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return c, ctx

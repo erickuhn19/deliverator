@@ -658,7 +658,7 @@ max_open_positions = 0             # cap on concurrent open positions (0 = off)
 
 [automation]
 allowed_coins = []             # empty = allow all
-limit_only = true              # block market orders (except exits); use --limit/--alo, or false to allow
+limit_only = true              # block market + trigger-market orders (except exits); use --limit/--alo, or false to allow
 max_orders_per_min = 120
 json_when_not_tty = true
 

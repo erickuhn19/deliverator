@@ -57,6 +57,8 @@ func TestOutcomeMarketableBuyNotionalUsesTouch(t *testing.T) {
 			return 200, `{"coin":"#6520","time":1,"levels":[[{"px":"0.33","sz":"500","n":1}],[{"px":"0.41","sz":"500","n":1}]]}`
 		case "allMids":
 			return 200, `{"#6520":"0.33"}`
+		case "frontendOpenOrders":
+			return 200, `[]` // the position cap counts resting orders (fail-closed read)
 		}
 		return 200, `{}`
 	})

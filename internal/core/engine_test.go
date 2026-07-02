@@ -552,6 +552,8 @@ func TestPlaceTriggerPxRounded(t *testing.T) {
 				return 200, `{"BTC":"67000"}`
 			case "clearinghouseState":
 				return 200, emptyState
+			case "frontendOpenOrders":
+				return 200, `[]` // the position cap counts resting orders (fail-closed read)
 			case "spotClearinghouseState":
 				return 200, `{"balances":[]}`
 			}
@@ -605,6 +607,8 @@ func TestPlaceAttachesBuilderLowercased(t *testing.T) {
 				return 200, `{"BTC":"64000"}`
 			case "clearinghouseState":
 				return 200, emptyState
+			case "frontendOpenOrders":
+				return 200, `[]` // the position cap counts resting orders (fail-closed read)
 			case "spotClearinghouseState":
 				return 200, `{"balances":[]}`
 			}
@@ -649,6 +653,8 @@ func TestPlaceManualModeOmitsBuilder(t *testing.T) {
 				return 200, `{"BTC":"64000"}`
 			case "clearinghouseState":
 				return 200, emptyState
+			case "frontendOpenOrders":
+				return 200, `[]` // the position cap counts resting orders (fail-closed read)
 			case "spotClearinghouseState":
 				return 200, `{"balances":[]}`
 			}
