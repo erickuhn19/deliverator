@@ -147,6 +147,19 @@ func (a *PnLAccountant) OpenPnL(markByCoin map[string]float64) float64 {
 	return a.openLocked(markByCoin)
 }
 
+// OpenForCoin marks one coin's held inventory against a supplied probability:
+// mark·shares − cost. Returns 0 if the coin isn't tracked. Used as the open-PnL fallback
+// for a holding HL couldn't mark (no live mid) but the model still prices.
+func (a *PnLAccountant) OpenForCoin(coin string, mark float64) float64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	p := a.pos[coin]
+	if p == nil || p.shares == 0 {
+		return 0
+	}
+	return mark*float64(p.shares) - p.cost
+}
+
 func (a *PnLAccountant) openLocked(markByCoin map[string]float64) float64 {
 	var open float64
 	for coin, p := range a.pos {

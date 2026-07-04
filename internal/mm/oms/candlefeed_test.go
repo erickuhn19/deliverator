@@ -61,7 +61,7 @@ func TestCandleFeedRefresh(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		r.data["BTC"] = append(r.data["BTC"], candle(int64(i), 60000+float64(i)*10))
 	}
-	f := NewCandleFeed()
+	f := NewCandleFeed(0)                                             // 0 ⇒ staleness guard off (this test exercises mark/vol math)
 	f.Refresh(context.Background(), r, []string{"BTC", "btc", "ETH"}) // dedup + case-insensitive; ETH has no data
 
 	if m, ok := f.Mark("BTC"); !ok || m != 60290 {

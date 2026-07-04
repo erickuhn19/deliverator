@@ -42,7 +42,24 @@ func (c *Client) portfolioGuardsActive() bool {
 	r := c.cfg.Risk
 	return r.MaxAccountLeverage > 0 || r.MaxNetExposureUSD > 0 || r.MaxConcentrationPctPerCoin > 0 ||
 		r.MaxDrawdownPct > 0 || r.MaxDailyLossUSD > 0 || r.MaxDailyLossPct > 0 ||
-		r.MaxOpenPositions > 0 || r.MaxOutcomeQuestionNotionalUSD > 0
+		r.MaxOpenPositions > 0
+}
+
+// outcomeQuestionCapActive reports whether the per-question outcome cap should run for
+// THIS invocation. Unlike the coin-agnostic gates, the cap governs only outcome coins,
+// so a non-outcome perp/spot order must not force the (fail-closed) account-state read
+// on its behalf — the cap is only relevant when at least one touched coin is an outcome
+// coin ("#<enc>"). This keeps a transient read failure from rejecting an unrelated order.
+func (c *Client) outcomeQuestionCapActive(deltas []exposureDelta) bool {
+	if c.cfg.Risk.MaxOutcomeQuestionNotionalUSD <= 0 {
+		return false
+	}
+	for _, d := range deltas {
+		if strings.HasPrefix(d.coin, "#") {
+			return true
+		}
+	}
+	return false
 }
 
 // outcomeQuestionKey groups outcome coins that are the SAME bet. A multi-outcome
@@ -524,7 +541,7 @@ func (c *Client) checkPortfolioGates(ctx context.Context, deltas []exposureDelta
 // replacement-adjusted pending fold — instead of fetching the book again.
 // book==nil behaves exactly like checkPortfolioGates.
 func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureDelta, book *gateBook) ([]string, error) {
-	if !c.portfolioGuardsActive() {
+	if !c.portfolioGuardsActive() && !c.outcomeQuestionCapActive(deltas) {
 		return nil, nil
 	}
 	snap, err := c.portfolioEquitySnapshot(ctx, book)
@@ -567,7 +584,7 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 	// always checkable — like net-exposure and open-positions above. It backstops the
 	// per-coin concentration cap, which cannot tell that the Yes and No legs of one
 	// binary (two different "#<enc>" coins) are the same bet.
-	if cap := r.MaxOutcomeQuestionNotionalUSD; cap > 0 {
+	if cap := r.MaxOutcomeQuestionNotionalUSD; cap > 0 && c.outcomeQuestionCapActive(deltas) {
 		if label, notional := c.heaviestOutcomeQuestion(resulting, snap.pending); notional > cap {
 			return nil, output.Risk("max_outcome_question_notional",
 				fmt.Sprintf("outcome question %q would hold $%.2f across its legs (resting orders count), over the $%.2f cap", label, notional, cap)).

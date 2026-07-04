@@ -39,23 +39,40 @@ const (
 // startup; candles give a fresh mark (latest close) and a stable annualized vol (stdev
 // of 1m log-returns) immediately, with no warm-up. It implements mm.UnderlyingFeed.
 type CandleFeed struct {
-	mu    sync.RWMutex
-	marks map[string]float64 // UPPER(underlying) -> latest close
-	vols  map[string]float64 // UPPER(underlying) -> annualized realized vol
-	now   func() time.Time
+	mu     sync.RWMutex
+	marks  map[string]float64   // UPPER(underlying) -> latest close
+	vols   map[string]float64   // UPPER(underlying) -> annualized realized vol
+	markT  map[string]time.Time // UPPER(underlying) -> last successful refresh time
+	maxAge time.Duration        // Mark is !ok once older than this (0 disables the guard)
+	now    func() time.Time
 }
 
-// NewCandleFeed builds an empty candle feed. Call Refresh before first use.
-func NewCandleFeed() *CandleFeed {
-	return &CandleFeed{marks: map[string]float64{}, vols: map[string]float64{}, now: time.Now}
+// NewCandleFeed builds an empty candle feed. maxAge bounds how stale a mark may be before
+// Mark reports it unusable (0 disables the guard). Call Refresh before first use.
+func NewCandleFeed(maxAge time.Duration) *CandleFeed {
+	return &CandleFeed{
+		marks: map[string]float64{}, vols: map[string]float64{},
+		markT: map[string]time.Time{}, maxAge: maxAge, now: time.Now,
+	}
 }
 
 // Mark implements mm.UnderlyingFeed: the latest perp close for an underlying.
 func (f *CandleFeed) Mark(underlying string) (float64, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	v, ok := f.marks[strings.ToUpper(strings.TrimSpace(underlying))]
-	return v, ok && v > 0
+	u := strings.ToUpper(strings.TrimSpace(underlying))
+	v, ok := f.marks[u]
+	if !ok || v <= 0 {
+		return 0, false
+	}
+	// Reject a stale mark: a frozen candle feed (Refresh erroring and keeping the prior
+	// value) must NOT be priced as a live fair — go !ok so the model errors and quotes pull.
+	if f.maxAge > 0 {
+		if t, seen := f.markT[u]; !seen || f.now().Sub(t) > f.maxAge {
+			return 0, false
+		}
+	}
+	return v, true
 }
 
 // Vol implements mm.UnderlyingFeed: the annualized realized vol of the underlying.
@@ -89,6 +106,7 @@ func (f *CandleFeed) Refresh(ctx context.Context, r CandleReader, underlyings []
 		}
 		f.mu.Lock()
 		f.marks[u] = mark
+		f.markT[u] = f.now() // stamp freshness so Mark can reject a frozen feed
 		if vol > 0 {
 			f.vols[u] = vol
 		}

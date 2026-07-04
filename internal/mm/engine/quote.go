@@ -45,7 +45,7 @@ func (e *Engine) tick(ctx context.Context) {
 	halted := e.client.Halted()
 
 	// Book any silently-settled holdings into realized PnL before marking.
-	e.reconcileSettlements(invByCoin)
+	e.reconcileSettlements(ctx, invByCoin)
 
 	// Markets to quote this tick = the selector's active set PLUS any market we hold a
 	// position in. Held-but-unselected markets stay managed (we keep quoting to reduce)
@@ -60,12 +60,28 @@ func (e *Engine) tick(ctx context.Context) {
 	}
 	for coin, sh := range invByCoin {
 		if sh <= 0 || quoteCoins[coin] {
+			continue // not held, or already being quoted via the active set (no lookup needed)
+		}
+		mk, ok := e.client.Meta().Lookup(coin)
+		if !ok || !mk.IsOutcome {
 			continue
 		}
-		if mk, ok := e.client.Meta().Lookup(coin); ok && mk.IsOutcome {
-			quoteCoins[coin] = true
-			quoteMkts = append(quoteMkts, mk)
+		// Normalize a held NO leg to its YES-leg market. desiredFor always treats its
+		// market as the YES coin and prices the NO sibling at 1−fair with asks capped to
+		// held NO; enqueuing a NO coin as a PRIMARY market would misprice it (quoted at
+		// the YES probability, asks capped to the wrong side ⇒ the held NO can't be sold).
+		if !mm.IsYes(mk) {
+			yes, ok := e.client.Meta().Lookup(mm.YesCoin(mk.Outcome))
+			if !ok {
+				continue // can't resolve the YES leg — skip rather than misquote
+			}
+			mk = yes
 		}
+		if quoteCoins[mk.Coin] {
+			continue
+		}
+		quoteCoins[mk.Coin] = true
+		quoteMkts = append(quoteMkts, mk)
 	}
 
 	var (
@@ -125,17 +141,25 @@ func (e *Engine) tick(ctx context.Context) {
 		e.flush(ctx, places, modifies, cancelByCn, halted)
 	}
 
-	pnl := e.pnl.View(markByCoin)
 	holdings := buildHoldings(pf.Positions, e.client.Meta(), quoteCoins)
-	// The session accountant's cost basis only covers fills since startup, so positions
-	// carried from a PRIOR session show open $0. Use HL's authoritative per-position
-	// unrealized PnL for the open figure so it matches the POSITIONS panel + the venue.
-	var openHL float64
+	// Open PnL: prefer HL's authoritative per-position unrealized. For any held coin HL
+	// left UNMARKED (empty UnrealizedPnl — a priceable coin momentarily absent from the
+	// allMids frame) fall back to the accountant's fair-marked open for that coin (basis
+	// from fills, or seeded from entry px at startup) so the holding isn't shown flat.
+	pnl := e.pnl.View(markByCoin) // realized / fees / fills / volume
+	var open float64
 	for _, h := range holdings {
-		openHL += h.PnL
+		if h.HasPnL {
+			open += h.PnL
+			continue
+		}
+		if mark, ok := markByCoin[h.Coin]; ok {
+			open += e.pnl.OpenForCoin(h.Coin, mark) // model fair-mark fallback
+		}
+		// else: neither HL nor the model can mark it this tick ⇒ contribute 0 (not −cost)
 	}
-	pnl.Open = openHL
-	pnl.Net = pnl.Realized - pnl.Fees + openHL
+	pnl.Open = open
+	pnl.Net = pnl.Realized - pnl.Fees + open
 
 	e.mu.Lock()
 	e.view.Active = views
@@ -192,10 +216,20 @@ func (e *Engine) desiredFor(ctx context.Context, m core.Market, inv mm.Inventory
 	// Skipped on ultra-deep-ITM markets (NO price below NoSideMinPrice), where the $10 min
 	// order would force a wildly oversized NO leg — a lottery ticket, not a neutral hedge.
 	// Still quote it if we already HOLD NO there, so an existing position stays managed.
-	if e.mmcfg.Strategy.QuoteNoSide && (1-fair.P >= e.mmcfg.Strategy.NoSideMinPrice || inv.No > 0) {
+	if e.mmcfg.Strategy.QuoteNoSide {
 		noCoin := mm.NoCoin(m.Outcome)
-		noBook := e.bookTop(ctx, noCoin)
-		sets = append(sets, strategy.BuildQuoteSet(noCoin, 1-fair.P, noBook, -netInv, e.strategyParams(fair.Conf, inv.No)))
+		if 1-fair.P >= e.mmcfg.Strategy.NoSideMinPrice || inv.No > 0 {
+			noBook := e.bookTop(ctx, noCoin)
+			sets = append(sets, strategy.BuildQuoteSet(noCoin, 1-fair.P, noBook, -netInv, e.strategyParams(fair.Conf, inv.No)))
+		} else {
+			// NO side gated off (deep-ITM tail, none held): still emit an EMPTY set so the
+			// diff CANCELS any NO order left resting from when it was quoted — otherwise a
+			// stale NO bid keeps resting and can fill into the exact position the gate exists
+			// to prevent (this mirrors how the paused/blackout branches return empty NO sets).
+			sets = append(sets, mm.QuoteSet{Coin: noCoin})
+		}
+		// Keep the paired YES/NO bids coherent (never pay >$1 for a complete set).
+		strategy.ReconcilePairedBids(&sets[0], &sets[1])
 	}
 
 	gate := "quoting"
@@ -321,13 +355,23 @@ func (e *Engine) bookTop(ctx context.Context, coin string) mm.BookTop {
 // to USDC with no fill) is realized at its inferred payout — 1 if its last mark was
 // ≥ 0.5 (its side won), else 0. Guarded so a coin merely closed via fills (market
 // still open) is not mis-booked, and skipped when there is no last mark to judge by.
-func (e *Engine) reconcileSettlements(invByCoin map[string]int64) {
+func (e *Engine) reconcileSettlements(ctx context.Context, invByCoin map[string]int64) {
+	ingested := false
 	for _, coin := range e.pnl.HeldCoins() {
 		if invByCoin[coin] > 0 {
 			continue // still held on-chain
 		}
 		if !e.marketResolved(coin) {
 			continue // position gone but market open → an ordinary close (already booked via fills)
+		}
+		// The position left the book AND the market resolved. Before booking a settlement
+		// against the accountant's (possibly stale) basis, refresh fills ONCE: fills lag the
+		// tick cadence, so a position emptied by an un-ingested SELL would otherwise be
+		// mis-booked as payout*staleShares. After the refresh the sell is booked as a normal
+		// close and RealizeSettlement below no-ops (shares==0) instead of over-booking.
+		if !ingested {
+			e.ingestFills(ctx)
+			ingested = true
 		}
 		mid, ok := e.feed.Mid(coin)
 		if !ok {
@@ -337,7 +381,7 @@ func (e *Engine) reconcileSettlements(invByCoin map[string]int64) {
 		if mid >= 0.5 {
 			payout = 1
 		}
-		e.pnl.RealizeSettlement(coin, payout)
+		e.pnl.RealizeSettlement(coin, payout) // no-op if the refresh already zeroed this coin
 	}
 }
 
@@ -380,11 +424,11 @@ func buildHoldings(positions []core.PositionView, meta *core.MetaStore, active m
 		val, _ := mm.ParseFloat(p.PositionValue)
 		entry, _ := mm.ParseFloat(p.EntryPx)
 		mark, _ := mm.ParseFloat(p.MarkPx)
-		pnl, _ := mm.ParseFloat(p.UnrealizedPnl)
+		pnl, hasPnL := mm.ParseFloat(p.UnrealizedPnl) // empty ⇒ HL couldn't mark it (no live mid)
 		out = append(out, HoldingView{
 			Coin: p.Coin, Title: title, Side: p.OutcomeSide,
 			Shares: int64(math.Round(math.Abs(sh))),
-			Value:  val, Entry: entry, Mark: mark, PnL: pnl, Active: active[p.Coin],
+			Value:  val, Entry: entry, Mark: mark, PnL: pnl, HasPnL: hasPnL, Active: active[p.Coin],
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Coin < out[j].Coin })

@@ -218,6 +218,40 @@ func (p Params) buildSide(coin string, anchor, r, half float64, side core.Side, 
 	return quotes
 }
 
+// ReconcilePairedBids caps the paired YES/NO bid ladders so the best bid on each leg
+// never sums above $1. Otherwise a complete-set holder could sell us YES and NO for more
+// than the $1 the set is worth at settlement — we'd overpay for a guaranteed $1. The two
+// legs are priced independently (each anchored to its own book), so a genuinely incoherent
+// sibling book can push them over parity; when the top bids breach it, every bid on BOTH
+// legs is scaled down by the same factor (preserving ladder order) until coherent.
+func ReconcilePairedBids(yes, no *mm.QuoteSet) {
+	yb, nb := topBidPx(*yes), topBidPx(*no)
+	if yb <= 0 || nb <= 0 || yb+nb <= 1 {
+		return
+	}
+	ratio := (1 - dedupeEpsilon) / (yb + nb)
+	scaleBids(yes, ratio)
+	scaleBids(no, ratio)
+}
+
+func topBidPx(qs mm.QuoteSet) float64 {
+	best := 0.0
+	for _, q := range qs.Quotes {
+		if q.Side == core.Buy && q.Px > best {
+			best = q.Px
+		}
+	}
+	return best
+}
+
+func scaleBids(qs *mm.QuoteSet, ratio float64) {
+	for i := range qs.Quotes {
+		if qs.Quotes[i].Side == core.Buy {
+			qs.Quotes[i].Px = mm.ClampProb(qs.Quotes[i].Px * ratio)
+		}
+	}
+}
+
 // bumpNotional raises each quote's size so px·sz ≥ minNotionalUSD at its current
 // price (a no-op when the floor is unset). ceil guarantees the product clears the
 // floor; px is post-clamp so it is always ≥ OutcomeMinPrice (no divide-by-zero).

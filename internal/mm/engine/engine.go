@@ -11,6 +11,7 @@ package engine
 import (
 	"context"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,9 +88,13 @@ type Engine struct {
 // from the feed; the selector and quote loop share it.
 func New(d Deps) *Engine {
 	mmcfg := d.Cfg.MMOrDefault()
+	scanEvery := durationSecs(mmcfg.Selection.ScanIntervalSecs, 5*time.Minute)
 	// The model prices off the perp's candles (fresh mark + realized vol, no warm-up),
-	// not the slow WS allMids stream. A test may inject d.Fair to bypass both.
-	candleFeed := oms.NewCandleFeed()
+	// not the slow WS allMids stream. A test may inject d.Fair to bypass both. The mark
+	// is refreshed each scan, so tolerate a couple of missed scans before declaring it
+	// stale — then Mark returns !ok, the model errors, and quotes pull (fail-safe against
+	// pricing off a frozen candle feed, mirroring the WS feed's own staleness guard).
+	candleFeed := oms.NewCandleFeed(3*scanEvery + time.Minute)
 	fair := d.Fair
 	if fair == nil {
 		fair = fairvalue.NewPriceBinaryModel(candleFeed)
@@ -111,7 +116,7 @@ func New(d Deps) *Engine {
 		live:        mmcfg.Enabled && !mmcfg.DryRun,
 		configPath:  d.ConfigPath,
 		quoteEvery:  durationMs(mmcfg.QuoteIntervalMs, time.Second),
-		scanEvery:   durationSecs(mmcfg.Selection.ScanIntervalSecs, 5*time.Minute),
+		scanEvery:   scanEvery,
 		questionNtl: map[string]float64{},
 	}
 	e.view.DryRun = !e.signing()
@@ -210,8 +215,13 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	quote := time.NewTicker(e.quoteEvery)
 	scan := time.NewTicker(e.scanEvery)
+	// The dead-man switch MUST re-arm on its own cadence, not the (default 5-minute) scan:
+	// the arm window is only ~180s, so re-arming on the scan tick would let the switch
+	// lapse mid-cycle and HL would cancel every resting quote during healthy operation.
+	dms := time.NewTicker(dmsRearmInterval)
 	defer quote.Stop()
 	defer scan.Stop()
+	defer dms.Stop()
 
 	for {
 		select {
@@ -222,6 +232,8 @@ func (e *Engine) Run(ctx context.Context) error {
 			e.scan(ctx)
 		case <-quote.C:
 			e.tick(ctx)
+		case <-dms.C:
+			e.armDMS(ctx)
 		}
 	}
 }
@@ -270,8 +282,7 @@ func (e *Engine) scan(ctx context.Context) {
 	// Cross-book arb runs on the scan cadence (best-effort, guarded, dry-run-aware).
 	// Passes the candidates so it reuses the YES books the selector already fetched.
 	e.arbScan(ctx, sel.Active)
-	// Heartbeat the dead-man's switch so it stays ahead of the next scan.
-	e.armDMS(ctx)
+	// (The dead-man switch re-arms on its own ticker in Run, not here — see dmsRearmInterval.)
 }
 
 // reloadConfig re-reads the config file (if a path was provided) so live [mm] edits —
@@ -337,13 +348,23 @@ func (e *Engine) ingestFills(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	e.pnl.IngestFills(fills)
+	// Advance the high-water past EVERY fill read (so non-outcome fills aren't re-read),
+	// but book ONLY outcome-market fills ("#<enc>") into the MM's session PnL — the same
+	// master account may trade perps/spot, and folding those fills would corrupt the
+	// session's fees/realized/volume/fill-count.
 	var maxTs int64 = since
 	for _, f := range fills {
 		if f.Time > maxTs {
 			maxTs = f.Time
 		}
 	}
+	outcome := fills[:0]
+	for _, f := range fills {
+		if strings.HasPrefix(f.Coin, "#") {
+			outcome = append(outcome, f)
+		}
+	}
+	e.pnl.IngestFills(outcome)
 	e.mu.Lock()
 	e.lastFillTs = maxTs
 	e.mu.Unlock()

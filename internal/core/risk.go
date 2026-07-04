@@ -162,7 +162,10 @@ func (c *Client) staticChecks(rc riskCheck) error {
 // so no invocation surface (CLI, the outcome-mm daemon, a hallucinating agent) can
 // open fresh exposure into a resolving market.
 func (c *Client) outcomeSettleGate(mk Market, req OrderReq) error {
-	if req.ReduceOnly || req.Closing {
+	// Outcome tokens are long-only spot, so a Sell can only REDUCE a holding — it is
+	// always de-risking. Exempt it (like ReduceOnly/Closing) so a plain `sell` can
+	// unwind a position during the blackout; only Buys (opening/adding exposure) are gated.
+	if req.ReduceOnly || req.Closing || (mk.IsOutcome && req.Side == Sell) {
 		return nil
 	}
 	return c.outcomeSettleCheck(mk)
@@ -185,10 +188,18 @@ func (c *Client) outcomeSettleCheck(mk Market) error {
 	if win <= 0 {
 		return nil
 	}
+	// An absent expiry is STRUCTURAL, not stale metadata: event and multi-outcome
+	// markets carry no expiry (parseOutcomeDescription only fills it for priceBinary),
+	// so there is no near-expiry blackout window to enforce. Do NOT fail closed here —
+	// that would ban the entire event/multi-outcome class regardless of resolution time.
+	// The "settled" check above still stops new exposure once such a market resolves.
+	if strings.TrimSpace(mk.Expiry) == "" {
+		return nil
+	}
 	exp, ok := parseOutcomeExpiryTime(mk.Expiry)
 	if !ok {
-		// Fail closed: the blackout window is configured but we cannot prove the
-		// order is outside it, so refuse the new exposure rather than assume safety.
+		// Fail closed: a NON-EMPTY but unparseable expiry means stale/corrupt metadata
+		// for a market that does have one — refuse rather than assume safety.
 		return output.Risk("outcome_expiry_unknown",
 			"cannot parse expiry for "+mk.Coin+" to enforce the settlement blackout — refusing new exposure").
 			WithHint("retry once market metadata is fresh, or clear risk.outcome_settle_blackout_mins")

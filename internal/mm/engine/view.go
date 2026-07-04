@@ -37,7 +37,8 @@ type HoldingView struct {
 	Value  float64 // current position value (USD)
 	Entry  float64 // avg entry probability
 	Mark   float64 // current mark probability
-	PnL    float64 // unrealized PnL (USD)
+	PnL    float64 // unrealized PnL (USD), from HL when it marked the coin
+	HasPnL bool    // HL provided an unrealized figure (coin present in the allMids frame)
 	Active bool    // still in the active quote set (being managed)
 }
 

@@ -25,9 +25,12 @@ func TestOutcomeSettleGate(t *testing.T) {
 	openNear := Market{Coin: "#6410", IsOutcome: true, ResolutionStatus: "open", Expiry: expiryIn(10 * time.Minute)}
 	settled := Market{Coin: "#6410", IsOutcome: true, ResolutionStatus: "settled", Expiry: expiryIn(3 * time.Hour)}
 	badExpiry := Market{Coin: "#6410", IsOutcome: true, ResolutionStatus: "open", Expiry: "garbage"}
+	// Event / multi-outcome markets carry NO expiry metadata (only priceBinary does).
+	noExpiry := Market{Coin: "#7000", IsOutcome: true, ResolutionStatus: "open", Expiry: ""}
 	perp := Market{Coin: "BTC", IsOutcome: false}
 
 	buy := OrderReq{Side: Buy}
+	sell := OrderReq{Side: Sell} // plain sell (not flagged) — de-risking on long-only outcome spot
 	reduce := OrderReq{Side: Sell, ReduceOnly: true}
 	closing := OrderReq{Side: Sell, Closing: true}
 
@@ -48,6 +51,12 @@ func TestOutcomeSettleGate(t *testing.T) {
 		{"blackout reduce-only allowed", blackoutCfg(15), openNear, reduce, ""},
 		{"unparseable expiry with blackout fails closed", blackoutCfg(15), badExpiry, buy, "expiry"},
 		{"unparseable expiry no blackout ok", blackoutCfg(0), badExpiry, buy, ""},
+		// Regression: an absent expiry is structural (event/multi-outcome market), not stale
+		// metadata — it must NOT fail closed and ban the whole class regardless of the knob.
+		{"empty expiry event market not blocked by blackout", blackoutCfg(15), noExpiry, buy, ""},
+		// Regression: a plain Sell is always de-risking on long-only outcome spot, so it may
+		// unwind during the blackout (only Buys open/add exposure).
+		{"blackout plain sell allowed (long-only de-risk)", blackoutCfg(15), openNear, sell, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -138,5 +147,31 @@ func TestHeaviestOutcomeQuestion(t *testing.T) {
 	_, n = c.heaviestOutcomeQuestion(map[string]float64{"#7000": 30}, map[string]pendingAdd{"#7000": {buy: 20}})
 	if n != 50 {
 		t.Fatalf("worst-case fold: got %.0f, want 50 (30 pos + 20 resting buy)", n)
+	}
+}
+
+// Regression (#2): the per-question outcome cap governs only outcome coins, so a
+// non-outcome perp/spot order must NOT activate it — otherwise it forces a fail-closed
+// account-state read on that order's behalf, and a transient read failure would reject an
+// unrelated BTC order. It must also stay OUT of the coin-agnostic portfolioGuardsActive.
+func TestOutcomeQuestionCapActive(t *testing.T) {
+	capOnly := &Client{cfg: &config.Config{Risk: config.Risk{MaxOutcomeQuestionNotionalUSD: 50}}}
+
+	if capOnly.portfolioGuardsActive() {
+		t.Fatal("outcome cap alone must NOT flag the coin-agnostic guards active (would force a read on non-outcome orders)")
+	}
+	if capOnly.outcomeQuestionCapActive([]exposureDelta{{coin: "BTC", signedNotional: 100}}) {
+		t.Error("a non-outcome (BTC) delta must not activate the outcome-question cap")
+	}
+	if !capOnly.outcomeQuestionCapActive([]exposureDelta{{coin: "#7290", signedNotional: 10}}) {
+		t.Error("an outcome (#7290) delta must activate the cap")
+	}
+	if !capOnly.outcomeQuestionCapActive([]exposureDelta{{coin: "BTC"}, {coin: "#7290"}}) {
+		t.Error("a mixed batch touching an outcome coin must activate the cap")
+	}
+
+	off := &Client{cfg: &config.Config{Risk: config.Risk{}}}
+	if off.outcomeQuestionCapActive([]exposureDelta{{coin: "#7290"}}) {
+		t.Error("cap unset (0) must never activate")
 	}
 }

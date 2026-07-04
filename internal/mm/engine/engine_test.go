@@ -31,6 +31,9 @@ func (f *fakeClient) Portfolio(context.Context) (*core.PortfolioView, error) { r
 func (f *fakeClient) Halted() bool                                           { return f.halted }
 func (f *fakeClient) Bbo(context.Context, string) (*core.BboView, error)     { return f.bbo, nil }
 func (f *fakeClient) Meta() *core.MetaStore                                  { return f.meta }
+func (f *fakeClient) Fills(context.Context, *int64, int) ([]hl.Fill, core.ReadMeta, error) {
+	return nil, core.ReadMeta{}, nil // no fills by default; fillsFake overrides for scripted history
+}
 func (f *fakeClient) PlaceBatch(_ context.Context, r []core.OrderReq) ([]*core.PlaceResult, []string, error) {
 	f.placed = append(f.placed, r)
 	return nil, nil, nil
