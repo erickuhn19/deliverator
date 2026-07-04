@@ -45,6 +45,90 @@ func (c *Client) portfolioGuardsActive() bool {
 		r.MaxOpenPositions > 0
 }
 
+// outcomeQuestionCapActive reports whether the per-question outcome cap should run for
+// THIS invocation. Unlike the coin-agnostic gates, the cap governs only outcome coins,
+// so a non-outcome perp/spot order must not force the (fail-closed) account-state read
+// on its behalf — the cap is only relevant when at least one touched coin is an outcome
+// coin ("#<enc>"). This keeps a transient read failure from rejecting an unrelated order.
+func (c *Client) outcomeQuestionCapActive(deltas []exposureDelta) bool {
+	if c.cfg.Risk.MaxOutcomeQuestionNotionalUSD <= 0 {
+		return false
+	}
+	for _, d := range deltas {
+		if strings.HasPrefix(d.coin, "#") {
+			return true
+		}
+	}
+	return false
+}
+
+// outcomeQuestionKey groups outcome coins that are the SAME bet. A multi-outcome
+// question (Question != 0) buckets all its outcomes together; a standalone binary
+// (Question == 0) buckets only its own Yes/No pair, keyed on the Outcome id — so two
+// unrelated Question==0 binaries never merge into one phantom bucket. Non-outcome
+// coins return ("", false).
+func outcomeQuestionKey(mk Market) (string, string, bool) {
+	if !mk.IsOutcome {
+		return "", "", false
+	}
+	if mk.Question != 0 {
+		return "q:" + strconv.Itoa(mk.Question), mk.QuestionName, true
+	}
+	name := mk.QuestionName
+	if name == "" {
+		name = mk.Title
+	}
+	return "o:" + strconv.Itoa(mk.Outcome), name, true
+}
+
+// heaviestOutcomeQuestion folds the resulting book's worst-case per-coin notional
+// (positions + this order's delta + resting pending-adds) into per-question buckets
+// and returns the heaviest one. Each outcome coin is valued at the same worst case
+// the per-coin gate uses (max of |v + resting buys| and |v − resting sells|), so the
+// per-question cap is consistent with max_concentration_pct_per_coin — it just sums
+// the legs the per-coin view cannot see are one bet. Non-outcome coins are ignored.
+func (c *Client) heaviestOutcomeQuestion(resulting map[string]float64, pending map[string]pendingAdd) (label string, notional float64) {
+	byKey := map[string]float64{}
+	nameByKey := map[string]string{}
+	seen := map[string]bool{}
+	fold := func(coin string, v float64, p pendingAdd) {
+		mk, ok := c.meta.Lookup(coin)
+		if !ok {
+			return
+		}
+		key, name, isOutcome := outcomeQuestionKey(mk)
+		if !isOutcome {
+			return
+		}
+		worst := math.Max(absF(v+p.buy), absF(v-p.sell))
+		byKey[key] += worst
+		if _, ok := nameByKey[key]; !ok {
+			nameByKey[key] = name
+		}
+	}
+	for coin, v := range resulting {
+		seen[coin] = true
+		fold(coin, v, pending[coin])
+	}
+	// Coins with only resting orders (no position) still deploy capital toward the
+	// question — fold them too.
+	for coin, p := range pending {
+		if seen[coin] {
+			continue
+		}
+		fold(coin, 0, p)
+	}
+	for key, n := range byKey {
+		if n > notional {
+			notional, label = n, key
+			if nm := nameByKey[key]; nm != "" {
+				label = nm
+			}
+		}
+	}
+	return label, notional
+}
+
 // reduceOnlyFlipErr rejects a reduce-only order that cannot actually REDUCE the
 // current open position in that coin (#44, review P0-A):
 //
@@ -457,7 +541,7 @@ func (c *Client) checkPortfolioGates(ctx context.Context, deltas []exposureDelta
 // replacement-adjusted pending fold — instead of fetching the book again.
 // book==nil behaves exactly like checkPortfolioGates.
 func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureDelta, book *gateBook) ([]string, error) {
-	if !c.portfolioGuardsActive() {
+	if !c.portfolioGuardsActive() && !c.outcomeQuestionCapActive(deltas) {
 		return nil, nil
 	}
 	snap, err := c.portfolioEquitySnapshot(ctx, book)
@@ -493,6 +577,18 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 			return nil, output.Risk("max_open_positions",
 				fmt.Sprintf("this would make %d open positions (resting orders on a coin count), over the max of %d", count, cap)).
 				WithHint(fmt.Sprintf("close a position, cancel resting orders on unopened coins, or add to an existing one (cap %d concurrent)", cap))
+		}
+	}
+
+	// Per-question outcome concentration needs no equity ($ notional cap), so it is
+	// always checkable — like net-exposure and open-positions above. It backstops the
+	// per-coin concentration cap, which cannot tell that the Yes and No legs of one
+	// binary (two different "#<enc>" coins) are the same bet.
+	if cap := r.MaxOutcomeQuestionNotionalUSD; cap > 0 && c.outcomeQuestionCapActive(deltas) {
+		if label, notional := c.heaviestOutcomeQuestion(resulting, snap.pending); notional > cap {
+			return nil, output.Risk("max_outcome_question_notional",
+				fmt.Sprintf("outcome question %q would hold $%.2f across its legs (resting orders count), over the $%.2f cap", label, notional, cap)).
+				WithHint(fmt.Sprintf("reduce size or cancel resting orders so the question's total notional <= $%.2f", cap))
 		}
 	}
 

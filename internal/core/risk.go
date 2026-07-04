@@ -152,6 +152,66 @@ func (c *Client) staticChecks(rc riskCheck) error {
 	return nil
 }
 
+// outcomeSettleGate is the core fail-closed backstop for HIP-4 settlement risk
+// (spec §10). It refuses to OPEN or ADD outcome exposure on a market that has
+// already settled, or — when risk.outcome_settle_blackout_mins is set — within that
+// many minutes of expiry (the adverse-selection window where informed flow lifts a
+// stale quote right before resolution). Exits (reduce-only / closing) are always
+// allowed so a holding can be unwound, and non-outcome orders pass through
+// untouched. It is enforced in the Place / PlaceBatch entry paths, before signing —
+// so no invocation surface (CLI, the outcome-mm daemon, a hallucinating agent) can
+// open fresh exposure into a resolving market.
+func (c *Client) outcomeSettleGate(mk Market, req OrderReq) error {
+	// Outcome tokens are long-only spot, so a Sell can only REDUCE a holding — it is
+	// always de-risking. Exempt it (like ReduceOnly/Closing) so a plain `sell` can
+	// unwind a position during the blackout; only Buys (opening/adding exposure) are gated.
+	if req.ReduceOnly || req.Closing || (mk.IsOutcome && req.Side == Sell) {
+		return nil
+	}
+	return c.outcomeSettleCheck(mk)
+}
+
+// outcomeSettleCheck is the settlement/blackout backstop with no exit-exemption
+// logic — callers invoke it only for orders that OPEN or ADD outcome exposure
+// (Place/PlaceBatch new legs, an exposure-increasing Modify, a non-reduce-only Twap
+// or bracket entry). Non-outcome coins pass through. See outcomeSettleGate.
+func (c *Client) outcomeSettleCheck(mk Market) error {
+	if !mk.IsOutcome {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(mk.ResolutionStatus), "settled") {
+		return output.Risk("outcome_settled",
+			"outcome market "+mk.Coin+" has settled — no new exposure").
+			WithHint("this market is resolved; quote an open outcome market")
+	}
+	win := c.cfg.Risk.OutcomeSettleBlackoutMins
+	if win <= 0 {
+		return nil
+	}
+	// An absent expiry is STRUCTURAL, not stale metadata: event and multi-outcome
+	// markets carry no expiry (parseOutcomeDescription only fills it for priceBinary),
+	// so there is no near-expiry blackout window to enforce. Do NOT fail closed here —
+	// that would ban the entire event/multi-outcome class regardless of resolution time.
+	// The "settled" check above still stops new exposure once such a market resolves.
+	if strings.TrimSpace(mk.Expiry) == "" {
+		return nil
+	}
+	exp, ok := parseOutcomeExpiryTime(mk.Expiry)
+	if !ok {
+		// Fail closed: a NON-EMPTY but unparseable expiry means stale/corrupt metadata
+		// for a market that does have one — refuse rather than assume safety.
+		return output.Risk("outcome_expiry_unknown",
+			"cannot parse expiry for "+mk.Coin+" to enforce the settlement blackout — refusing new exposure").
+			WithHint("retry once market metadata is fresh, or clear risk.outcome_settle_blackout_mins")
+	}
+	if time.Until(exp) <= time.Duration(win)*time.Minute {
+		return output.Risk("outcome_settle_blackout",
+			fmt.Sprintf("%s is within the %d-minute settlement blackout before expiry — no new exposure", mk.Coin, win)).
+			WithHint("quotes are pulled near expiry to avoid adverse selection; reduce or hold to settle")
+	}
+	return nil
+}
+
 // checkLeverage caps leverage changes (§6).
 func (c *Client) checkLeverage(x int) error {
 	if cap := c.cfg.Risk.MaxLeverage; cap > 0 && x > cap {

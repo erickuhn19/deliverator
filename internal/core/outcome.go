@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	hl "github.com/erickuhn19/deliverator/internal/hl"
 )
@@ -109,6 +110,20 @@ func formatOutcomeExpiry(s string) string {
 		return s
 	}
 	return fmt.Sprintf("%s-%s-%s %s:%sZ", s[0:4], s[4:6], s[6:8], s[9:11], s[11:13])
+}
+
+// outcomeExpiryLayout parses the string formatOutcomeExpiry emits (UTC, minute res).
+const outcomeExpiryLayout = "2006-01-02 15:04Z"
+
+// parseOutcomeExpiryTime parses a Market.Expiry ("YYYY-MM-DD HH:MMZ") as a UTC
+// instant; ok=false when it is empty or malformed. It is the core-side counterpart
+// to mm.ParseExpiry (core cannot import internal/mm — that would be an import cycle).
+func parseOutcomeExpiryTime(s string) (time.Time, bool) {
+	t, err := time.Parse(outcomeExpiryLayout, strings.TrimSpace(s))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.UTC(), true
 }
 
 // outcomeTitle builds a human-readable description of what a Yes resolves on.

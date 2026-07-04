@@ -250,6 +250,10 @@ func riskCapValue(c *config.Config, key string) (string, bool) {
 		return v(r.MaxDailyLossPct), true
 	case "risk.max_open_positions":
 		return v(r.MaxOpenPositions), true
+	case "risk.outcome_settle_blackout_mins":
+		return v(r.OutcomeSettleBlackoutMins), true
+	case "risk.max_outcome_question_notional_usd":
+		return v(r.MaxOutcomeQuestionNotionalUSD), true
 	case "risk.max_priority_bps":
 		return v(r.MaxPriorityBps), true
 	}
@@ -362,6 +366,18 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 			return err
 		}
 		cfg.Risk.MaxOpenPositions = n
+	case "risk.outcome_settle_blackout_mins":
+		n, err := atoi()
+		if err != nil {
+			return err
+		}
+		cfg.Risk.OutcomeSettleBlackoutMins = n
+	case "risk.max_outcome_question_notional_usd":
+		f, err := atof()
+		if err != nil {
+			return err
+		}
+		cfg.Risk.MaxOutcomeQuestionNotionalUSD = f
 	case "risk.max_priority_bps":
 		n, err := atoi()
 		if err != nil {
@@ -460,6 +476,14 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 		}
 		cfg.Outcomes = b
 	default:
+		// [mm] table keys route to the shared setter in package config (the separate
+		// outcome-mm binary + its TUI use the same one). Seeds DefaultMM if absent.
+		if config.IsMMKey(key) {
+			if err := cfg.SetMMKey(key, val); err != nil {
+				return err
+			}
+			return cfg.Validate()
+		}
 		return fmt.Errorf("unknown or unsettable key %q", key)
 	}
 	return cfg.Validate()

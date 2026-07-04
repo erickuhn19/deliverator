@@ -368,6 +368,11 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 	if !ok {
 		return nil, nil, unknownCoin(req.Coin)
 	}
+	// HIP-4 settlement backstop: refuse new outcome exposure on a settled or
+	// in-blackout market before doing any pricing work (exits are exempt inside).
+	if err := c.outcomeSettleGate(mk, req); err != nil {
+		return nil, nil, err
+	}
 	req, nerr := c.applyNotional(ctx, mk, req)
 	if nerr != nil {
 		return nil, nil, nerr
@@ -692,6 +697,11 @@ func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResu
 	}
 	if req.TP == "" && req.SL == "" {
 		return nil, nil, output.Validation("no_bracket", "a bracket needs --tp and/or --sl")
+	}
+	// The bracket ENTRY leg opens fresh exposure → settlement/blackout backstop for
+	// outcome coins (the TP/SL children are reduce-only and exempt).
+	if serr := c.outcomeSettleCheck(mk); serr != nil {
+		return nil, nil, serr
 	}
 	warnings := []string{}
 	szOut, _, err := RoundSize(req.Size, mk.SzDecimals)
@@ -1111,6 +1121,10 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 		mk, ok := c.meta.Lookup(req.Coin)
 		if !ok {
 			return nil, warnings, batchLegErr(i, unknownCoin(req.Coin))
+		}
+		// HIP-4 settlement backstop, per leg (exits exempt inside the gate).
+		if err := c.outcomeSettleGate(mk, req); err != nil {
+			return nil, warnings, batchLegErr(i, err)
 		}
 		req, nerr := c.applyNotional(ctx, mk, req) // --notional per leg (#50)
 		if nerr != nil {
@@ -2039,6 +2053,13 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 	if !existing.ReduceOnly {
 		newPendingN := szF * pxF // limit-valued, exactly like the resting-book fold
 		increase = szF > existing.RemainingSz+1e-9 || newPendingN > existing.PendingNotional+1e-6
+		// A modify that GROWS an outcome order opens fresh exposure — apply the
+		// settlement/blackout backstop (a shrink/reprice is de-risking and exempt).
+		if increase {
+			if err := c.outcomeSettleCheck(mk); err != nil {
+				return nil, nil, err
+			}
+		}
 		// A modify to a crossing limit fills at the market — price the guard at the
 		// mid (the wire pxF still carries the new limit), same as Place/PlaceBatch.
 		refPx := pxF
@@ -2278,6 +2299,10 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 			increase := szF > existing.RemainingSz+1e-9 || newPendingN > existing.PendingNotional+1e-6
 			if increase {
 				anyIncrease = true
+				// Growing an outcome order opens fresh exposure → settlement backstop.
+				if serr := c.outcomeSettleCheck(mk); serr != nil {
+					return nil, warnings, batchLegErr(i, serr)
+				}
 			}
 			if capActive || gatesActive {
 				if increase && len(staleDexs) > 0 {
@@ -2731,6 +2756,10 @@ func (c *Client) Twap(ctx context.Context, req TwapReq) (*TwapResult, []string, 
 	notional, posNotional := 0.0, 0.0
 	var book *gateBook // one open-orders read, shared cap → gates (parity with Place)
 	if !req.ReduceOnly {
+		// A non-reduce-only TWAP opens fresh exposure → settlement/blackout backstop.
+		if serr := c.outcomeSettleCheck(mk); serr != nil {
+			return nil, nil, serr
+		}
 		refPx, hasMid := c.midPrice(ctx, mk.Coin)
 		if !hasMid {
 			if c.pricingGuardsActive() {
