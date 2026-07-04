@@ -347,6 +347,72 @@ Run `deliverator <cmd> --help` for flags. Config lives at
 
 ---
 
+## Outcome Market Maker (`outcome-mm`)
+
+A **second binary** in this module, `outcome-mm`, is a specialized market maker for
+HIP-4 outcome (prediction) markets. It consumes `internal/core` in-process — the same
+guarded client the CLI drives — so every quote passes the identical risk gauntlet
+(pre-trade checks, portfolio gates, plus two new outcome-specific gates) and signs
+with the same non-withdraw agent key. It is a long-lived daemon; run it under
+launchd/systemd with restart-on-crash, **not** cron.
+
+```sh
+go build -o outcome-mm ./cmd/outcome-mm
+outcome-mm run                 # foreground TUI dashboard
+outcome-mm run --headless      # daemon: no TUI, periodic JSON status on stdout
+outcome-mm run --dry-run       # shadow: compute + render quotes, never sign
+```
+
+**It never signs by default.** A fresh install runs in shadow; live quoting requires
+the operator to explicitly set `mm.enabled = true` **and** `mm.dry_run = false` (and
+not pass `--dry-run`). Start on testnet or `--dry-run` first.
+
+What it does each cycle: a slow **selector** ranks the daily-rotating outcome universe
+into a small active set (liquidity + spread-opportunity + model-confidence score, with
+hysteresis and per-underlying/expiry diversification); a fast loop prices each active
+market with a **Black–Scholes-digital** fair value off the underlying's live mark and
+EWMA realized vol, builds an **inventory-skewed two-sided ladder**, diffs it against
+the resting book, and applies the minimal place/modify/cancel as aggregated signed
+actions (staying inside `max_orders_per_min`). A cross-book **YES/NO arb** scanner and
+a **blackout + hold-to-settle** policy round it out. Direction is handled by inventory
+skew + small size, not a hedge (perp delta-hedge is v1.1; an LLM fair-value layer for
+event markets is v2).
+
+Two new **core** gates back it (they apply to every invocation surface, not just the
+MM): `risk.outcome_settle_blackout_mins` refuses new outcome exposure near expiry (and
+always on a settled market), and `risk.max_outcome_question_notional_usd` caps total
+notional across all legs of one question (the Yes/No pair of a binary counts as one
+bet). Both default off.
+
+Config lives in the same `config.toml` under an `[mm]` table (selection weights,
+spreads, ladder shape, TTL band, blackout window, pins/blacklist, `priceable_underlyings`).
+Set keys with `deliverator config set mm.<key> <value>` or edit them live in the TUI.
+
+```toml
+[mm]
+enabled = false          # master switch for live quoting
+dry_run = true           # shadow even when enabled; flip to false to sign
+
+[mm.selection]
+max_active_markets = 6
+priceable_underlyings = ["BTC", "ETH", "HYPE"]
+min_ttl_mins = 30
+
+[mm.strategy]
+base_spread = 0.02       # half-spread in probability units
+levels = 3
+
+[mm.settle]
+blackout_mins = 15       # stop quoting this long before expiry; hold to settle
+```
+
+The dashboard (`internal/tui/mm`) shows the active markets (fair vs mid, your quotes,
+inventory, gate status), the ranked candidate pool with include/exclude reasons,
+account/risk, a PnL split, and the activity feed; `p` pauses, `!` panics, `+`/`-`/`b`/`P`
+edit selection live. See the build spec for the full design.
+
+---
+
 ## Development
 
 ```sh
