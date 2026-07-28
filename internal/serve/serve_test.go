@@ -393,3 +393,128 @@ func TestAnOverlongSocketPathSaysWhy(t *testing.T) {
 		t.Errorf("error should name the length problem, got: %v", err)
 	}
 }
+
+func TestCancelCarriesEveryTargetingForm(t *testing.T) {
+	eng := &fakeEngine{}
+	sc, conn, _ := start(t, eng)
+
+	oid := int64(77)
+	r := call(t, sc, conn, Request{ID: "1", Method: "cancel",
+		Params: json.RawMessage(`{"oid":77,"coin":"BTC"}`)})
+	if !r.OK {
+		t.Fatalf("cancel by oid failed: %+v", r.Error)
+	}
+	if len(eng.cancels) != 1 || eng.cancels[0].Oid == nil || *eng.cancels[0].Oid != oid {
+		t.Fatalf("oid did not reach the engine: %+v", eng.cancels)
+	}
+	if eng.cancels[0].Coin != "BTC" {
+		t.Errorf("coin lost: %q", eng.cancels[0].Coin)
+	}
+
+	// The batch forms matter most: a ladder is cancelled by cloid list in one
+	// signed action, and a dropped list would silently leave rungs resting.
+	call(t, sc, conn, Request{ID: "2", Method: "cancel",
+		Params: json.RawMessage(`{"cloids":["0xa","0xb","0xc"]}`)})
+	if got := eng.cancels[1].Cloids; len(got) != 3 {
+		t.Errorf("cloid list lost: %v", got)
+	}
+
+	call(t, sc, conn, Request{ID: "3", Method: "cancel",
+		Params: json.RawMessage(`{"all":true,"coin":"#9370"}`)})
+	if !eng.cancels[2].All || eng.cancels[2].Coin != "#9370" {
+		t.Errorf("cancel-all lost: %+v", eng.cancels[2])
+	}
+}
+
+// The dead-man switch is the rail that saves the account if this process dies
+// holding orders, and a persistent server is exactly the caller that should be
+// heartbeating one. Nil CLEARS; a value arms.
+func TestDMSArmsAndClears(t *testing.T) {
+	eng := &fakeEngine{}
+	sc, conn, _ := start(t, eng)
+
+	if r := call(t, sc, conn, Request{ID: "1", Method: "dms",
+		Params: json.RawMessage(`{"deadline_ms":1785000000000}`)}); !r.OK {
+		t.Fatalf("arm failed: %+v", r.Error)
+	}
+	if len(eng.dms) != 1 || eng.dms[0] == nil || *eng.dms[0] != 1785000000000 {
+		t.Fatalf("deadline did not reach the engine: %+v", eng.dms)
+	}
+	if r := call(t, sc, conn, Request{ID: "2", Method: "dms", Params: json.RawMessage(`{}`)}); !r.OK {
+		t.Fatalf("clear failed: %+v", r.Error)
+	}
+	if len(eng.dms) != 2 || eng.dms[1] != nil {
+		t.Errorf("a nil deadline must CLEAR, got %+v", eng.dms[1])
+	}
+}
+
+func TestFillsPassesSinceAndLimit(t *testing.T) {
+	sc, conn, _ := start(t, &fakeEngine{})
+	if r := call(t, sc, conn, Request{ID: "1", Method: "fills",
+		Params: json.RawMessage(`{"since":1785000000000,"limit":50}`)}); !r.OK {
+		t.Fatalf("fills failed: %+v", r.Error)
+	}
+}
+
+// A truncated history read must be as visible as a degraded one: the caller
+// stopped at a safety cap and there are more rows, which changes what a
+// reconcile means.
+func TestTruncatedReadsStayVisible(t *testing.T) {
+	eng := &fakeEngine{ordersMeta: core.ReadMeta{Truncated: true}}
+	sc, conn, _ := start(t, eng)
+	r := call(t, sc, conn, Request{ID: "1", Method: "orders"})
+	if !r.Truncated {
+		t.Error("truncation lost across the socket")
+	}
+	if len(r.Warnings) == 0 {
+		t.Error("a truncated read needs a warning a human would see")
+	}
+}
+
+func TestAMissingMethodIsRejected(t *testing.T) {
+	sc, conn, _ := start(t, &fakeEngine{})
+	r := call(t, sc, conn, Request{ID: "1"})
+	if r.OK || r.Error == nil || r.Error.Code != "no_method" {
+		t.Fatalf("an empty method must be rejected: %+v", r.Error)
+	}
+}
+
+func TestBadParamsAreRejectedNotIgnored(t *testing.T) {
+	eng := &fakeEngine{}
+	sc, conn, _ := start(t, eng)
+	r := call(t, sc, conn, Request{ID: "1", Method: "place",
+		Params: json.RawMessage(`{"coin":123}`)})
+	if r.OK {
+		t.Fatal("malformed params must not place an order")
+	}
+	if len(eng.placed) != 0 {
+		t.Error("an order was placed from undecodable params")
+	}
+}
+
+func TestEmptySocketPathIsRejected(t *testing.T) {
+	if err := New(&fakeEngine{}, "", nil).Listen(); err == nil {
+		t.Error("an empty socket path must fail rather than bind somewhere surprising")
+	}
+}
+
+// A nil meta provider must not panic — the server is constructed that way in
+// several tests and could be by an embedder.
+func TestNilMetaIsSafe(t *testing.T) {
+	sock := shortSock(t)
+	srv := New(&fakeEngine{}, sock, nil)
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx) }()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if r := call(t, bufio.NewScanner(conn), conn, Request{ID: "1", Method: "ping"}); !r.OK {
+		t.Error("a nil meta provider should still answer")
+	}
+}
