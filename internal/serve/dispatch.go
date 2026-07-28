@@ -13,6 +13,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/erickuhn19/deliverator/internal/core"
 	"github.com/erickuhn19/deliverator/internal/output"
@@ -36,7 +38,35 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 			fmt.Sprintf("method %q is not served", req.Method)).
 			WithHint("serve mode exposes the execution path only; streams and admin stay on the CLI. Available: "+joinMethods()))
 	}
-	return h(s, ctx, req)
+	resp := h(s, ctx, req)
+
+	// A "#<enc>" coin the universe does not know is almost always a stale cache,
+	// not a bad request: these markets roll DAILY and this process outlives the
+	// roll. Reload once and retry.
+	//
+	// Retrying is safe HERE and only here. unknown_coin is a VALIDATION error
+	// raised while resolving the market, long before anything is signed — so
+	// nothing reached the venue and there is no double-fill to create. No other
+	// failure gets this treatment.
+	if !resp.OK && resp.Error != nil && resp.Error.Code == "unknown_coin" &&
+		strings.Contains(resp.Error.Message, "#") && s.reloadOutcomes(ctx) {
+		resp = h(s, ctx, req)
+	}
+	return resp
+}
+
+// reloadOutcomes refreshes the HIP-4 universe, at most once every 30s. Reports
+// whether a refresh actually ran, so the caller only retries when the world may
+// have changed underneath it.
+func (s *Server) reloadOutcomes(ctx context.Context) bool {
+	s.refreshMu.Lock()
+	if time.Since(s.outcomeRefreshAt) < 30*time.Second {
+		s.refreshMu.Unlock()
+		return false
+	}
+	s.outcomeRefreshAt = time.Now()
+	s.refreshMu.Unlock()
+	return s.eng.RefreshOutcomes(ctx) == nil
 }
 
 func joinMethods() string {

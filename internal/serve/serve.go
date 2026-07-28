@@ -90,6 +90,11 @@ type Engine interface {
 	PlaceBatch(ctx context.Context, reqs []core.OrderReq) ([]*core.PlaceResult, []string, error)
 	Cancel(ctx context.Context, req core.CancelReq) (*core.CancelResult, error)
 	ScheduleCancel(ctx context.Context, deadlineMs *int64) error
+
+	// RefreshOutcomes reloads the HIP-4 universe. A server outlives the DAILY
+	// roll that retires a coin and lists its successor, so a universe cached at
+	// startup goes stale every day. See reloadOutcomesFor.
+	RefreshOutcomes(ctx context.Context) error
 }
 
 // Server accepts requests on a Unix socket until its context ends.
@@ -99,6 +104,11 @@ type Server struct {
 	meta func() output.Meta
 
 	ln net.Listener
+
+	// outcomeRefreshAt rate-limits the universe reload so a caller hammering a
+	// genuinely bad coin cannot turn every request into an API fetch.
+	refreshMu        sync.Mutex
+	outcomeRefreshAt time.Time
 
 	// One in-flight request per CONNECTION, enforced by handling a connection's
 	// lines sequentially. Concurrency across connections is allowed and the

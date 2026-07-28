@@ -30,10 +30,28 @@ type fakeEngine struct {
 	placeErr    error
 	ordersMeta  core.ReadMeta
 	ordersError error
+
+	// knownCoins is the outcome universe. bookErrUntilRefresh models the DAILY
+	// roll: the coin exists on the venue but not in this process's cache until
+	// something reloads it.
+	knownCoins map[string]bool
+	refreshes  int
+}
+
+func (f *fakeEngine) RefreshOutcomes(context.Context) error {
+	f.refreshes++
+	if f.knownCoins == nil {
+		f.knownCoins = map[string]bool{}
+	}
+	f.knownCoins["#9450"] = true // the roll's successor becomes visible
+	return nil
 }
 
 func (f *fakeEngine) Book(_ context.Context, coin string, levels int) (*core.BookView, error) {
 	f.bookCoin, f.bookLvls = coin, levels
+	if f.knownCoins != nil && strings.HasPrefix(coin, "#") && !f.knownCoins[coin] {
+		return nil, output.Validation("unknown_coin", "unknown coin "+coin)
+	}
 	return &core.BookView{Coin: coin}, nil
 }
 func (f *fakeEngine) Ctx(context.Context, string) (*core.CtxView, error) {
@@ -516,5 +534,66 @@ func TestNilMetaIsSafe(t *testing.T) {
 	defer conn.Close()
 	if r := call(t, bufio.NewScanner(conn), conn, Request{ID: "1", Method: "ping"}); !r.OK {
 		t.Error("a nil meta provider should still answer")
+	}
+}
+
+// THE roll regression. Outcome markets are DAILY and this process outlives the
+// roll, so a universe cached at startup stops recognising the coin the moment
+// the binary rolls — and every order fails "unknown coin" while the decision
+// layer, reading a stream that resolves coins independently, believes it is
+// quoting normally.
+//
+// It is not hypothetical: it cost a full session. A downstream maker sat at 398
+// consecutive placement failures against a market it could see perfectly well.
+func TestAnUnknownOutcomeCoinTriggersOneReloadAndRetry(t *testing.T) {
+	eng := &fakeEngine{knownCoins: map[string]bool{"#9370": true}}
+	sc, conn, _ := start(t, eng)
+
+	// The coin that existed before the roll still works, and must NOT refresh.
+	if r := call(t, sc, conn, Request{ID: "1", Method: "book",
+		Params: json.RawMessage(`{"coin":"#9370","levels":2}`)}); !r.OK {
+		t.Fatalf("a known coin should not fail: %+v", r.Error)
+	}
+	if eng.refreshes != 0 {
+		t.Errorf("a successful call must not reload the universe (%d reloads)", eng.refreshes)
+	}
+
+	// The roll's successor: unknown, so reload once and retry.
+	r := call(t, sc, conn, Request{ID: "2", Method: "book",
+		Params: json.RawMessage(`{"coin":"#9450","levels":2}`)})
+	if !r.OK {
+		t.Fatalf("a rolled-to coin must succeed after the reload: %+v", r.Error)
+	}
+	if eng.refreshes != 1 {
+		t.Errorf("want exactly one reload, got %d", eng.refreshes)
+	}
+}
+
+// A genuinely bad coin must not turn every request into an API fetch.
+func TestAGenuinelyUnknownCoinReloadsAtMostOnce(t *testing.T) {
+	eng := &fakeEngine{knownCoins: map[string]bool{"#9370": true}}
+	sc, conn, _ := start(t, eng)
+	for i := 0; i < 4; i++ {
+		if r := call(t, sc, conn, Request{ID: "x", Method: "book",
+			Params: json.RawMessage(`{"coin":"#0000","levels":2}`)}); r.OK {
+			t.Fatal("a coin that does not exist must still fail")
+		}
+	}
+	if eng.refreshes > 1 {
+		t.Errorf("the reload must be rate-limited, got %d fetches", eng.refreshes)
+	}
+}
+
+// Only unknown_coin gets the retry. Anything else could have reached the venue.
+func TestOtherErrorsAreNotRetried(t *testing.T) {
+	eng := &fakeEngine{placeErr: output.Validation("min_notional", "too small")}
+	sc, conn, _ := start(t, eng)
+	r := call(t, sc, conn, Request{ID: "1", Method: "place",
+		Params: json.RawMessage(`{"coin":"BTC","side":"buy","size":"1","limit":"1","tif":"Alo"}`)})
+	if r.OK || r.Error.Code != "min_notional" {
+		t.Fatalf("unexpected: %+v", r.Error)
+	}
+	if eng.refreshes != 0 {
+		t.Error("only unknown_coin may trigger a reload — other failures may have reached the venue")
 	}
 }
