@@ -149,6 +149,8 @@ func newTransport(baseURL string, opts ...ClientOpt) *httpTransport {
 	return t
 }
 
+func (t *httpTransport) base() string { return t.baseURL }
+
 // post sends a JSON body to path (e.g. "/info" or "/exchange") and returns the
 // raw response body. A >=400 status is decoded into APIError when possible.
 // Transport-level failures are wrapped in TransportError so callers can

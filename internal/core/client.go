@@ -369,14 +369,15 @@ func safeNewInfo(ctx context.Context, url string, httpc *http.Client, meta *hl.M
 	return
 }
 
-func safeNewExchange(ctx context.Context, key *ecdsa.PrivateKey, url string, httpc *http.Client, meta *hl.Meta, vault, account string, spot *hl.SpotMeta) (ex *hl.Exchange, err error) {
+func safeNewExchange(ctx context.Context, key *ecdsa.PrivateKey, url string, httpc *http.Client, meta *hl.Meta, vault, account string, spot *hl.SpotMeta, useWS bool) (ex *hl.Exchange, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%v", r)
 		}
 	}()
 	ex = hl.NewExchange(ctx, key, url, meta, vault, account, spot, nil,
-		hl.ExchangeOptClientOptions(hl.ClientOptHTTPClient(httpc)))
+		hl.ExchangeOptClientOptions(hl.ClientOptHTTPClient(httpc)),
+		hl.ExchangeOptWebsocket(useWS))
 	return
 }
 
@@ -448,7 +449,12 @@ func (c *Client) exchange(ctx context.Context) (*hl.Exchange, error) {
 	// separate, withdrawal-incapable API wallet).
 	c.signerWarn = signerWarnFor(c.cfg.Wallet.MasterAddress, ag.Address)
 	c.audit.Append(map[string]any{"action": "signer_bind", "agent": ag.Address, "account": account, "master_key": c.signerWarn != ""})
-	ex, err := safeNewExchange(ctx, ag.Key, c.signURL, c.httpc, c.meta.Meta(), c.vaultAddr, account, c.meta.SpotMeta())
+	// transport = "ws" routes SIGNED ACTIONS over the socket. Read from cfg, not
+	// the hot-reloadable guard snapshot: the transport is fixed for the life of
+	// the connection, and swapping the pipe under in-flight writes is not a thing
+	// a config reload should be able to do.
+	useWS := c.cfg != nil && c.cfg.Transport == "ws"
+	ex, err := safeNewExchange(ctx, ag.Key, c.signURL, c.httpc, c.meta.Meta(), c.vaultAddr, account, c.meta.SpotMeta(), useWS)
 	if err != nil {
 		return nil, output.Network("exchange_init", "build signer: "+err.Error()).Retry()
 	}

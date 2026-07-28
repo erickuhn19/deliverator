@@ -71,6 +71,16 @@ type Config struct {
 	// opts in (mirrors PerpDexs).
 	Outcomes bool `toml:"outcomes,omitempty"`
 
+	// Transport selects the pipe SIGNED ACTIONS travel down: "http" (default) or
+	// "ws". Reads are unaffected either way.
+	//
+	// REST order entry shares Hyperliquid's per-IP weight budget with market
+	// data, so placements compete with the very feed that decides where to place
+	// them. The socket does not. It only pays off in a LONG-LIVED process
+	// (`deliverator serve`, watch, chase) — a one-shot CLI invocation pays a
+	// handshake HTTP does not, which is why the default stays http.
+	Transport string `toml:"transport,omitempty"`
+
 	path string // resolved source path, for diagnostics
 }
 
@@ -353,6 +363,11 @@ func (c *Config) Validate() error {
 	case NetworkMainnet, NetworkTestnet:
 	default:
 		return fmt.Errorf("network must be %q or %q, got %q", NetworkMainnet, NetworkTestnet, c.Network)
+	}
+	switch c.Transport {
+	case "", "http", "ws":
+	default:
+		return fmt.Errorf("transport must be \"http\" or \"ws\", got %q", c.Transport)
 	}
 	if c.Wallet.MasterAddress != "" && !hexAddr.MatchString(c.Wallet.MasterAddress) {
 		return fmt.Errorf("wallet.master_address %q is not a 0x-prefixed 40-hex address", c.Wallet.MasterAddress)
