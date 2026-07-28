@@ -49,10 +49,11 @@ func SetHalt(on bool) error {
 }
 
 func (c *Client) coinAllowed(coin string) bool {
-	if len(c.cfg.Automation.AllowedCoins) == 0 {
+	auto := c.automationConfig()
+	if len(auto.AllowedCoins) == 0 {
 		return true // empty allowlist = allow all (operator opts into lockdown)
 	}
-	for _, a := range c.cfg.Automation.AllowedCoins {
+	for _, a := range auto.AllowedCoins {
 		if strings.EqualFold(strings.TrimSpace(a), coin) {
 			return true
 		}
@@ -82,7 +83,7 @@ type riskCheck struct {
 // it cannot be priced, so the guard could not be enforced and we refuse rather
 // than slip through.
 func (c *Client) pricingGuardsActive() bool {
-	r := c.cfg.Risk
+	r := c.riskConfig()
 	return r.MaxOrderNotionalUSD > 0 || r.MaxPositionNotionalUSD > 0 || r.MinOrderNotionalUSD > 0 ||
 		c.portfolioGuardsActive()
 }
@@ -100,6 +101,7 @@ func (c *Client) preTradeChecks(rc riskCheck) error {
 // rate cap is kept separate (see preTradeChecks) so a batch — one signed action —
 // charges it ONCE rather than once per leg, which would self-trip mid-batch.
 func (c *Client) staticChecks(rc riskCheck) error {
+	guards := c.currentGuards()
 	// Panic's internal flatten legs skip the halt gate: the emergency flatten
 	// must work DURING a halt (see Panic). Every other write stays halt-gated.
 	if !rc.HaltExempt && c.Halted() {
@@ -116,7 +118,7 @@ func (c *Client) staticChecks(rc riskCheck) error {
 			"coin "+rc.Coin+" is not in automation.allowed_coins").
 			WithHint("trade an allowed coin or add it to allowed_coins")
 	}
-	if rc.IsMarket && !exit && c.cfg.Automation.LimitOnly {
+	if rc.IsMarket && !exit && guards.automation.LimitOnly {
 		return output.Risk("limit_only",
 			"automation.limit_only is set — market orders (including trigger orders that execute as market) are blocked").
 			WithHint("place a limit order with --limit/--alo, or a trigger-limit instead of --trigger-market")
@@ -137,12 +139,12 @@ func (c *Client) staticChecks(rc riskCheck) error {
 		// The max caps bound NEW exposure only — a close (which the floor above still
 		// guards against HL's sub-minimum reject) is exempt so it can always exit.
 		if !rc.Closing {
-			if cap := c.cfg.Risk.MaxOrderNotionalUSD; cap > 0 && rc.NotionalUSD > cap {
+			if cap := guards.risk.MaxOrderNotionalUSD; cap > 0 && rc.NotionalUSD > cap {
 				return output.Risk("max_order_notional",
 					fmt.Sprintf("order notional $%.2f exceeds cap $%.2f", rc.NotionalUSD, cap)).
 					WithHint(fmt.Sprintf("reduce size so notional <= $%.2f", cap))
 			}
-			if cap := c.cfg.Risk.MaxPositionNotionalUSD; cap > 0 && rc.PositionNotionalUSD > cap {
+			if cap := guards.risk.MaxPositionNotionalUSD; cap > 0 && rc.PositionNotionalUSD > cap {
 				return output.Risk("max_position_notional",
 					fmt.Sprintf("resulting position notional ~$%.2f (position + resting orders + this order) exceeds cap $%.2f", rc.PositionNotionalUSD, cap)).
 					WithHint(fmt.Sprintf("reduce size or cancel resting orders in %s so position notional <= $%.2f", rc.Coin, cap))
@@ -184,7 +186,7 @@ func (c *Client) outcomeSettleCheck(mk Market) error {
 			"outcome market "+mk.Coin+" has settled — no new exposure").
 			WithHint("this market is resolved; quote an open outcome market")
 	}
-	win := c.cfg.Risk.OutcomeSettleBlackoutMins
+	win := c.riskConfig().OutcomeSettleBlackoutMins
 	if win <= 0 {
 		return nil
 	}
@@ -214,7 +216,7 @@ func (c *Client) outcomeSettleCheck(mk Market) error {
 
 // checkLeverage caps leverage changes (§6).
 func (c *Client) checkLeverage(x int) error {
-	if cap := c.cfg.Risk.MaxLeverage; cap > 0 && x > cap {
+	if cap := c.riskConfig().MaxLeverage; cap > 0 && x > cap {
 		return output.Risk("max_leverage",
 			fmt.Sprintf("leverage %dx exceeds cap %dx", x, cap)).
 			WithHint(fmt.Sprintf("use <= %dx", cap))
@@ -226,7 +228,7 @@ func (c *Client) checkLeverage(x int) error {
 // own per-address limit (§7). It records action timestamps in a small log and
 // rejects when more than max_orders_per_min occurred in the last 60s.
 func (c *Client) checkRateCap() error {
-	limit := c.cfg.Automation.MaxOrdersPerMin
+	limit := c.automationConfig().MaxOrdersPerMin
 	if limit <= 0 {
 		return nil
 	}

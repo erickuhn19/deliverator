@@ -38,6 +38,22 @@ type Options struct {
 	Timeout     time.Duration
 }
 
+// guardConfig is the subset of configuration a long-running client may reload
+// without changing its network, account, endpoints, or market universe.
+type guardConfig struct {
+	risk       config.Risk
+	automation config.Automation
+}
+
+func guardConfigFrom(cfg *config.Config) *guardConfig {
+	if cfg == nil {
+		return &guardConfig{}
+	}
+	auto := cfg.Automation
+	auto.AllowedCoins = append([]string(nil), cfg.Automation.AllowedCoins...)
+	return &guardConfig{risk: cfg.Risk, automation: auto}
+}
+
 // Client is the only thing that talks to Hyperliquid. The CLI is a thin adapter
 // over it (§3.6, §12). It owns meta caching, nonce coordination, signing, and
 // the raw /info calls internal/hl doesn't surface as typed methods.
@@ -49,6 +65,19 @@ type Client struct {
 	signURL string
 	lbURL   string // public trader-leaderboard source (stats-data host)
 	httpc   *http.Client
+
+	// guards is the risk/automation subset read by the gates, held behind a mutex
+	// rather than read straight off cfg: a long-running client serves gate reads
+	// from several goroutines, and racing on the config struct is a data race in
+	// the one place that must be right. Non-nil for production clients; hand-built
+	// unit clients leave it nil and fall back to cfg, which keeps the simple test
+	// fixtures working.
+	//
+	// There is deliberately NO exported setter. Swapping guards at runtime is a
+	// real need for a long-lived process, but it arrives WITH its consumer and a
+	// test rather than as unreachable API waiting for one.
+	guardMu sync.RWMutex
+	guards  *guardConfig
 
 	meta *MetaStore
 	info *hl.Info
@@ -76,6 +105,22 @@ type Client struct {
 	builderApprOK  bool      // true once successfully fetched
 	builderApprAt  time.Time // fetch time (TTL anchor)
 }
+
+func (c *Client) currentGuards() guardConfig {
+	c.guardMu.RLock()
+	defer c.guardMu.RUnlock()
+	if c.guards != nil {
+		return *c.guards
+	}
+	if c.cfg == nil {
+		return guardConfig{}
+	}
+	return *guardConfigFrom(c.cfg)
+}
+
+func (c *Client) riskConfig() config.Risk { return c.currentGuards().risk }
+
+func (c *Client) automationConfig() config.Automation { return c.currentGuards().automation }
 
 // signerWarnings returns the one-shot signer-binding warning (audit #91 /
 // T3-keybind), or nil. Every write path prepends it to its warnings so a
@@ -120,6 +165,7 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Client, error)
 		network: cfg.Network,
 		signURL: signURLFor(cfg.Network),
 		httpc:   &http.Client{Timeout: opts.Timeout},
+		guards:  guardConfigFrom(cfg),
 	}
 	c.infoURL = c.signURL
 	if cfg.Endpoints.InfoURL != "" {

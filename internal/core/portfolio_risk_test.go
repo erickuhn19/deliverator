@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/erickuhn19/deliverator/internal/config"
 	"github.com/erickuhn19/deliverator/internal/output"
@@ -138,6 +139,25 @@ func TestObserveEquityDayRolloverAndPeak(t *testing.T) {
 	}
 	if dd < 79.9 || dd > 80.1 { // all-time peak 5000 persists across the day rollover
 		t.Fatalf("drawdown from the persistent peak should be ~80%%, got %.2f", dd)
+	}
+}
+
+func TestObserveEquityFailsWhenStateCannotPersist(t *testing.T) {
+	testHome(t)
+	path := riskStatePath("testnet", testMaster)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "real-risk-state.json")
+	seed, _ := json.Marshal(riskState{PeakEquity: 1000, Day: time.Now().UTC().Format("2006-01-02"), DayAnchorEquity: 1000, Basis: currentEquityBasis})
+	if err := os.WriteFile(target, seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := observeEquity("testnet", testMaster, 900); err == nil {
+		t.Fatal("a refused risk-state write must fail the gate, not silently re-anchor")
 	}
 }
 
