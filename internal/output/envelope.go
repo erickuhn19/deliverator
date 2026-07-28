@@ -1,6 +1,7 @@
 package output
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,19 +43,25 @@ type Meta struct {
 }
 
 var (
-	jsonMode              = true
-	writer      io.Writer = os.Stdout
-	clockSkewMs int64     // server-time offset applied to Now()
+	jsonMode               = true
+	writer       io.Writer = os.Stdout
+	clockSkewMs  int64     // server-time offset applied to Now()
+	renderFailed atomic.Bool
 )
 
 // Configure sets the global render mode and destination. Called once at startup
 // after global flags + TTY detection are resolved.
 func Configure(jsonOut bool, w io.Writer) {
 	jsonMode = jsonOut
+	renderFailed.Store(false)
 	if w != nil {
 		writer = w
 	}
 }
+
+// RenderFailed reports whether a response could not be encoded or written. The
+// process entrypoint uses it to prevent an internal rendering bug from exiting 0.
+func RenderFailed() bool { return renderFailed.Load() }
 
 // SetClockSkew records a measured server-time offset (serverMs - localMs) so
 // emitted ts values are server-aligned (§5.1).
@@ -110,14 +117,37 @@ func Fail(cmd string, err *Error, meta Meta) error {
 	return &CmdError{Code: err.ExitCode()}
 }
 
+func encodeEnvelope(env Envelope) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false) // keep 0x.., URLs, and math symbols literal
+	if err := enc.Encode(env); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil // Encoder supplies the NDJSON newline
+}
+
 func render(env Envelope) {
 	if env.Warnings == nil {
 		env.Warnings = []string{}
 	}
 	if jsonMode {
-		enc := json.NewEncoder(writer)
-		enc.SetEscapeHTML(false) // keep 0x.., URLs, and math symbols literal
-		_ = enc.Encode(env)      // newline-terminated → NDJSON-friendly
+		b, err := encodeEnvelope(env)
+		if err != nil {
+			renderFailed.Store(true)
+			// Emit a schema-valid fallback rather than silently writing nothing. It
+			// contains only JSON-safe primitives, so this marshal cannot inherit the
+			// original data's encoding failure.
+			fallback := Envelope{
+				Schema: SchemaVersion, OK: false, Ts: Now(), Cmd: env.Cmd, Data: nil,
+				Error:    Unknown("encode_envelope", "could not encode command response: "+err.Error()),
+				Warnings: []string{}, Meta: env.Meta,
+			}
+			b, _ = encodeEnvelope(fallback)
+		}
+		if _, err := writer.Write(b); err != nil {
+			renderFailed.Store(true)
+		}
 		return
 	}
 	renderHuman(env)
@@ -146,7 +176,14 @@ func renderHuman(env Envelope) {
 		return
 	}
 	if env.Data != nil {
-		b, _ := json.MarshalIndent(env.Data, "  ", "  ")
-		fmt.Fprintf(writer, "  %s\n", string(b))
+		b, err := json.MarshalIndent(env.Data, "  ", "  ")
+		if err != nil {
+			renderFailed.Store(true)
+			fmt.Fprintf(writer, "  error [unknown/encode_envelope]: could not encode command response: %v\n", err)
+			return
+		}
+		if _, err := fmt.Fprintf(writer, "  %s\n", string(b)); err != nil {
+			renderFailed.Store(true)
+		}
 	}
 }
