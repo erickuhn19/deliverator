@@ -239,7 +239,7 @@ func (c *Client) chaseStep(ctx context.Context, st *chaseState, p ChaseParams, r
 	// replacement. Leave the dust resting at its current price (cancel-on-exit
 	// cleans it up) instead of spamming a reject every tick.
 	pegF := parseFloatSafe(pegStr)
-	if c.cfg.Risk.MinOrderNotionalUSD > 0 && remaining*pegF < c.cfg.Risk.MinOrderNotionalUSD {
+	if minNotional := c.riskConfig().MinOrderNotionalUSD; minNotional > 0 && remaining*pegF < minNotional {
 		return false
 	}
 	if p.MaxReprices > 0 && *reprices >= p.MaxReprices {

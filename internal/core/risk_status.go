@@ -93,11 +93,12 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 	// Read caps from disk, not the in-memory snapshot: a long-running console (and
 	// `risk` after a `config set`) must reflect edits to config.toml. The client's
 	// c.cfg is only the startup load. Falls back to the snapshot if there's no file.
-	r := c.cfg.Risk
+	guards := c.currentGuards()
+	r := guards.risk
 	network := c.cfg.Network
 	outcomes := c.cfg.Outcomes
-	limitOnly := c.cfg.Automation.LimitOnly
-	allowedCoins := c.cfg.Automation.AllowedCoins
+	limitOnly := guards.automation.LimitOnly
+	allowedCoins := guards.automation.AllowedCoins
 	perpDexs := c.cfg.PerpDexs
 	if p := c.cfg.SourcePath(); p != "" {
 		if fresh, ferr := config.Load(p); ferr == nil {
