@@ -1,9 +1,11 @@
 package core
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/erickuhn19/deliverator/internal/config"
+	"github.com/erickuhn19/deliverator/internal/output"
 )
 
 // one live resting BTC limit order, oid 7, carrying cloid ...aa.
@@ -57,6 +59,44 @@ func TestReconcileKnownOrderIsClean(t *testing.T) {
 	if !v.Clean {
 		t.Fatalf("expected clean, got divergences %v", v.Divergences)
 	}
+	if v.PositionMode != "authoritative_live_snapshot" {
+		t.Fatalf("position semantics must be explicit, got %q", v.PositionMode)
+	}
+}
+
+func TestReconcileFailsClosedOnDegradedSubDexOrders(t *testing.T) {
+	cfg := config.Default()
+	cfg.PerpDexs = []string{"xyz"}
+	resp := func(_, typ string, body map[string]any) (int, string) {
+		if typ == "frontendOpenOrders" {
+			if dex, _ := body["dex"].(string); strings.EqualFold(dex, "xyz") {
+				return 500, `unavailable`
+			}
+			return 200, `[]`
+		}
+		if typ == "clearinghouseState" {
+			return 200, emptyState
+		}
+		if typ == "spotClearinghouseState" {
+			return 200, `{"balances":[]}`
+		}
+		return 200, `{}`
+	}
+	c, ctx := newTestClient(t, cfg, Options{}, resp)
+	_, err := c.Reconcile(ctx, ReconcileOpts{})
+	if err == nil {
+		t.Fatal("reconcile must not issue a verdict from a degraded sub-dex order book")
+	}
+	assertErr(t, err, output.CatNetwork, output.ExitNetwork)
+}
+
+func TestReconcileFailsClosedOnDegradedSubDexPositions(t *testing.T) {
+	c, ctx := newTestClient(t, subDexCfg(), Options{}, degradedSubDexResp(true, false, false))
+	_, err := c.Reconcile(ctx, ReconcileOpts{})
+	if err == nil {
+		t.Fatal("reconcile must not issue a verdict from a degraded sub-dex position snapshot")
+	}
+	assertErr(t, err, output.CatNetwork, output.ExitNetwork)
 }
 
 // An in-flight cloid the exchange has never heard of resolves to absent/resubmit

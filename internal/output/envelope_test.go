@@ -3,6 +3,7 @@ package output
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"testing"
 )
 
@@ -28,6 +29,25 @@ func TestEnvelopeSuccessShape(t *testing.T) {
 	}
 	if env.Ts == 0 {
 		t.Errorf("ts must be set")
+	}
+}
+
+func TestEnvelopeEncodingFailureEmitsFallbackAndMarksFailure(t *testing.T) {
+	var buf bytes.Buffer
+	Configure(true, &buf)
+	defer Configure(true, nil)
+
+	Emit(Response{Cmd: "config.get", Data: map[string]any{"cap": math.NaN()}, Meta: Meta{Network: "testnet", Account: "main"}})
+
+	var env Envelope
+	if err := json.Unmarshal(buf.Bytes(), &env); err != nil {
+		t.Fatalf("fallback is not valid JSON: %v; raw=%q", err, buf.String())
+	}
+	if env.OK || env.Error == nil || env.Error.Code != "encode_envelope" {
+		t.Fatalf("want encode_envelope failure fallback, got %+v", env)
+	}
+	if !RenderFailed() {
+		t.Fatal("render failure must be visible to the process exit mapper")
 	}
 }
 
