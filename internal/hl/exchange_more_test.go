@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -80,6 +81,17 @@ func TestUpdateIsolatedMargin(t *testing.T) {
 	}
 	if _, err := ex.UpdateIsolatedMargin(ctx, -25, "BTC"); err != nil {
 		t.Fatalf("remove margin: %v", err)
+	}
+}
+
+func TestUpdateIsolatedMarginRejectsUnsafeAmounts(t *testing.T) {
+	ex, ctx := testExchange(t, noInfo, func(string, map[string]any) (int, string) {
+		return 200, `{"status":"ok","response":{"type":"default"}}`
+	})
+	for _, amount := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), math.MaxFloat64} {
+		if _, err := ex.UpdateIsolatedMargin(ctx, amount, "BTC"); err == nil {
+			t.Fatalf("accepted unsafe isolated margin amount %v", amount)
+		}
 	}
 }
 
@@ -234,7 +246,7 @@ func TestSmallHelpers(t *testing.T) {
 	if absFloat(-3) != 3 || absFloat(3) != 3 {
 		t.Error("absFloat")
 	}
-	if parseFloat("1.5") != 1.5 || parseFloat("nope") != 0 {
+	if parseFloat("1.5") != 1.5 || parseFloat("nope") != 0 || parseFloat("NaN") != 0 || parseFloat("+Inf") != 0 {
 		t.Error("parseFloat")
 	}
 }
