@@ -2,10 +2,18 @@ module github.com/erickuhn19/deliverator
 
 go 1.25.7
 
-// Build with a patched toolchain: go1.25.7 has 8 reachable stdlib CVEs (TLS/x509/
-// HTTP/net in the exchange-comms path); 1.25.11 fixes all of them. Pinned so CI and
-// release builds are reproducible. Re-confirm zero reachable with `govulncheck`.
-toolchain go1.25.11
+// Build with a patched toolchain: go1.25.7 has reachable stdlib CVEs (TLS/x509/
+// HTTP/net in the exchange-comms path). Pinned so CI and release builds are
+// reproducible. Re-confirm zero reachable with `govulncheck` after every bump.
+//
+// Bump THIS line, never the `go` line above. The `go` directive is the language
+// minimum and setup-go honours the toolchain directive when resolving
+// go-version-file — raising `go` while leaving this behind installs the OLD
+// toolchain and then fails every job with "go.mod requires go >= X (running Y)".
+//
+// 1.25.12: GO-2026-5856, an Encrypted Client Hello privacy leak in crypto/tls,
+// reachable from the websocket dialer and the http client.
+toolchain go1.25.12
 
 require (
 	github.com/BurntSushi/toml v1.6.0
