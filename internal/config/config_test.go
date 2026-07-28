@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestDefaultIsValid(t *testing.T) {
 	if err := Default().Validate(); err != nil {
@@ -108,5 +112,67 @@ func TestIsReservedAlias(t *testing.T) {
 	}
 	if IsReservedAlias("vault1") {
 		t.Error("IsReservedAlias(vault1) should be false")
+	}
+}
+
+// Removing the outcome-mm daemon must not brick configs that still carry its
+// [mm] table. The strict unknown-key check is there to catch a mistyped risk cap
+// silently failing to apply; an obsolete table from a removed feature is not a
+// typo, and treating it as one made EVERY command fail to load — including the
+// read-only ones a running recorder depends on.
+func TestLegacyMMTableIsToleratedNotFatal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `
+network = "mainnet"
+outcomes = true
+
+[wallet]
+master_address = "0x9ccAcA47f0318FaeF9C8175767a15AEe1586177e"
+
+[risk]
+max_outcome_question_notional_usd = 50.0
+
+[mm]
+enabled = false
+dry_run = true
+quote_interval_ms = 3000
+
+[mm.strategy]
+base_spread = 0.02
+levels = 2
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("a legacy [mm] table must be ignored, not fatal: %v", err)
+	}
+	// The gate that actually protects the account must survive the removal.
+	if cfg.Risk.MaxOutcomeQuestionNotionalUSD != 50 {
+		t.Errorf("outcome risk gate lost: got %v", cfg.Risk.MaxOutcomeQuestionNotionalUSD)
+	}
+	if !cfg.Outcomes {
+		t.Error("HIP-4 outcome support must survive removing the MM daemon")
+	}
+}
+
+// The tolerance is scoped to the removed table only — a genuine typo anywhere
+// else must still be rejected loudly.
+func TestAGenuineTypoIsStillFatal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `
+network = "mainnet"
+
+[risk]
+max_ordr_notional_usd = 50.0
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("a mistyped risk cap must still fail the strict unknown-key check")
 	}
 }
