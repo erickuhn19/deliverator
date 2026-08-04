@@ -127,7 +127,7 @@ func TestObserveEquityDayRolloverAndPeak(t *testing.T) {
 	if err := os.WriteFile(riskStatePath("testnet", testMaster), seed, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	dd, dlUSD, dlPct, fresh, err := observeEquity("testnet", testMaster, 1000)
+	dd, dlUSD, dlPct, fresh, err := observeEquity("testnet", testMaster, 1000, 0)
 	if fresh {
 		t.Fatal("a valid persisted peak must not report fresh anchors")
 	}
@@ -156,7 +156,7 @@ func TestObserveEquityFailsWhenStateCannotPersist(t *testing.T) {
 	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, err := observeEquity("testnet", testMaster, 900); err == nil {
+	if _, _, _, _, err := observeEquity("testnet", testMaster, 900, 0); err == nil {
 		t.Fatal("a refused risk-state write must fail the gate, not silently re-anchor")
 	}
 }

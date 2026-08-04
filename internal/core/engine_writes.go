@@ -364,6 +364,9 @@ func (c *Client) outcomeGuardPx(ctx context.Context, coin string, side Side, lim
 
 // order (market | limit | trigger). It is idempotent on Cloid (§5.4).
 func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []string, error) {
+	// Honour meta_ttl_secs at USE: this is a signing path, and a stale szDecimals
+	// mis-rounds a real order rather than failing loudly (#38).
+	c.ensureMetaFresh(ctx)
 	mk, ok := c.meta.Lookup(req.Coin)
 	if !ok {
 		return nil, nil, unknownCoin(req.Coin)
@@ -581,7 +584,7 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 		"action": "order", "cloid": cloid, "coin": mk.Coin, "side": req.Side.String(),
 		"size": szOut, "limit_px": limitOut, "type": typ, "status": res.Status, "oid": res.Oid,
 	}, res))
-	return res, append(c.signerWarnings(), warnings...), nil
+	return res, append(c.writeWarnings(), warnings...), nil
 }
 
 func applyStatus(res *PlaceResult, st hl.OrderStatus) {
@@ -691,6 +694,9 @@ type BracketReq struct {
 
 // PlaceBracket submits an entry + linked tp/sl as one normalTpsl action.
 func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResult, []string, error) {
+	// Honour meta_ttl_secs at USE: this is a signing path, and a stale szDecimals
+	// mis-rounds a real order rather than failing loudly (#38).
+	c.ensureMetaFresh(ctx)
 	mk, ok := c.meta.Lookup(req.Coin)
 	if !ok {
 		return nil, nil, unknownCoin(req.Coin)
@@ -864,7 +870,7 @@ func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResu
 		bm = withFill(bm, results[0])
 	}
 	c.audit.Append(bm)
-	return results, append(c.signerWarnings(), warnings...), nil
+	return results, append(c.writeWarnings(), warnings...), nil
 }
 
 // ---------- position-level tp/sl (positionTpsl) ----------
@@ -887,6 +893,9 @@ type PositionTpslReq struct {
 // it. The legs are reduce-only, so no new-exposure/portfolio gate or min-notional
 // floor applies (like close, you can always de-risk). Triggers fire as market orders.
 func (c *Client) PlacePositionTpsl(ctx context.Context, req PositionTpslReq) ([]*PlaceResult, []string, error) {
+	// Honour meta_ttl_secs at USE: this is a signing path, and a stale szDecimals
+	// mis-rounds a real order rather than failing loudly (#38).
+	c.ensureMetaFresh(ctx)
 	mk, ok := c.meta.Lookup(req.Coin)
 	if !ok {
 		return nil, nil, unknownCoin(req.Coin)
@@ -1040,7 +1049,7 @@ func (c *Client) PlacePositionTpsl(ctx context.Context, req PositionTpslReq) ([]
 		am = withFill(am, results[0])
 	}
 	c.audit.Append(am)
-	return results, append(c.signerWarnings(), warnings...), nil
+	return results, append(c.writeWarnings(), warnings...), nil
 }
 
 // sideWord renders a position direction for messages and audit rows.
@@ -1096,6 +1105,9 @@ func batchLegErr(i int, err error) error {
 // itself succeeds), leaving the caller to decide the exit code (all-rejected vs
 // partial vs ok).
 func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResult, []string, error) {
+	// Honour meta_ttl_secs at USE: this is a signing path, and a stale szDecimals
+	// mis-rounds a real order rather than failing loudly (#38).
+	c.ensureMetaFresh(ctx)
 	if len(reqs) == 0 {
 		return nil, nil, output.Validation("empty_batch", "batch has no orders")
 	}
@@ -1383,7 +1395,7 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 		}
 	}
 	c.audit.Append(map[string]any{"action": "batch", "orders": len(orders), "legs": auditLegs(results)})
-	return results, append(c.signerWarnings(), warnings...), nil
+	return results, append(c.writeWarnings(), warnings...), nil
 }
 
 // GridReq describes a ladder of evenly-spaced limit orders on one coin.
@@ -1439,6 +1451,9 @@ func (c *Client) BuildGrid(req GridReq) ([]OrderReq, error) {
 // Close flattens (or reduces) a position. Market close uses MarketClose; a limit
 // close places a reduce-only limit on the opposite side of the current position.
 func (c *Client) Close(ctx context.Context, coin, size string, market bool, limit, cloidIn string) (*PlaceResult, []string, error) {
+	// Honour meta_ttl_secs at USE: this is a signing path, and a stale szDecimals
+	// mis-rounds a real order rather than failing loudly (#38).
+	c.ensureMetaFresh(ctx)
 	return c.close(ctx, coin, size, market, limit, cloidIn, false)
 }
 
@@ -1532,7 +1547,7 @@ func (c *Client) close(ctx context.Context, coin, size string, market bool, limi
 	}
 	applyStatus(res, st)
 	c.audit.Append(withFill(map[string]any{"action": "close", "cloid": cloid, "coin": mk.Coin, "size": res.Size, "status": res.Status, "oid": res.Oid}, res))
-	return res, append(c.signerWarnings(), warnings...), nil
+	return res, append(c.writeWarnings(), warnings...), nil
 }
 
 // closeSpot exits a spot holding by SELLING the base token for USDC. Spot has no
@@ -1945,6 +1960,9 @@ func cancelLegError(mv hl.MixedValue) string {
 // Modify changes the size and/or limit price of a resting order. The existing
 // order is fetched to recover its coin/side/tif.
 func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimit string) (*PlaceResult, []string, error) {
+	// Honour meta_ttl_secs at USE: this is a signing path, and a stale szDecimals
+	// mis-rounds a real order rather than failing loudly (#38).
+	c.ensureMetaFresh(ctx)
 	if err := c.requireQueryAddr(); err != nil {
 		return nil, nil, err
 	}
@@ -2173,7 +2191,7 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 		"action": "modify", "coin": mk.Coin, "oid": oid, "cloid": preservedCloid,
 		"side": res.Side, "size": res.Size, "limit_px": res.LimitPx, "status": res.Status,
 	})
-	return res, append(c.signerWarnings(), warnings...), nil
+	return res, append(c.writeWarnings(), warnings...), nil
 }
 
 // ModifyReq is one leg of a batch modify: re-price and/or re-size a resting
@@ -2191,6 +2209,9 @@ type ModifyReq struct {
 // at submit, surfaced as per-leg results. The rate cap is charged once. Like the
 // single modify, HL drops the builder fee on the replacement orders.
 func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceResult, []string, error) {
+	// Honour meta_ttl_secs at USE: this is a signing path, and a stale szDecimals
+	// mis-rounds a real order rather than failing loudly (#38).
+	c.ensureMetaFresh(ctx)
 	if len(reqs) == 0 {
 		return nil, nil, output.Validation("empty_batch", "batch has no modifies")
 	}
@@ -2447,7 +2468,7 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 		}
 	}
 	c.audit.Append(map[string]any{"action": "batch_modify", "count": len(mreqs), "legs": auditLegs(results)})
-	return results, append(c.signerWarnings(), warnings...), nil
+	return results, append(c.writeWarnings(), warnings...), nil
 }
 
 // ---------- panic (emergency cancel-all + flatten-all) ----------
@@ -2745,6 +2766,9 @@ type TwapResult struct {
 // as passive slices, so it is treated as a non-market order for risk: it is not
 // blocked by automation.limit_only but is subject to the allowlist and caps.
 func (c *Client) Twap(ctx context.Context, req TwapReq) (*TwapResult, []string, error) {
+	// Honour meta_ttl_secs at USE: this is a signing path, and a stale szDecimals
+	// mis-rounds a real order rather than failing loudly (#38).
+	c.ensureMetaFresh(ctx)
 	mk, ok := c.meta.Lookup(req.Coin)
 	if !ok {
 		return nil, nil, unknownCoin(req.Coin)

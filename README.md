@@ -99,6 +99,25 @@ go build -o deliverator .
 
 Building from source requires Go 1.25+. macOS/Linux (uses `flock` + the OS keychain).
 
+### Upgrading in place on macOS — replace the file, don't overwrite it
+
+On macOS, **copying a new binary over a running one invalidates its code
+signature**, and every subsequent invocation dies instantly with `SIGKILL` — no
+error message, no envelope, nothing to diagnose from. This bites hardest when
+long-lived processes (`deliverator serve`, `deliverator stream …`) still have the
+old inode mapped, which is exactly the upgrade path an operator reaches for.
+
+Replace the file so the new binary lands on a **fresh inode**, then re-sign:
+
+```sh
+rm -f "$(command -v deliverator)"          # fresh inode — do NOT cp over the old file
+cp ./deliverator "$(command -v deliverator)"
+codesign -f -s - "$(command -v deliverator)"
+```
+
+Restart any `serve`/`stream` processes afterwards: they keep running against the
+old mapped image until they do.
+
 ---
 
 ## Verifying a download

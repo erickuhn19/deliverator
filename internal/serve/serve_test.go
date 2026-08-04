@@ -40,6 +40,7 @@ type fakeEngine struct {
 	guardReloads int
 	guardWarns   []string
 	guardGen     string
+	universeGen  string
 }
 
 // guardWarns is returned by the next ReloadGuardsIfChanged; guardReloads counts
@@ -49,6 +50,13 @@ func (f *fakeEngine) ReloadGuardsIfChanged(string) []string {
 	w := f.guardWarns
 	f.guardWarns = nil
 	return w
+}
+
+func (f *fakeEngine) UniverseGeneration() string {
+	if f.universeGen == "" {
+		return "universe fetched 2026-08-04T02:00:00Z, 8 outcome legs, fp deadbeef, signer in sync"
+	}
+	return f.universeGen
 }
 
 func (f *fakeEngine) GuardGeneration() string {

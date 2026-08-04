@@ -47,6 +47,10 @@ type ClientAPI interface {
 	Reconcile(ctx context.Context, opts ReconcileOpts) (*ReconcileView, error)
 	ReferralStatus(ctx context.Context) (*hl.ReferralInfo, error)
 	RiskStatus(ctx context.Context) (*RiskView, error)
+	// ResetDrawdownAnchor re-bases the drawdown peak to current equity. Operator
+	// action, audit-logged, and gated on explicit confirmation — it reduces
+	// protection, so it must never be reachable from the agent's order path (#39).
+	ResetDrawdownAnchor(ctx context.Context, confirm bool) (*AnchorReset, error)
 	RiskStatusFromPortfolio(pf *PortfolioView) *RiskView
 	Snapshot(ctx context.Context, coins []string) (*SnapshotView, ReadMeta, error)
 	TwapStatus(ctx context.Context, coin string, id int64) (*TwapStatusView, error)

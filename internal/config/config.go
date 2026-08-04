@@ -84,6 +84,26 @@ type Config struct {
 	path string // resolved source path, for diagnostics
 }
 
+// ADDING A NEW CONFIG KEY: give it `omitempty`.
+//
+// Load is strict — an unknown key is a hard error, deliberately, so a typo'd risk
+// cap can never be silently ignored (audit S1). Save re-encodes the WHOLE struct,
+// so a new field without `omitempty` gets written at its zero value the first time
+// anyone runs `config set` from a build that has it. Every OLDER binary reading
+// that same config then fails to load — including a long-running `serve` that has
+// not been restarted, and every CLI invocation from an un-upgraded path.
+//
+// Observed live on 2026-08-04: adding drawdown_window_days and running one
+// `config set` left a running server unable to parse its own config. It failed
+// closed and said so (the reload keeps the last good caps and warns — see
+// Client.ReloadGuardsIfChanged), so nothing traded against a wrong cap, but the
+// operator's new cap did not take effect until the stray line was removed.
+//
+// `omitempty` confines the breakage to operators who actually SET the new key,
+// who need the new binary anyway. It does not remove the constraint: enabling a
+// new key still requires upgrading every process that reads the config, INCLUDING
+// restarting `serve`.
+
 // Wallet — the query target (master). The agent signing key lives ONLY in the OS
 // keychain (see internal/wallet); there is no key-source or key-file config, so a
 // stale `agent_key_source` cannot silently point the CLI away from the keychain.
@@ -119,9 +139,35 @@ type Risk struct {
 	MaxNetExposureUSD          float64 `toml:"max_net_exposure_usd"`           // 0 = off; |signed long − short|
 	MaxConcentrationPctPerCoin float64 `toml:"max_concentration_pct_per_coin"` // 0 = off; |coin notional| / equity * 100
 	MaxDrawdownPct             float64 `toml:"max_drawdown_pct"`               // 0 = off; (peak − equity) / peak * 100
-	MaxDailyLossUSD            float64 `toml:"max_daily_loss_usd"`             // 0 = off; (UTC-day anchor − equity) USD
-	MaxDailyLossPct            float64 `toml:"max_daily_loss_pct"`             // 0 = off; (anchor − equity) / anchor * 100
-	MaxOpenPositions           int     `toml:"max_open_positions"`             // 0 = off; cap on the number of concurrent open positions
+	// DrawdownWindowDays bounds WHICH peak max_drawdown_pct measures from.
+	// 0 = the all-time high-water mark (the original behaviour, unchanged).
+	//
+	// An all-time anchor permanently re-litigates history: once a real loss is
+	// realized and accepted, the gate stops asking "is this period going wrong"
+	// and its only steady states are strangling the account or being switched off.
+	// A live account sat at 98.7% utilization with $1.52 of losable equity and the
+	// only escape was setting the cap to 100 — i.e. disabling the ruin backstop
+	// entirely, which is strictly worse than a well-anchored one. A trailing window
+	// (e.g. 7 or 30) keeps a real floor that forgives acknowledged history. See #39.
+	//
+	// NOT RETROACTIVE. The trailing peak is computed from a per-UTC-day equity
+	// series that only starts accumulating once a build carrying it has run, and
+	// with no series the window falls back to the all-time peak (fail safe, never
+	// fail open). So a freshly-configured window behaves exactly like today's
+	// anchor and only diverges as history builds — to release an ALREADY-STRANDED
+	// anchor immediately, use `deliverator risk reset-anchor --yes`.
+	//
+	// POINTER ON PURPOSE — see the NEW CONFIG KEYS note below Config. omitempty is
+	// what keeps this key out of a default config, and in BurntSushi/toml it is a
+	// NO-OP on numeric kinds (isEmpty covers String/Slice/Map/Struct/Bool/Ptr and
+	// nothing else). A plain int would be written as `drawdown_window_days = 0` by
+	// the first `config set` from a build carrying it, breaking every older binary
+	// that reads the same file. Read it through Risk.DrawdownWindow(), never
+	// directly: nil and 0 mean the same thing (all-time peak).
+	DrawdownWindowDays *int    `toml:"drawdown_window_days,omitempty"`
+	MaxDailyLossUSD    float64 `toml:"max_daily_loss_usd"` // 0 = off; (UTC-day anchor − equity) USD
+	MaxDailyLossPct    float64 `toml:"max_daily_loss_pct"` // 0 = off; (anchor − equity) / anchor * 100
+	MaxOpenPositions   int     `toml:"max_open_positions"` // 0 = off; cap on the number of concurrent open positions
 
 	// HIP-4 outcome-specific gates (enforced in core alongside the generic caps).
 	// Both default 0 = off, keeping the safe baseline unchanged. They apply to
@@ -442,6 +488,9 @@ func (c *Config) Validate() error {
 	if c.Risk.MaxDrawdownPct > 100 || c.Risk.MaxDailyLossPct > 100 {
 		return fmt.Errorf("risk.max_drawdown_pct / risk.max_daily_loss_pct are percentages in [0,100]")
 	}
+	if w := c.Risk.DrawdownWindow(); w < 0 || w > 3650 {
+		return fmt.Errorf("risk.drawdown_window_days must be 0 (all-time peak) or 1..3650 days")
+	}
 	if c.Risk.MaxOpenPositions < 0 {
 		return fmt.Errorf("risk.max_open_positions must be >= 0 (0 = off)")
 	}
@@ -584,4 +633,15 @@ func pathConfinedTo(field, configured, base string) error {
 		return fmt.Errorf("%s %q escapes the config directory %q — keep it under that dir or set DELIVERATOR_HOME to its parent", field, configured, base)
 	}
 	return nil
+}
+
+// DrawdownWindow returns the configured trailing-peak window in days, with nil
+// and 0 both meaning "all-time peak". Every reader must go through this rather
+// than dereferencing the field, so an unset key can never be confused with a
+// deliberate zero — and can never nil-panic on a money path.
+func (r Risk) DrawdownWindow() int {
+	if r.DrawdownWindowDays == nil {
+		return 0
+	}
+	return *r.DrawdownWindowDays
 }

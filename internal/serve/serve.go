@@ -106,6 +106,12 @@ type Engine interface {
 	// GuardGeneration names the config the gates are currently enforcing, so a
 	// rejection can carry it and a stale cache is visible in the error itself.
 	GuardGeneration() string
+
+	// UniverseGeneration names the HIP-4 universe being enforced AND whether the
+	// signer agrees with it. The same staleness family produced three multi-hour
+	// incidents (#37, #41, #43), each invisible the same way: the process answered
+	// confidently from a snapshot nothing in its output identified (#45).
+	UniverseGeneration() string
 }
 
 // Server accepts requests on a Unix socket until its context ends.

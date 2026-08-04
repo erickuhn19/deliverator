@@ -1,10 +1,13 @@
 package core
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -157,6 +160,69 @@ type MetaStore struct {
 	outcomeCoins []string
 	// perpDexCoins is the same idea per sub-dex index.
 	perpDexCoins map[int][]string
+	// outcomeFetchedAt stamps the last AddOutcomes, so a rejection can say WHICH
+	// universe it was resolving against (#45). Distinct from fetchedAt, which
+	// tracks the perp/spot metas.
+	outcomeFetchedAt time.Time
+}
+
+// UniverseStamp identifies the HIP-4 universe currently installed: when it was
+// loaded and a fingerprint of exactly which coins resolve.
+//
+// It exists because three separate multi-hour incidents (#37, #41, #43) were
+// invisible in the same way — the process kept answering confidently from a
+// snapshot that nothing in its output identified. A rejection that names the
+// universe turns "diagnose a 13-hour outage from first principles" into reading
+// one error.
+type UniverseStamp struct {
+	FetchedAtMs int64  `json:"fetched_at_ms"`
+	Outcomes    int    `json:"outcomes"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+// String renders the stamp for an error message.
+func (u UniverseStamp) String() string {
+	if u.FetchedAtMs == 0 {
+		return "universe not loaded"
+	}
+	return fmt.Sprintf("universe fetched %s, %d outcome legs, fp %s",
+		time.UnixMilli(u.FetchedAtMs).UTC().Format("2006-01-02T15:04:05Z"), u.Outcomes, u.Fingerprint)
+}
+
+// UniverseStamp fingerprints the installed HIP-4 universe. The fingerprint is
+// over the SORTED set of resolvable outcome coins, so it changes exactly when the
+// universe rolls and not merely because a refresh re-ran.
+func (m *MetaStore) UniverseStamp() UniverseStamp {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	coins := append([]string(nil), m.outcomeCoins...)
+	sort.Strings(coins)
+	h := sha256.New()
+	for _, c := range coins {
+		h.Write([]byte(c))
+		h.Write([]byte{0})
+	}
+	// A zero time is NOT zero milliseconds — time.Time{}.UnixMilli() is a large
+	// negative number, which would render as "universe fetched 0001-01-01" and
+	// read as a real (absurdly old) load rather than "never loaded".
+	var ms int64
+	if !m.outcomeFetchedAt.IsZero() {
+		ms = m.outcomeFetchedAt.UnixMilli()
+	}
+	return UniverseStamp{
+		FetchedAtMs: ms,
+		Outcomes:    len(coins),
+		Fingerprint: hex.EncodeToString(h.Sum(nil))[:8],
+	}
+}
+
+// OutcomeCoins returns the coins the HIP-4 universe currently resolves, so a
+// caller can cross-check them against another resolver (see
+// Client.UniverseGeneration, which checks the SIGNER agrees).
+func (m *MetaStore) OutcomeCoins() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]string(nil), m.outcomeCoins...)
 }
 
 // AddPerpDex indexes a builder sub-dex's perps as "<dex>:<coin>" markets so they
@@ -172,7 +238,14 @@ func (m *MetaStore) AddPerpDex(dexIndex int, meta *hl.Meta) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addPerpDexLocked(dexIndex, meta)
+}
 
+// addPerpDexLocked is AddPerpDex's body. Callers must hold m.mu for writing.
+func (m *MetaStore) addPerpDexLocked(dexIndex int, meta *hl.Meta) {
+	if meta == nil {
+		return
+	}
 	// Retire the previous universe for this dex, if any.
 	if old, ok := m.perpDexCoins[dexIndex]; ok {
 		retired := make(map[string]bool, len(old))
@@ -303,6 +376,52 @@ func (m *MetaStore) build() {
 			m.ordered = append(m.ordered, mk)
 		}
 	}
+}
+
+// Refresh installs newly-fetched perp/spot metas and rebuilds the lookup tables,
+// preserving the sub-dex and HIP-4 universes registered on top of them.
+//
+// NEVER DESTRUCTIVE. Replacing a live universe is a very different act from
+// building an empty one at startup:
+//
+//   - A nil perp meta is REFUSED outright. It is the whole universe.
+//   - A nil spot meta KEEPS the previous one. At construction nil-spot is simply
+//     the initial state and "spot is optional" is correct; at use it would delete
+//     a working spot universe and turn every spot coin into an unknown_coin on a
+//     transient /info hiccup.
+//
+// The caller is responsible for only passing metas it actually fetched — a
+// partial refresh must not be laundered through here as a successful one.
+func (m *MetaStore) Refresh(meta *hl.Meta, spot *hl.SpotMeta, fetchedAt time.Time) error {
+	if meta == nil || len(meta.Universe) == 0 {
+		return fmt.Errorf("refusing to replace the market universe with an empty perp meta")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if spot == nil {
+		spot = m.spotMeta // a failed spot fetch must not delete a working spot universe
+	}
+	m.meta, m.spotMeta, m.fetchedAt = meta, spot, fetchedAt
+
+	// Rebuild the base tables from scratch so a delisting actually disappears
+	// rather than lingering from the previous build.
+	m.byCoin = make(map[string]Market, len(m.byCoin))
+	m.ordered = nil
+	m.build()
+
+	// Re-apply what was layered on top. Both writers are idempotent and reset
+	// their own bookkeeping, so this cannot double-count (#43).
+	dexes := m.perpDexs
+	m.perpDexs, m.perpDexCoins = nil, nil
+	for _, e := range dexes {
+		m.addPerpDexLocked(e.Index, e.Meta)
+	}
+	if om := m.outcomeMeta; om != nil {
+		m.outcomeCoins, m.outcomeMarkets = nil, nil
+		m.addOutcomesLocked(om)
+	}
+	return nil
 }
 
 // Lookup resolves a coin (perp ticker or spot pair name) to its Market.

@@ -773,7 +773,7 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 	// drawdown / daily loss.
 	var warnings []string
 	if r.MaxDrawdownPct > 0 || r.MaxDailyLossUSD > 0 || r.MaxDailyLossPct > 0 {
-		dd, dlUSD, dlPct, fresh, oerr := observeEquity(c.network, c.queryAddr, snap.equity)
+		dd, dlUSD, dlPct, fresh, oerr := observeEquity(c.network, c.queryAddr, snap.equity, r.DrawdownWindow())
 		if oerr != nil {
 			return nil, output.Network("risk_state", "cannot update drawdown/daily-loss state: "+oerr.Error()).Retry()
 		}
@@ -785,9 +785,28 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 				c.network, riskStateComponent(c.queryAddr)))
 		}
 		if cap := r.MaxDrawdownPct; cap > 0 && dd > cap {
+			anchor := "all-time peak"
+			if r.DrawdownWindow() > 0 {
+				anchor = fmt.Sprintf("%d-day trailing peak", r.DrawdownWindow())
+			}
 			return warnings, output.Risk("max_drawdown",
-				fmt.Sprintf("drawdown %.1f%% from peak exceeds the %.1f%% cap — trading paused", dd, cap)).
-				WithHint("recover above the threshold, raise the cap, or clear this network+account's risk_state file to reset the peak")
+				fmt.Sprintf("drawdown %.1f%% from %s exceeds the %.1f%% cap — trading paused", dd, anchor, cap)).
+				WithHint("recover above the threshold, `deliverator risk reset-anchor --yes` to re-base the peak to " +
+					"current equity after accepting a realized loss, or set risk.drawdown_window_days so the peak " +
+					"trails instead of being all-time. Raising the cap toward 100 disables the ruin backstop entirely — " +
+					"prefer re-anchoring to disabling")
+		}
+		// An all-time anchor degenerates into a standing halt: at high utilization
+		// the only remaining escapes are re-anchoring or switching the gate off, and
+		// an operator who does not know that reaches for `max_drawdown_pct = 100`.
+		// Say so BEFORE they get there.
+		if cap := r.MaxDrawdownPct; cap > 0 && dd > cap*0.9 && r.DrawdownWindow() <= 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"drawdown is %.1f%% of the %.1f%% cap (%.0f%% utilization) and the anchor is the ALL-TIME peak — "+
+					"this gate is close to a standing halt. The escapes are `deliverator risk reset-anchor --yes` "+
+					"(re-base the peak to current equity) or risk.drawdown_window_days (make the peak trailing). "+
+					"Raising the cap to 100 turns the ruin backstop OFF and is strictly worse than either",
+				dd, cap, dd/cap*100))
 		}
 		if cap := r.MaxDailyLossUSD; cap > 0 && dlUSD > cap {
 			return warnings, output.Risk("max_daily_loss",
@@ -850,6 +869,76 @@ type riskState struct {
 	Day             string  `json:"day"`               // UTC date, YYYY-MM-DD
 	DayAnchorEquity float64 `json:"day_anchor_equity"` // equity at the day's first observation
 	Basis           int     `json:"basis,omitempty"`   // equity-computation version (currentEquityBasis)
+
+	// ---- #39: bounding which peak the drawdown gate measures from ----
+
+	// DailyHighs is a rolling per-UTC-day high-water series, newest last, capped
+	// at maxDailyHighs. It is what makes risk.drawdown_window_days possible: a
+	// trailing peak needs history, and one float per day is cheap enough to keep
+	// unconditionally so switching the window on works immediately rather than
+	// after the window has elapsed.
+	DailyHighs []dayHigh `json:"daily_highs,omitempty"`
+
+	// Reset provenance. A reset re-bases the anchor to current equity, which
+	// REDUCES protection, so it is recorded rather than silently applied: the
+	// superseded peak is kept, not destroyed, and the count makes a habit of
+	// resetting visible in `deliverator risk`.
+	PrevPeakEquity float64 `json:"prev_peak_equity,omitempty"`
+	PeakResetAtMs  int64   `json:"peak_reset_at_ms,omitempty"`
+	PeakResetCount int     `json:"peak_reset_count,omitempty"`
+}
+
+// dayHigh is one UTC day's highest observed equity.
+type dayHigh struct {
+	Day  string  `json:"d"`
+	High float64 `json:"h"`
+}
+
+// maxDailyHighs bounds the rolling series. 400 days covers any sane window and
+// keeps the state file small; the series is exchange-independent local data, but
+// an unbounded slice in a file rewritten on every gate check is still a leak.
+const maxDailyHighs = 400
+
+// recordDailyHigh folds today's equity into the rolling series.
+func recordDailyHigh(highs []dayHigh, today string, equity float64) []dayHigh {
+	if n := len(highs); n > 0 && highs[n-1].Day == today {
+		if equity > highs[n-1].High {
+			highs[n-1].High = equity
+		}
+		return highs
+	}
+	highs = append(highs, dayHigh{Day: today, High: equity})
+	if len(highs) > maxDailyHighs {
+		highs = highs[len(highs)-maxDailyHighs:]
+	}
+	return highs
+}
+
+// effectivePeak returns the peak the drawdown gate should measure against.
+//
+// windowDays <= 0 keeps the ALL-TIME high-water mark — the original behaviour,
+// so an operator who never sets the knob sees no change. With a window, the peak
+// is the highest daily high within the last windowDays UTC days (today
+// inclusive), which lets an accepted loss age out instead of gating forever.
+//
+// FAIL SAFE, NOT FAIL OPEN: if the window somehow yields nothing (empty series,
+// clock moved backwards), fall back to the all-time peak rather than to zero —
+// a zero peak would silently disable the gate.
+func effectivePeak(st riskState, windowDays int, now time.Time) float64 {
+	if windowDays <= 0 || len(st.DailyHighs) == 0 {
+		return st.PeakEquity
+	}
+	cutoff := now.UTC().AddDate(0, 0, -(windowDays - 1)).Format("2006-01-02")
+	var peak float64
+	for _, h := range st.DailyHighs {
+		if h.Day >= cutoff && h.High > peak {
+			peak = h.High
+		}
+	}
+	if peak <= 0 {
+		return st.PeakEquity
+	}
+	return peak
 }
 
 // observeEquity records equity into the persistent high-water / daily-anchor state
@@ -860,7 +949,7 @@ type riskState struct {
 // bricks trading. fresh=true reports that the anchors were (re)initialized from
 // the current equity — the caller must surface that as a warning, because fresh
 // anchors measure nothing until they move.
-func observeEquity(network, account string, equity float64) (drawdownPct, dailyLossUSD, dailyLossPct float64, fresh bool, err error) {
+func observeEquity(network, account string, equity float64, windowDays int) (drawdownPct, dailyLossUSD, dailyLossPct float64, fresh bool, err error) {
 	if math.IsNaN(equity) || math.IsInf(equity, 0) {
 		return 0, 0, 0, false, fmt.Errorf("equity must be finite")
 	}
@@ -890,8 +979,12 @@ func observeEquity(network, account string, equity float64) (drawdownPct, dailyL
 	if equity > st.PeakEquity {
 		st.PeakEquity = equity
 	}
-	if st.PeakEquity > 0 && equity < st.PeakEquity {
-		drawdownPct = (st.PeakEquity - equity) / st.PeakEquity * 100
+	st.DailyHighs = recordDailyHigh(st.DailyHighs, today, equity)
+	// Measure against the WINDOWED peak when one is configured; windowDays <= 0
+	// keeps the all-time mark, so the default behaviour is untouched.
+	peak := effectivePeak(st, windowDays, time.Now())
+	if peak > 0 && equity < peak {
+		drawdownPct = (peak - equity) / peak * 100
 	}
 	if st.DayAnchorEquity > 0 && equity < st.DayAnchorEquity {
 		dailyLossUSD = st.DayAnchorEquity - equity
@@ -915,6 +1008,86 @@ func observeEquity(network, account string, equity float64) (drawdownPct, dailyL
 	return drawdownPct, dailyLossUSD, dailyLossPct, fresh, nil
 }
 
+// AnchorReset describes a completed drawdown-anchor reset, for the envelope and
+// the audit trail.
+type AnchorReset struct {
+	PrevPeakEquity float64 `json:"prev_peak_equity"`
+	NewPeakEquity  float64 `json:"new_peak_equity"`
+	DrawdownWasPct float64 `json:"drawdown_was_pct"`
+	ResetCount     int     `json:"peak_reset_count"`
+	Network        string  `json:"network"`
+	Account        string  `json:"account"`
+}
+
+// ResetPeakAnchor re-bases the drawdown high-water mark to current equity.
+//
+// THIS IS THE SECOND WRITER of the drawdown/daily-loss anchor file, alongside
+// observeEquity — see TestObserveEquityHasExactlyOneCaller and its sibling pin.
+// It is deliberately operator-only and never reachable from the agent's order
+// path: re-basing the anchor REDUCES protection, so it must be a conscious human
+// acknowledgment of a realized loss, not something a trading loop can do to
+// unblock itself.
+//
+// It exists because the alternative operators actually reach for is worse. With
+// an all-time anchor, a real loss leaves the gate permanently near 100%
+// utilization, and the only escape is setting max_drawdown_pct to 100 — turning
+// the ruin backstop OFF entirely. A reset keeps a real floor.
+//
+// History is preserved, not destroyed: the superseded peak, the reset time, and
+// a running count are all recorded, so `deliverator risk` can show that the
+// current floor is a re-based one and how often that has happened.
+func ResetPeakAnchor(network, account string, equity float64) (AnchorReset, error) {
+	if math.IsNaN(equity) || math.IsInf(equity, 0) || equity <= 0 {
+		return AnchorReset{}, fmt.Errorf("equity must be a positive finite number to re-anchor, got %v", equity)
+	}
+	lk, err := state.Lock(riskStateLockPath(network, account))
+	if err != nil {
+		return AnchorReset{}, err
+	}
+	defer lk.Unlock()
+
+	var st riskState
+	if b, e := os.ReadFile(riskStatePath(network, account)); e == nil {
+		if err := json.Unmarshal(b, &st); err != nil {
+			return AnchorReset{}, fmt.Errorf("decode risk state: %w", err)
+		}
+	} else if !os.IsNotExist(e) {
+		return AnchorReset{}, fmt.Errorf("read risk state: %w", e)
+	}
+
+	res := AnchorReset{PrevPeakEquity: st.PeakEquity, NewPeakEquity: equity, Network: network, Account: account}
+	if st.PeakEquity > 0 && equity < st.PeakEquity {
+		res.DrawdownWasPct = (st.PeakEquity - equity) / st.PeakEquity * 100
+	}
+
+	today := time.Now().UTC().Format("2006-01-02")
+	st.PrevPeakEquity = st.PeakEquity
+	st.PeakEquity = equity
+	st.PeakResetAtMs = time.Now().UTC().UnixMilli()
+	st.PeakResetCount++
+	// Drop the rolling history too: a trailing window must not resurrect the peak
+	// the operator just acknowledged and re-based away from.
+	st.DailyHighs = []dayHigh{{Day: today, High: equity}}
+	// The DAY anchor is deliberately left alone. daily_loss_pct measures a
+	// different horizon and resetting it here would quietly hand back the day's
+	// loss budget in the same breath.
+	st.Basis = currentEquityBasis
+	res.ResetCount = st.PeakResetCount
+
+	b, err := json.Marshal(st)
+	if err != nil {
+		return AnchorReset{}, fmt.Errorf("encode risk state: %w", err)
+	}
+	path := riskStatePath(network, account)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return AnchorReset{}, fmt.Errorf("create risk state directory: %w", err)
+	}
+	if err := state.WriteFileAtomic(path, b, 0o600); err != nil {
+		return AnchorReset{}, fmt.Errorf("persist risk state: %w", err)
+	}
+	return res, nil
+}
+
 // ReadRiskState reads the persistent drawdown/daily-loss state of one
 // network+account WITHOUT mutating it and computes the drawdown-from-peak +
 // daily-loss figures against the supplied live equity — the read-only
@@ -926,7 +1099,10 @@ func observeEquity(network, account string, equity float64) (drawdownPct, dailyL
 // figure is reported only when the stored anchor is from the current UTC day
 // (a new day re-anchors on the next observeEquity write); drawdown uses the
 // stored peak as-is. The legacy unkeyed risk_state.json is never consulted.
-func ReadRiskState(network, account string, equity float64) (st riskState, drawdownPct, dailyLossUSD, dailyLossPct float64, found bool) {
+// windowDays must match the gate's risk.drawdown_window_days: a monitor that
+// measured from a different anchor than the enforcer would reproduce exactly the
+// fork-path/serve-path disagreement that hid a two-day outage (#41).
+func ReadRiskState(network, account string, equity float64, windowDays int) (st riskState, drawdownPct, dailyLossUSD, dailyLossPct float64, found bool) {
 	b, e := os.ReadFile(riskStatePath(network, account))
 	if e != nil {
 		return riskState{}, 0, 0, 0, false
@@ -938,8 +1114,8 @@ func ReadRiskState(network, account string, equity float64) (st riskState, drawd
 		return riskState{}, 0, 0, 0, false // stale basis: treat as fresh until observeEquity re-anchors
 	}
 	found = true
-	if st.PeakEquity > 0 && equity < st.PeakEquity {
-		drawdownPct = (st.PeakEquity - equity) / st.PeakEquity * 100
+	if peak := effectivePeak(st, windowDays, time.Now()); peak > 0 && equity < peak {
+		drawdownPct = (peak - equity) / peak * 100
 	}
 	today := time.Now().UTC().Format("2006-01-02")
 	if st.Day == today && st.DayAnchorEquity > 0 && equity < st.DayAnchorEquity {

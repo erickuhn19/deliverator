@@ -63,7 +63,7 @@ func TestReadRiskStateNoMutationAndCompute(t *testing.T) {
 	}
 	before, _ := os.ReadFile(riskStatePath("testnet", testMaster))
 
-	st, dd, dlUSD, dlPct, found := ReadRiskState("testnet", testMaster, 800)
+	st, dd, dlUSD, dlPct, found := ReadRiskState("testnet", testMaster, 800, 0)
 	if !found {
 		t.Fatal("want found=true")
 	}
@@ -84,12 +84,12 @@ func TestReadRiskStateNoMutationAndCompute(t *testing.T) {
 
 func TestReadRiskStateFreshAndCorrupt(t *testing.T) {
 	testHome(t)
-	if _, _, _, _, found := ReadRiskState("testnet", testMaster, 1000); found {
+	if _, _, _, _, found := ReadRiskState("testnet", testMaster, 1000, 0); found {
 		t.Error("missing file should yield found=false")
 	}
 	_ = os.MkdirAll(config.Dir(), 0o700)
 	_ = os.WriteFile(riskStatePath("testnet", testMaster), []byte("{not json"), 0o600)
-	if _, _, _, _, found := ReadRiskState("testnet", testMaster, 1000); found {
+	if _, _, _, _, found := ReadRiskState("testnet", testMaster, 1000, 0); found {
 		t.Error("corrupt file should yield found=false")
 	}
 }
@@ -101,7 +101,7 @@ func TestReadRiskStateStaleDayNoDailyLoss(t *testing.T) {
 	// read-only view reports no daily loss; drawdown (from the stored peak) still computes.
 	content := []byte(`{"peak_equity":1000,"day":"2000-01-01","day_anchor_equity":900,"basis":2}`)
 	_ = os.WriteFile(riskStatePath("testnet", testMaster), content, 0o600)
-	_, dd, dlUSD, _, found := ReadRiskState("testnet", testMaster, 800)
+	_, dd, dlUSD, _, found := ReadRiskState("testnet", testMaster, 800, 0)
 	if !found || !approxEq(dd, 20) {
 		t.Errorf("drawdown should still compute: dd=%v found=%v", dd, found)
 	}
@@ -239,7 +239,7 @@ func TestReadRiskStateStaleBasisResets(t *testing.T) {
 	today := time.Now().UTC().Format("2006-01-02")
 	// No "basis" field => old basis (0) => must be treated as fresh, not compared.
 	_ = os.WriteFile(riskStatePath("testnet", testMaster), []byte(`{"peak_equity":1000,"day":"`+today+`","day_anchor_equity":1000}`), 0o600)
-	if _, dd, _, _, found := ReadRiskState("testnet", testMaster, 800); found || dd != 0 {
+	if _, dd, _, _, found := ReadRiskState("testnet", testMaster, 800, 0); found || dd != 0 {
 		t.Errorf("stale-basis state must read as fresh (found=false, dd=0); got found=%v dd=%v", found, dd)
 	}
 }
