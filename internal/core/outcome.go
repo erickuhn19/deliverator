@@ -16,11 +16,26 @@ import (
 // rotate daily. Rich fields (Yes/No side, the question grouping, parsed priceBinary
 // underlying/target/expiry, resolution status) let an agent discover and reason
 // about them.
+// It is IDEMPOTENT and safe to call repeatedly: `serve` reloads the universe on
+// the daily roll (RefreshOutcomes), and an append-only writer duplicated every
+// row on each reload while leaving rolled-out coins resolvable forever (#43).
+// Each call installs exactly the universe it was given.
 func (m *MetaStore) AddOutcomes(om *hl.OutcomeMeta) {
 	if om == nil {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.outcomeMeta = om
+
+	// Retire the previous universe. Coins that rolled out must stop resolving:
+	// leaving them in byCoin lets an order price against a market that no longer
+	// trades, and the stale asset id would sign for the wrong leaf.
+	for _, key := range m.outcomeCoins {
+		delete(m.byCoin, key)
+	}
+	m.outcomeCoins = m.outcomeCoins[:0]
+	m.outcomeMarkets = nil
 
 	// Map each outcome to its grouping question, and collect settled outcome ids.
 	type qref struct {
@@ -71,7 +86,9 @@ func (m *MetaStore) AddOutcomes(om *hl.OutcomeMeta) {
 				PriceBound:       "0..1",
 				QuoteToken:       o.QuoteToken,
 			}
-			m.byCoin[strings.ToUpper(coin)] = mk
+			key := strings.ToUpper(coin)
+			m.byCoin[key] = mk
+			m.outcomeCoins = append(m.outcomeCoins, key)
 			m.outcomeMarkets = append(m.outcomeMarkets, mk)
 		}
 	}

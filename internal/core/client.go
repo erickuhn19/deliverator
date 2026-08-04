@@ -88,7 +88,11 @@ type Client struct {
 	nonce *state.NonceLock
 	audit *state.Audit
 
-	// lazily initialized only when a write needs to sign
+	// lazily initialized only when a write needs to sign, and guarded by exMu:
+	// under `serve` several connection goroutines can reach the first write at
+	// once, and the HIP-4 roll re-registers the signer's asset ids underneath
+	// them (see reregisterSignerUniverse). Nothing here is safe to touch unlocked.
+	exMu       sync.Mutex
 	agent      *wallet.Agent
 	ex         *hl.Exchange
 	signerWarn string // non-empty if the loaded signer is misconfigured (T3-keybind)
@@ -126,6 +130,8 @@ func (c *Client) automationConfig() config.Automation { return c.currentGuards()
 // T3-keybind), or nil. Every write path prepends it to its warnings so a
 // dangerous signer setup surfaces in the result envelope.
 func (c *Client) signerWarnings() []string {
+	c.exMu.Lock()
+	defer c.exMu.Unlock()
 	if c.signerWarn == "" {
 		return nil
 	}
@@ -339,7 +345,32 @@ func (c *Client) loadOutcomes(ctx context.Context) error {
 	}
 	c.meta.AddOutcomes(om)
 	c.info.RegisterOutcomes(om)
+	c.reregisterSignerUniverse(om)
 	return nil
+}
+
+// reregisterSignerUniverse teaches an ALREADY-BUILT signer the reloaded HIP-4
+// asset ids.
+//
+// The signer carries its own hl.Info, seeded exactly once in exchange() on the
+// process's first write. Refreshing only c.meta and c.info left that copy on the
+// previous day's universe, so after a roll a placement resolved through the
+// gates, got SIGNED, and then died in newCreateOrderAction with "coin #<enc> not
+// found in info" — mapped to exit 50 (exchange-rejected, NON-retryable), which
+// serve's unknown_coin retry cannot recover. That reproduced the very outage the
+// reactive refresh was added to fix. See #43.
+//
+// No-op before the first write, when there is no signer to correct.
+func (c *Client) reregisterSignerUniverse(om *hl.OutcomeMeta) {
+	if om == nil {
+		return
+	}
+	c.exMu.Lock()
+	defer c.exMu.Unlock()
+	if c.ex == nil {
+		return
+	}
+	c.ex.Info().RegisterOutcomes(om)
 }
 
 // EnsureOutcomes lazily loads the HIP-4 outcome universe if it isn't already
@@ -411,6 +442,8 @@ func (c *Client) QueryAddr() string { return c.queryAddr }
 
 // AgentAddress returns the loaded agent address, or "" if no write has occurred.
 func (c *Client) AgentAddress() string {
+	c.exMu.Lock()
+	defer c.exMu.Unlock()
 	if c.agent == nil {
 		return ""
 	}
@@ -434,6 +467,8 @@ func (c *Client) RequireQueryAddr() error { return c.requireQueryAddr() }
 
 // exchange lazily loads the agent key and builds the signing client.
 func (c *Client) exchange(ctx context.Context) (*hl.Exchange, error) {
+	c.exMu.Lock()
+	defer c.exMu.Unlock()
 	if c.ex != nil {
 		return c.ex, nil
 	}

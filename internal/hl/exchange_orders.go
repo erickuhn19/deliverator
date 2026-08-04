@@ -419,7 +419,7 @@ func (e *Exchange) MarketClose(
 // rounded to 5 significant figures then to the asset's allowed decimals. The
 // float64 path matches the exchange exactly — do not substitute decimal math.
 func (e *Exchange) SlippagePrice(ctx context.Context, name string, isBuy bool, slippage float64, px *float64) (float64, error) {
-	asset := e.info.coinToAsset[name]
+	asset, _ := e.info.CoinToAsset(name)
 	// Spot ids are [10000, 100000); sub-dex (HIP-3) ids are >= 100000 and are NOT
 	// spot. A "<dex>:<coin>" name draws its mid from that dex's allMids. HIP-4
 	// outcome ids are >= 100_000_000 and price in (0,1).
@@ -475,7 +475,7 @@ func (e *Exchange) SlippagePrice(ctx context.Context, name string, isBuy bool, s
 	if isSpot {
 		decimals = 8
 	}
-	szDecimals := e.info.assetToDecimal[asset]
+	szDecimals := e.info.AssetDecimals(asset)
 	return roundToDecimals(price, decimals-szDecimals), nil
 }
 
