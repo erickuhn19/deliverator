@@ -476,13 +476,12 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 		}
 		cfg.Outcomes = b
 	default:
-		// [mm] table keys route to the shared setter in package config (the separate
-		// outcome-mm binary + its TUI use the same one). Seeds DefaultMM if absent.
-		if config.IsMMKey(key) {
-			if err := cfg.SetMMKey(key, val); err != nil {
-				return err
-			}
-			return cfg.Validate()
+		// The [mm] table went with the outcome-mm daemon. An existing config may still
+		// carry one, so say what actually happened rather than "unknown key": the
+		// market maker lives in the prediction-bot repo now, not in this CLI.
+		if strings.HasPrefix(key, "mm.") {
+			return fmt.Errorf("the [mm] table was removed along with the outcome-mm daemon; "+
+				"delete it from your config (key %q)", key)
 		}
 		return fmt.Errorf("unknown or unsettable key %q", key)
 	}

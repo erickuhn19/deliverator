@@ -5,6 +5,8 @@ package core
 // market caps must be priced at the worst-case fill with a slippage clamp.
 
 import (
+	"context"
+	"math"
 	"testing"
 
 	"github.com/erickuhn19/deliverator/internal/config"
@@ -37,6 +39,92 @@ func TestPlaceMarketRejectsPoisonedMid(t *testing.T) {
 		}
 		assertErr(t, err, output.CatRisk, output.ExitRisk)
 	}
+}
+
+func TestPositionCapRejectsPoisonedPositionValue(t *testing.T) {
+	cfg := config.Default()
+	cfg.Risk.MaxPositionNotionalUSD = 1000
+	resp := func(_, typ string, _ map[string]any) (int, string) {
+		switch typ {
+		case "clearinghouseState":
+			return 200, `{"assetPositions":[{"position":{"coin":"BTC","szi":"1","positionValue":"NaN","unrealizedPnl":"0","leverage":{"type":"cross","value":1}}}],"marginSummary":{"accountValue":"1000"}}`
+		case "frontendOpenOrders":
+			return 200, `[]`
+		case "spotClearinghouseState":
+			return 200, `{"balances":[]}`
+		}
+		return 200, `{}`
+	}
+	c, ctx := newTestClient(t, cfg, Options{DryRun: true}, resp)
+	_, _, err := c.Place(ctx, OrderReq{Coin: "BTC", Side: Buy, Size: "0.01", Limit: "100"})
+	if err == nil {
+		t.Fatal("malformed position value must fail closed before signing")
+	}
+	assertErr(t, err, output.CatNetwork, output.ExitNetwork)
+}
+
+func TestPortfolioGateRejectsUnpricedOpenOrder(t *testing.T) {
+	orders := []hl.FrontendOpenOrder{{Coin: "BTC", Oid: 7, Side: hl.OrderSideBid, Sz: 1}}
+	if err := validateRiskOrders(orders); err == nil {
+		t.Fatal("an exposure-adding open order with no usable price must fail closed")
+	}
+}
+
+func TestPortfolioGateRejectsOverflowingOpenOrders(t *testing.T) {
+	orders := []hl.FrontendOpenOrder{
+		{Coin: "BTC", Oid: 7, Side: hl.OrderSideBid, Sz: math.MaxFloat64, LimitPx: 1},
+		{Coin: "BTC", Oid: 8, Side: hl.OrderSideBid, Sz: math.MaxFloat64, LimitPx: 1},
+	}
+	if err := validateRiskOrders(orders); err == nil {
+		t.Fatal("overflowing aggregate open-order notional must fail closed")
+	}
+}
+
+func TestPortfolioGateRejectsMalformedPositionValue(t *testing.T) {
+	cases := []string{"NaN", "Inf", "-1"}
+	for _, value := range cases {
+		clearing := `{"assetPositions":[{"position":{"coin":"BTC","szi":"1","positionValue":"` + value + `","unrealizedPnl":"0","leverage":{"type":"cross","value":1}}}],"marginSummary":{"accountValue":"1000"}}`
+		cfg := config.Default()
+		cfg.Risk.MaxNetExposureUSD = 10000
+		c, ctx := newTestClient(t, cfg, Options{DryRun: true}, gateResp(&clearing, noSpot))
+		_, err := c.checkPortfolioGates(ctx, []exposureDelta{{coin: "ETH", signedNotional: 1}})
+		if err == nil {
+			t.Fatalf("position value %q must fail the portfolio gate closed", value)
+		}
+		assertErr(t, err, output.CatNetwork, output.ExitNetwork)
+	}
+}
+
+func TestAdjustMarginRejectsUnsafeAmounts(t *testing.T) {
+	c := newCfgClient(t, config.Default())
+	for _, amount := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), math.MaxFloat64} {
+		if _, err := c.AdjustMargin(context.Background(), "BTC", amount); err == nil {
+			t.Fatalf("AdjustMargin accepted unsafe amount %v", amount)
+		}
+	}
+}
+
+func TestOutcomePositionCapRejectsOutOfRangeMark(t *testing.T) {
+	cfg := config.Default()
+	cfg.Risk.MaxPositionNotionalUSD = 100
+	resp := func(_, typ string, _ map[string]any) (int, string) {
+		switch typ {
+		case "spotClearinghouseState":
+			return 200, `{"balances":[{"coin":"+6410","total":"200","hold":"0","entryNtl":"40"}]}`
+		case "allMids":
+			return 200, `{"#6410":"2"}`
+		case "frontendOpenOrders":
+			return 200, `[]`
+		}
+		return 200, `{}`
+	}
+	c, ctx := newTestClient(t, cfg, Options{DryRun: true}, resp)
+	c.Meta().AddOutcomes(outcome641)
+	_, _, err := c.Place(ctx, OrderReq{Coin: "#6410", Side: Buy, Size: "1", Limit: "0.25"})
+	if err == nil {
+		t.Fatal("an outcome mark above 1 must not be used to enforce the position cap")
+	}
+	assertErr(t, err, output.CatNetwork, output.ExitNetwork)
 }
 
 // --- S4: market caps priced at the worst-case fill + slippage clamp ---

@@ -27,13 +27,18 @@ func TestResolvePriority(t *testing.T) {
 	if r, w := c.resolvePriority(&ten); r != 80000 || w == "" {
 		t.Fatalf("10 bps must clamp to 80000 with a warning, got rate=%d warn=%q", r, w)
 	}
-	// Config default applies when there's no override.
-	cfg.Automation.PriorityBps = 2
+	// Config default applies when there's no override. Rebuilt rather than
+	// mutating cfg: the guards are snapshotted at construction.
+	cfgDef := config.Default()
+	cfgDef.Automation.PriorityBps = 2
+	c = newCfgClient(t, cfgDef)
 	if r, _ := c.resolvePriority(nil); r != 20000 {
 		t.Fatalf("config default 2 bps -> rate=%d, want 20000", r)
 	}
 	// A lower configured cap clamps an override down (with a warning).
-	cfg.Risk.MaxPriorityBps = 1
+	cfgCap := config.Default()
+	cfgCap.Risk.MaxPriorityBps = 1
+	c = newCfgClient(t, cfgCap)
 	if r, w := c.resolvePriority(&three); r != 10000 || w == "" {
 		t.Fatalf("max 1 bp must clamp 3 bps to 10000 with a warning, got rate=%d warn=%q", r, w)
 	}
