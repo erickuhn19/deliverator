@@ -95,13 +95,27 @@ type Engine interface {
 	// roll that retires a coin and lists its successor, so a universe cached at
 	// startup goes stale every day. See reloadOutcomesFor.
 	RefreshOutcomes(ctx context.Context) error
+
+	// ReloadGuardsIfChanged re-reads the risk caps when the config file changed,
+	// and returns any warnings to attach to this request's envelope. `config set`
+	// writes the file and exits, so a server that captured risk config at startup
+	// enforces it forever otherwise — the fork path and the socket path then
+	// disagree about the caps, which is precisely what hid a two-day outage (#41).
+	ReloadGuardsIfChanged(path string) []string
+
+	// GuardGeneration names the config the gates are currently enforcing, so a
+	// rejection can carry it and a stale cache is visible in the error itself.
+	GuardGeneration() string
 }
 
 // Server accepts requests on a Unix socket until its context ends.
 type Server struct {
-	eng  Engine
-	path string
-	meta func() output.Meta
+	eng Engine
+	// configPath is the risk config watched for changes on each request. Empty
+	// means the default location.
+	configPath string
+	path       string
+	meta       func() output.Meta
 
 	ln net.Listener
 
@@ -121,6 +135,13 @@ type Server struct {
 // New builds a server. The socket path is created on Start.
 func New(eng Engine, socketPath string, meta func() output.Meta) *Server {
 	return &Server{eng: eng, path: socketPath, meta: meta}
+}
+
+// WatchConfig points the per-request risk-config freshness check at a specific
+// file. Empty (the default) uses the standard config location.
+func (s *Server) WatchConfig(path string) *Server {
+	s.configPath = path
+	return s
 }
 
 // Listen creates the socket. Separate from Serve so a caller can report a bind

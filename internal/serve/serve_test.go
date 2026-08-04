@@ -36,6 +36,26 @@ type fakeEngine struct {
 	// something reloads it.
 	knownCoins map[string]bool
 	refreshes  int
+
+	guardReloads int
+	guardWarns   []string
+	guardGen     string
+}
+
+// guardWarns is returned by the next ReloadGuardsIfChanged; guardReloads counts
+// the calls, so a test can prove the freshness check runs on EVERY request.
+func (f *fakeEngine) ReloadGuardsIfChanged(string) []string {
+	f.guardReloads++
+	w := f.guardWarns
+	f.guardWarns = nil
+	return w
+}
+
+func (f *fakeEngine) GuardGeneration() string {
+	if f.guardGen == "" {
+		return "config generation 1700000000000 (mtime 2023-11-14T22:13:20Z)"
+	}
+	return f.guardGen
 }
 
 func (f *fakeEngine) RefreshOutcomes(context.Context) error {
