@@ -84,6 +84,26 @@ type Config struct {
 	path string // resolved source path, for diagnostics
 }
 
+// ADDING A NEW CONFIG KEY: give it `omitempty`.
+//
+// Load is strict — an unknown key is a hard error, deliberately, so a typo'd risk
+// cap can never be silently ignored (audit S1). Save re-encodes the WHOLE struct,
+// so a new field without `omitempty` gets written at its zero value the first time
+// anyone runs `config set` from a build that has it. Every OLDER binary reading
+// that same config then fails to load — including a long-running `serve` that has
+// not been restarted, and every CLI invocation from an un-upgraded path.
+//
+// Observed live on 2026-08-04: adding drawdown_window_days and running one
+// `config set` left a running server unable to parse its own config. It failed
+// closed and said so (the reload keeps the last good caps and warns — see
+// Client.ReloadGuardsIfChanged), so nothing traded against a wrong cap, but the
+// operator's new cap did not take effect until the stray line was removed.
+//
+// `omitempty` confines the breakage to operators who actually SET the new key,
+// who need the new binary anyway. It does not remove the constraint: enabling a
+// new key still requires upgrading every process that reads the config, INCLUDING
+// restarting `serve`.
+
 // Wallet — the query target (master). The agent signing key lives ONLY in the OS
 // keychain (see internal/wallet); there is no key-source or key-file config, so a
 // stale `agent_key_source` cannot silently point the CLI away from the keychain.
@@ -136,7 +156,15 @@ type Risk struct {
 	// fail open). So a freshly-configured window behaves exactly like today's
 	// anchor and only diverges as history builds — to release an ALREADY-STRANDED
 	// anchor immediately, use `deliverator risk reset-anchor --yes`.
-	DrawdownWindowDays int     `toml:"drawdown_window_days"`
+	//
+	// POINTER ON PURPOSE — see the NEW CONFIG KEYS note below Config. omitempty is
+	// what keeps this key out of a default config, and in BurntSushi/toml it is a
+	// NO-OP on numeric kinds (isEmpty covers String/Slice/Map/Struct/Bool/Ptr and
+	// nothing else). A plain int would be written as `drawdown_window_days = 0` by
+	// the first `config set` from a build carrying it, breaking every older binary
+	// that reads the same file. Read it through Risk.DrawdownWindow(), never
+	// directly: nil and 0 mean the same thing (all-time peak).
+	DrawdownWindowDays *int    `toml:"drawdown_window_days,omitempty"`
 	MaxDailyLossUSD    float64 `toml:"max_daily_loss_usd"` // 0 = off; (UTC-day anchor − equity) USD
 	MaxDailyLossPct    float64 `toml:"max_daily_loss_pct"` // 0 = off; (anchor − equity) / anchor * 100
 	MaxOpenPositions   int     `toml:"max_open_positions"` // 0 = off; cap on the number of concurrent open positions
@@ -460,7 +488,7 @@ func (c *Config) Validate() error {
 	if c.Risk.MaxDrawdownPct > 100 || c.Risk.MaxDailyLossPct > 100 {
 		return fmt.Errorf("risk.max_drawdown_pct / risk.max_daily_loss_pct are percentages in [0,100]")
 	}
-	if c.Risk.DrawdownWindowDays < 0 || c.Risk.DrawdownWindowDays > 3650 {
+	if w := c.Risk.DrawdownWindow(); w < 0 || w > 3650 {
 		return fmt.Errorf("risk.drawdown_window_days must be 0 (all-time peak) or 1..3650 days")
 	}
 	if c.Risk.MaxOpenPositions < 0 {
@@ -605,4 +633,15 @@ func pathConfinedTo(field, configured, base string) error {
 		return fmt.Errorf("%s %q escapes the config directory %q — keep it under that dir or set DELIVERATOR_HOME to its parent", field, configured, base)
 	}
 	return nil
+}
+
+// DrawdownWindow returns the configured trailing-peak window in days, with nil
+// and 0 both meaning "all-time peak". Every reader must go through this rather
+// than dereferencing the field, so an unset key can never be confused with a
+// deliberate zero — and can never nil-panic on a money path.
+func (r Risk) DrawdownWindow() int {
+	if r.DrawdownWindowDays == nil {
+		return 0
+	}
+	return *r.DrawdownWindowDays
 }

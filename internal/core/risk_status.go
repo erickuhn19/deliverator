@@ -130,7 +130,7 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 	// AFTER the on-disk caps are resolved, so the window this measures with is the
 	// same one the gates will enforce — a monitor and an enforcer disagreeing
 	// about the anchor is the shape that hid a two-day outage (#41).
-	st, ddPct, dlUSD, dlPct, found := ReadRiskState(c.network, c.queryAddr, equity, r.DrawdownWindowDays)
+	st, ddPct, dlUSD, dlPct, found := ReadRiskState(c.network, c.queryAddr, equity, r.DrawdownWindow())
 
 	f := func(v float64) *float64 { return &v }
 	mk := func(key, label, unit, value string, active bool, current *float64, capVal float64) RiskCap {
@@ -173,8 +173,8 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 		{Key: "perp_dexs", Label: "Sub-dexes (HIP-3)", Type: "list", Value: strings.Join(perpDexs, ",")},
 	}
 	anchor := "all-time peak"
-	if r.DrawdownWindowDays > 0 {
-		anchor = fmt.Sprintf("%d-day trailing peak", r.DrawdownWindowDays)
+	if r.DrawdownWindow() > 0 {
+		anchor = fmt.Sprintf("%d-day trailing peak", r.DrawdownWindow())
 	}
 	var rvWarnings []string
 	var ddUtil float64
@@ -182,7 +182,7 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 		ddUtil = ddPct / r.MaxDrawdownPct * 100
 		// The same warning the gate raises, so an operator reading `risk` sees the
 		// standing-halt risk BEFORE a rejection rather than after.
-		if ddUtil > 90 && r.DrawdownWindowDays <= 0 {
+		if ddUtil > 90 && r.DrawdownWindow() <= 0 {
 			rvWarnings = append(rvWarnings, fmt.Sprintf(
 				"drawdown is at %.0f%% of the %.1f%% cap and the anchor is the ALL-TIME peak — this gate is "+
 					"effectively a standing halt. Escapes: `deliverator risk reset-anchor --yes` (re-base the peak "+
@@ -206,7 +206,7 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 		DailyLossPct:       dlPct,
 		RiskStateFound:     found,
 		Halted:             c.Halted(),
-		DrawdownWindowDays: r.DrawdownWindowDays,
+		DrawdownWindowDays: r.DrawdownWindow(),
 		DrawdownAnchor:     anchor,
 		DrawdownUtilPct:    ddUtil,
 		PeakResetCount:     st.PeakResetCount,

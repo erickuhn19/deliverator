@@ -245,7 +245,7 @@ func riskCapValue(c *config.Config, key string) (string, bool) {
 	case "risk.max_drawdown_pct":
 		return v(r.MaxDrawdownPct), true
 	case "risk.drawdown_window_days":
-		return strconv.Itoa(r.DrawdownWindowDays), true
+		return strconv.Itoa(r.DrawdownWindow()), true
 	case "risk.max_daily_loss_usd":
 		return v(r.MaxDailyLossUSD), true
 	case "risk.max_daily_loss_pct":
@@ -355,7 +355,7 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 		if err != nil {
 			return err
 		}
-		cfg.Risk.DrawdownWindowDays = n
+		cfg.Risk.DrawdownWindowDays = &n
 	case "risk.max_daily_loss_usd":
 		f, err := atof()
 		if err != nil {

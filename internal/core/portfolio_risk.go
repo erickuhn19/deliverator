@@ -773,7 +773,7 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 	// drawdown / daily loss.
 	var warnings []string
 	if r.MaxDrawdownPct > 0 || r.MaxDailyLossUSD > 0 || r.MaxDailyLossPct > 0 {
-		dd, dlUSD, dlPct, fresh, oerr := observeEquity(c.network, c.queryAddr, snap.equity, r.DrawdownWindowDays)
+		dd, dlUSD, dlPct, fresh, oerr := observeEquity(c.network, c.queryAddr, snap.equity, r.DrawdownWindow())
 		if oerr != nil {
 			return nil, output.Network("risk_state", "cannot update drawdown/daily-loss state: "+oerr.Error()).Retry()
 		}
@@ -786,8 +786,8 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 		}
 		if cap := r.MaxDrawdownPct; cap > 0 && dd > cap {
 			anchor := "all-time peak"
-			if r.DrawdownWindowDays > 0 {
-				anchor = fmt.Sprintf("%d-day trailing peak", r.DrawdownWindowDays)
+			if r.DrawdownWindow() > 0 {
+				anchor = fmt.Sprintf("%d-day trailing peak", r.DrawdownWindow())
 			}
 			return warnings, output.Risk("max_drawdown",
 				fmt.Sprintf("drawdown %.1f%% from %s exceeds the %.1f%% cap — trading paused", dd, anchor, cap)).
@@ -800,7 +800,7 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 		// the only remaining escapes are re-anchoring or switching the gate off, and
 		// an operator who does not know that reaches for `max_drawdown_pct = 100`.
 		// Say so BEFORE they get there.
-		if cap := r.MaxDrawdownPct; cap > 0 && dd > cap*0.9 && r.DrawdownWindowDays <= 0 {
+		if cap := r.MaxDrawdownPct; cap > 0 && dd > cap*0.9 && r.DrawdownWindow() <= 0 {
 			warnings = append(warnings, fmt.Sprintf(
 				"drawdown is %.1f%% of the %.1f%% cap (%.0f%% utilization) and the anchor is the ALL-TIME peak — "+
 					"this gate is close to a standing halt. The escapes are `deliverator risk reset-anchor --yes` "+
