@@ -94,6 +94,11 @@ func Execute() {
 				RootMeta(0))
 		}
 	}
+	if err == nil && output.RenderFailed() {
+		// render already emitted a schema-valid encode_envelope fallback when it
+		// could; make the exit code match that failure without printing a second row.
+		err = &output.CmdError{Code: output.ExitUnknown}
+	}
 	code := exitCodeFor(err)
 	logInvocation(code) // best-effort command log for live oversight
 	os.Exit(code)

@@ -89,6 +89,29 @@ func TestPreTradeChecksMaxPositionNotional(t *testing.T) {
 	assertErr(t, c.preTradeChecks(riskCheck{Coin: "BTC", NotionalUSD: 100, PositionNotionalUSD: 6000}), output.CatRisk, output.ExitRisk)
 }
 
+// The guard snapshot must OWN its slice. guardConfigFrom copies AllowedCoins so
+// a caller mutating the config it handed in cannot silently widen the live coin
+// allowlist afterwards — the gate would keep passing checks against a list the
+// operator believes they changed.
+//
+// Exercised through the unexported constructor rather than an exported reloader:
+// swapping guards at runtime is a real need for a long-lived process, but that
+// API arrives with its consumer, not ahead of it.
+func TestGuardSnapshotOwnsItsAllowedCoins(t *testing.T) {
+	cfg := config.Default()
+	cfg.Automation.AllowedCoins = []string{"BTC"}
+	c := newCfgClient(t, cfg)
+
+	if !c.coinAllowed("BTC") || c.coinAllowed("ETH") {
+		t.Fatal("baseline allowlist should admit BTC only")
+	}
+	// Mutating the caller-owned slice must not reach the live guard.
+	cfg.Automation.AllowedCoins[0] = "ETH"
+	if !c.coinAllowed("BTC") || c.coinAllowed("ETH") {
+		t.Fatal("a caller mutation leaked into the live allowlist")
+	}
+}
+
 // Under concurrency the local rate cap must still admit at most max_orders_per_min:
 // the flock serializes the read-modify-write so overlapping processes can't all
 // pass the gate and clobber rate.log (a TOCTOU cap bypass).
@@ -153,7 +176,12 @@ func TestCoinAllowed(t *testing.T) {
 	if !c.coinAllowed("ANYTHING") {
 		t.Error("empty allowlist should allow all")
 	}
-	c.cfg.Automation.AllowedCoins = []string{"BTC"}
+	// Rebuilt rather than mutating c.cfg: the gates read an immutable snapshot
+	// taken at construction, so a post-hoc cfg edit is not how a caller changes
+	// the allowlist and a test that pretends otherwise proves nothing.
+	cfgAllow := config.Default()
+	cfgAllow.Automation.AllowedCoins = []string{"BTC"}
+	c = newCfgClient(t, cfgAllow)
 	if !c.coinAllowed("btc") {
 		t.Error("allowlist should be case-insensitive")
 	}
@@ -170,8 +198,10 @@ func TestCheckLeverage(t *testing.T) {
 		t.Errorf("10x at cap should pass, got %v", err)
 	}
 	assertErr(t, c.checkLeverage(20), output.CatRisk, output.ExitRisk)
-	// No cap configured => any leverage passes.
-	c.cfg.Risk.MaxLeverage = 0
+	// No cap configured => any leverage passes. Rebuilt, for the same reason.
+	cfgNoCap := config.Default()
+	cfgNoCap.Risk.MaxLeverage = 0
+	c = newCfgClient(t, cfgNoCap)
 	if err := c.checkLeverage(100); err != nil {
 		t.Errorf("no cap should pass, got %v", err)
 	}

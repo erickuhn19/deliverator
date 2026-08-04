@@ -9,6 +9,7 @@ import (
 
 	hl "github.com/erickuhn19/deliverator/internal/hl"
 
+	"github.com/erickuhn19/deliverator/internal/output"
 	"github.com/erickuhn19/deliverator/internal/state"
 )
 
@@ -60,6 +61,10 @@ type ReconcileView struct {
 	AuditRows    int                    `json:"audit_rows_scanned"`
 	OpenOrders   []hl.FrontendOpenOrder `json:"open_orders"`
 	Positions    []PositionView         `json:"positions"`
+	// PositionMode makes the position semantics explicit: positions are the
+	// authoritative live snapshot the caller adopts. The audit is an action log,
+	// not a position ledger, so Clean below describes order/cloid reconciliation.
+	PositionMode string `json:"position_mode"`
 	// OrphanOrders are live resting orders this instance has no audit record of
 	// placing — placed out-of-band, by another signer, or before the audit window.
 	// Trigger / position-tp-sl legs (e.g. a bracket's tp/sl, which aren't
@@ -89,19 +94,30 @@ func (c *Client) Reconcile(ctx context.Context, opts ReconcileOpts) (*ReconcileV
 		since = time.Now().Add(-reconcileDefaultWindow).UnixMilli()
 	}
 
-	liveOrders, err := c.allOpenOrders(ctx)
+	liveOrders, staleOrders, err := c.allOpenOrdersStale(ctx)
 	if err != nil {
 		return nil, mapNetwork("open_orders", err)
 	}
-	// TODO(NEXT-4): a degraded positions read must not be treated as
-	// authoritative for reconciliation verdicts; the read-health return is
-	// consumed in that cluster (tracked separately — scope discipline).
-	positions, _, err := c.Positions(ctx, "")
+	if len(staleOrders) > 0 {
+		return nil, output.Network("reconcile_degraded",
+			"cannot reconcile authoritatively: open orders are unreadable on sub-dex(es) "+strings.Join(staleOrders, ", ")).Retry().
+			WithHint("back off and retry reconcile; do not resume trading from a partial order book")
+	}
+	positions, positionMeta, err := c.Positions(ctx, "")
 	if err != nil {
 		return nil, err
 	}
+	if len(positionMeta.Degraded) > 0 {
+		return nil, output.Network("reconcile_degraded",
+			"cannot reconcile authoritatively: position state is incomplete ("+strings.Join(positionMeta.Degraded, ", ")+")").Retry().
+			WithHint("back off and retry reconcile; do not resume trading from a partial position snapshot")
+	}
 
-	rows, _ := state.ReadSince(c.audit.Path(), since) // best-effort: no trail => empty diff
+	rows, err := state.ReadSince(c.audit.Path(), since)
+	if err != nil {
+		return nil, output.Network("audit_read", "cannot read the local audit trail for reconciliation: "+err.Error()).Retry().
+			WithHint("repair access to the audit file, then re-run reconcile before trading")
+	}
 
 	// Every order id/cloid this instance ever recorded touching. A live order
 	// absent from these sets is an orphan.
@@ -168,6 +184,7 @@ func (c *Client) Reconcile(ctx context.Context, opts ReconcileOpts) (*ReconcileV
 		AuditRows:    len(rows),
 		OpenOrders:   liveOrders,
 		Positions:    positions,
+		PositionMode: "authoritative_live_snapshot",
 		OrphanOrders: orphans,
 		ClosedSince:  closedSince,
 		Suspects:     suspects,

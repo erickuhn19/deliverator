@@ -65,7 +65,12 @@ func testHome(t *testing.T) { t.Helper(); t.Setenv("DELIVERATOR_HOME", t.TempDir
 func newCfgClient(t *testing.T, cfg *config.Config) *Client {
 	t.Helper()
 	testHome(t)
-	return &Client{cfg: cfg, meta: testMeta(), queryAddr: testMaster}
+	// guards is populated exactly as the production constructor does. Leaving it
+	// nil made every risk test take the cfg fallback path instead of the one
+	// production uses, so the gates were being tested through a door real callers
+	// never open — and the snapshot's slice-isolation property silently did not
+	// hold under test.
+	return &Client{cfg: cfg, guards: guardConfigFrom(cfg), meta: testMeta(), queryAddr: testMaster}
 }
 
 // newTestClient builds a full Client wired to an httptest server (no real

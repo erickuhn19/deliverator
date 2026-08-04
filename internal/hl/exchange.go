@@ -14,14 +14,27 @@ import (
 	"time"
 )
 
+// poster is the pipe a signed action travels down. httpTransport and
+// wsTransport both satisfy it, and NOTHING above this line knows which is in
+// use: the signing, nonce and envelope logic is transport-agnostic, which is
+// what makes swapping the pipe safe.
+type poster interface {
+	post(ctx context.Context, path string, payload any) ([]byte, error)
+	// base is the REST endpoint this transport ultimately talks to. Needed
+	// because mainnet-vs-testnet decisions (builder-fee attachment) key off it,
+	// and those must not change when the pipe does.
+	base() string
+}
+
 type Exchange struct {
-	transport    *httpTransport
+	transport    poster
 	privateKey   *ecdsa.PrivateKey
 	vault        string
 	accountAddr  string
 	info         *Info
 	expiresAfter *int64
 	lastNonce    atomic.Int64
+	useWS        bool
 
 	clientOpts []ClientOpt
 }
@@ -42,7 +55,14 @@ func NewExchange(
 	for _, opt := range opts {
 		opt(ex)
 	}
-	ex.transport = newTransport(baseURL, ex.clientOpts...)
+	ht := newTransport(baseURL, ex.clientOpts...)
+	ex.transport = ht
+	if ex.useWS {
+		// Signed actions go over the socket; everything else keeps the HTTP path.
+		// Opt-in only — the default must stay HTTP so a socket problem can never
+		// be something an operator gets by upgrading.
+		ex.transport = newWSTransport(baseURL, ht)
+	}
 	// Forward the same client options (custom *http.Client / timeout) to the
 	// inner read client — the Exchange reads through it (SlippagePrice, MarketClose).
 	ex.info = NewInfo(ctx, baseURL, true, meta, spotMeta, perpDexs, InfoOptClientOptions(ex.clientOpts...))
@@ -52,7 +72,7 @@ func NewExchange(
 // Info returns the read client backing this exchange.
 func (e *Exchange) Info() *Info { return e.info }
 
-func (e *Exchange) isMainnet() bool { return e.transport.baseURL == MainnetAPIURL }
+func (e *Exchange) isMainnet() bool { return e.transport.base() == MainnetAPIURL }
 
 // nextNonce returns a strictly-increasing millisecond nonce (CAS-guarded so
 // concurrent callers never collide).
@@ -141,4 +161,24 @@ func (e *Exchange) postAction(ctx context.Context, action any, signature Signatu
 		payload["expiresAfter"] = *e.expiresAfter
 	}
 	return e.transport.post(ctx, "/exchange", payload)
+}
+
+// ExchangeOptWebsocket routes SIGNED ACTIONS over the websocket instead of REST.
+// Reads are unaffected — they are idempotent and are not what the per-IP weight
+// budget needs protecting from.
+//
+// OFF BY DEFAULT, and it must stay that way. An operator should never acquire a
+// new failure mode by upgrading; turning this on is a decision, made once, in
+// config. See ws_transport.go for why an unknown outcome on this path must be
+// resolved by reading rather than resending.
+func ExchangeOptWebsocket(on bool) ExchangeOpt {
+	return func(e *Exchange) { e.useWS = on }
+}
+
+// Close releases a websocket transport if one is in use, waking any in-flight
+// caller as unknown-outcome. A no-op on the HTTP path.
+func (e *Exchange) Close() {
+	if w, ok := e.transport.(*wsTransport); ok {
+		w.Close()
+	}
 }

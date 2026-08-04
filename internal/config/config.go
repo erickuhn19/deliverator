@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -72,93 +71,17 @@ type Config struct {
 	// opts in (mirrors PerpDexs).
 	Outcomes bool `toml:"outcomes,omitempty"`
 
-	// MM is the HIP-4 outcome market-maker (outcome-mm binary) configuration. It is
-	// a POINTER so the default deliverator config is byte-for-byte unchanged: nil =
-	// absent, omitted on Save, so an operator who never runs the MM never grows an
-	// [mm] block. The outcome-mm binary fills defaults via MMOrDefault when the table
-	// is absent. Every knob here is strategy/compute-shaping — the hard money
-	// backstops remain the account-wide [risk] gates, which DO bind outcome coins.
-	MM *MM `toml:"mm,omitempty"`
+	// Transport selects the pipe SIGNED ACTIONS travel down: "http" (default) or
+	// "ws". Reads are unaffected either way.
+	//
+	// REST order entry shares Hyperliquid's per-IP weight budget with market
+	// data, so placements compete with the very feed that decides where to place
+	// them. The socket does not. It only pays off in a LONG-LIVED process
+	// (`deliverator serve`, watch, chase) — a one-shot CLI invocation pays a
+	// handshake HTTP does not, which is why the default stays http.
+	Transport string `toml:"transport,omitempty"`
 
 	path string // resolved source path, for diagnostics
-}
-
-// MM configures the outcome market maker. See spec §5/§8.
-type MM struct {
-	// Enabled is the master switch for live quoting. Off (default) means the daemon
-	// runs read-only/shadow even without --dry-run. DryRun forces shadow regardless.
-	Enabled         bool `toml:"enabled"`
-	DryRun          bool `toml:"dry_run"`           // shadow: compute + render quotes, never sign
-	QuoteIntervalMs int  `toml:"quote_interval_ms"` // fast active-set requote cadence
-
-	Selection MMSelection `toml:"selection"`
-	Strategy  MMStrategy  `toml:"strategy"`
-	Arb       MMArb       `toml:"arb"`
-	Settle    MMSettle    `toml:"settle"`
-	Fees      MMFees      `toml:"fees"`
-}
-
-// MMSelection ranks the outcome universe into the active quote set (spec §5).
-type MMSelection struct {
-	MaxActiveMarkets     int      `toml:"max_active_markets"`    // top-N quoted at once (bounded by margin + rate budget)
-	MinTTLMins           int      `toml:"min_ttl_mins"`          // drop markets expiring sooner (adverse selection / blackout)
-	MaxTTLMins           int      `toml:"max_ttl_mins"`          // drop very-far expiries; 0 = no upper band
-	ScanIntervalSecs     int      `toml:"scan_interval_secs"`    // slow candidate-scan cadence (read-heavy)
-	PriceableUnderlyings []string `toml:"priceable_underlyings"` // v1 can price these (live mark + vol), e.g. ["BTC","ETH","HYPE"]
-	Pins                 []string `toml:"pins"`                  // always-quote "#<enc>" coins (operator override)
-	Blacklist            []string `toml:"blacklist"`             // never-quote "#<enc>" coins
-
-	// Composite score = P·(w_liquidity·L + w_spread·S + w_confidence·C); weights sum≈1.
-	WLiquidity  float64 `toml:"w_liquidity"`
-	WSpread     float64 `toml:"w_spread"`
-	WConfidence float64 `toml:"w_confidence"`
-	WVolume     float64 `toml:"w_volume"` // within L: volume sub-weight
-	WDepth      float64 `toml:"w_depth"`  // within L: two-sided-depth sub-weight
-
-	VolSat           float64 `toml:"vol_sat"`           // $ notional above which more volume doesn't help
-	DepthRef         float64 `toml:"depth_ref"`         // $ two-sided depth mapped to L_d=1
-	SpreadRef        float64 `toml:"spread_ref"`        // book half-spread mapped to S=1
-	HalfSpreadFloor  float64 `toml:"half_spread_floor"` // min half-spread (covers fee-on-close + margin)
-	PlateauK         float64 `toml:"plateau_k"`         // >1 broadens the mid-probability confidence plateau
-	MinL             float64 `toml:"min_l"`             // eligibility floors: a zero on any core axis excludes
-	MinS             float64 `toml:"min_s"`
-	MinC             float64 `toml:"min_c"`
-	HysteresisMargin float64 `toml:"hysteresis_margin"`  // must beat the Nth incumbent by this to displace
-	DropThreshold    float64 `toml:"drop_threshold"`     // an active market is dropped once score falls below this
-	MaxPerUnderlying int     `toml:"max_per_underlying"` // diversification cap; 0 = no cap
-	MaxPerExpiry     int     `toml:"max_per_expiry"`     // diversification cap; 0 = no cap
-}
-
-// MMStrategy configures the inventory-skew PMM (spec §14 decision 2).
-type MMStrategy struct {
-	BaseSpread         float64 `toml:"base_spread"`          // half-spread in probability units (e.g. 0.02)
-	Levels             int     `toml:"levels"`               // ladder levels per side
-	LevelStep          float64 `toml:"level_step"`           // probability step between ladder levels
-	BaseSizeShares     int64   `toml:"base_size_shares"`     // integer shares at level 0
-	SizeStepShares     int64   `toml:"size_step_shares"`     // shares added per level out
-	InventorySkew      float64 `toml:"inventory_skew"`       // lean coefficient: skews p* against held inventory
-	MaxInventoryShares int64   `toml:"max_inventory_shares"` // per-market soft inventory cap (quote reducing side only past it)
-	MinEdge            float64 `toml:"min_edge"`             // minimum edge over fair required to quote a level
-	MidAnchorWeight    float64 `toml:"mid_anchor_weight"`    // 0..1: blend the quoting anchor toward the live book mid (0 ⇒ pure model fair, 1 ⇒ pure mid)
-	QuoteNoSide        bool    `toml:"quote_no_side"`        // also quote the sibling NO coin so the MM can be two-sided/neutral while flat (buy NO = short YES)
-	NoSideMinPrice     float64 `toml:"no_side_min_price"`    // only quote the NO side when its price ≥ this (skip ultra-thin tails where the $10 min forces a lopsided leg)
-}
-
-// MMArb configures the cross-book YES/NO scanner (spec §5, engages independent of selection).
-type MMArb struct {
-	Enabled       bool    `toml:"enabled"`
-	MinEdge       float64 `toml:"min_edge"`        // required 1 − YES_ask − NO_ask − costs
-	MaxSizeShares int64   `toml:"max_size_shares"` // cap per arb capture
-}
-
-// MMSettle configures settlement/expiry handling (operator decision: blackout + hold-to-settle).
-type MMSettle struct {
-	BlackoutMins int `toml:"blackout_mins"` // cancel quotes + place none this many mins before expiry; hold residual to auto-settle
-}
-
-// MMFees feeds the fee-on-close cost model (HIP-4 charges on close/burn/settle, not open).
-type MMFees struct {
-	CloseFeeBps float64 `toml:"close_fee_bps"` // estimated close fee (bps of notional); 0 = model no fee (rely on half_spread_floor)
 }
 
 // Wallet — the query target (master). The agent signing key lives ONLY in the OS
@@ -323,233 +246,6 @@ func Default() *Config {
 	}
 }
 
-// DefaultMM returns the outcome-mm defaults. It is deliberately SAFE by default:
-// Enabled=false and DryRun=true, so a freshly-started daemon computes and renders
-// quotes but never signs until the operator explicitly sets mm.enabled=true and
-// mm.dry_run=false. All numeric knobs are conservative starting points meant to be
-// tuned against live fills.
-func DefaultMM() *MM {
-	return &MM{
-		Enabled: false,
-		DryRun:  true,
-		// 3s: each tick reads Portfolio + a per-market book; 1s blew the exchange's
-		// per-IP read-weight budget (429s). Fair value only moves on the scan cadence
-		// anyway, so a few-second requote is plenty responsive for outcome markets.
-		QuoteIntervalMs: 3000,
-		Selection: MMSelection{
-			MaxActiveMarkets:     6,
-			MinTTLMins:           30,  // inside 30m of expiry we don't open (blackout territory)
-			MaxTTLMins:           0,   // no upper band by default
-			ScanIntervalSecs:     300, // 5-min candidate scan
-			PriceableUnderlyings: []string{"BTC", "ETH", "HYPE"},
-			WLiquidity:           0.40,
-			WSpread:              0.30,
-			WConfidence:          0.30,
-			WVolume:              0.60,
-			WDepth:               0.40,
-			VolSat:               100_000,
-			DepthRef:             5_000,
-			SpreadRef:            0.05,
-			HalfSpreadFloor:      0.01,
-			PlateauK:             2.0,
-			MinL:                 0.05,
-			MinS:                 0.05,
-			MinC:                 0.05,
-			HysteresisMargin:     0.05,
-			DropThreshold:        0.10,
-			MaxPerUnderlying:     3,
-			MaxPerExpiry:         3,
-		},
-		Strategy: MMStrategy{
-			BaseSpread:         0.02,
-			Levels:             3,
-			LevelStep:          0.01,
-			BaseSizeShares:     10,
-			SizeStepShares:     5,
-			InventorySkew:      0.50,
-			MaxInventoryShares: 500,
-			MinEdge:            0.005,
-			MidAnchorWeight:    0.70, // mostly straddle the live market (model too noisy per-coin on liquid books); 1 → pure market-neutral, 0 → trust the model
-			QuoteNoSide:        true, // two-sided while flat: express "short YES" by buying the sibling NO coin
-			NoSideMinPrice:     0.10, // skip NO-quoting on ultra-deep-ITM (NO<0.10) where the $10 min forces a lopsided tail leg
-		},
-		Arb: MMArb{
-			// Off by default: the two IOC legs are NOT atomic on the venue, so a
-			// one-leg fill leaves a naked directional outcome position. Opt in only
-			// once you accept that (and ideally size it small).
-			Enabled:       false,
-			MinEdge:       0.005,
-			MaxSizeShares: 100,
-		},
-		Settle: MMSettle{BlackoutMins: 15},
-		Fees:   MMFees{CloseFeeBps: 0},
-	}
-}
-
-// MMOrDefault returns the configured [mm] table, or the full DefaultMM when the
-// operator supplied none. The returned pointer is always non-nil, so the outcome-mm
-// binary can read knobs without a nil guard.
-func (c *Config) MMOrDefault() *MM {
-	if c.MM != nil {
-		return c.MM
-	}
-	return DefaultMM()
-}
-
-// IsMMKey reports whether key names an [mm] table field ("mm." prefix). Used by the
-// CLI's `config set` to route to SetMMKey.
-func IsMMKey(key string) bool { return strings.HasPrefix(key, "mm.") }
-
-// SetMMKey sets a single [mm] table value from its string form. It is defined here
-// (not in package cmd like setConfigKey) because the SEPARATE outcome-mm binary and
-// its TUI need the same guarded edit and cannot reach package cmd. When [mm] is
-// absent it is first seeded from DefaultMM so a single `config set mm.enabled true`
-// yields a fully-sane table (not an all-zero one). The caller Validates + Saves.
-func (c *Config) SetMMKey(key, val string) error {
-	if c.MM == nil {
-		c.MM = DefaultMM()
-	}
-	m := c.MM
-	atoi := func() (int, error) { return strconv.Atoi(strings.TrimSpace(val)) }
-	atoi64 := func() (int64, error) { return strconv.ParseInt(strings.TrimSpace(val), 10, 64) }
-	atof := func() (float64, error) { return strconv.ParseFloat(strings.TrimSpace(val), 64) }
-	atob := func() (bool, error) { return strconv.ParseBool(strings.TrimSpace(val)) }
-	list := func() []string {
-		if strings.TrimSpace(val) == "" {
-			return nil
-		}
-		parts := strings.Split(val, ",")
-		out := parts[:0]
-		for _, p := range parts {
-			if p = strings.TrimSpace(p); p != "" {
-				out = append(out, p)
-			}
-		}
-		return out
-	}
-	setF := func(dst *float64) error {
-		f, err := atof()
-		if err == nil {
-			*dst = f
-		}
-		return err
-	}
-	setI := func(dst *int) error {
-		n, err := atoi()
-		if err == nil {
-			*dst = n
-		}
-		return err
-	}
-	setI64 := func(dst *int64) error {
-		n, err := atoi64()
-		if err == nil {
-			*dst = n
-		}
-		return err
-	}
-	setB := func(dst *bool) error {
-		b, err := atob()
-		if err == nil {
-			*dst = b
-		}
-		return err
-	}
-
-	switch key {
-	case "mm.enabled":
-		return setB(&m.Enabled)
-	case "mm.dry_run":
-		return setB(&m.DryRun)
-	case "mm.quote_interval_ms":
-		return setI(&m.QuoteIntervalMs)
-	case "mm.selection.max_active_markets":
-		return setI(&m.Selection.MaxActiveMarkets)
-	case "mm.selection.min_ttl_mins":
-		return setI(&m.Selection.MinTTLMins)
-	case "mm.selection.max_ttl_mins":
-		return setI(&m.Selection.MaxTTLMins)
-	case "mm.selection.scan_interval_secs":
-		return setI(&m.Selection.ScanIntervalSecs)
-	case "mm.selection.priceable_underlyings":
-		m.Selection.PriceableUnderlyings = list()
-		return nil
-	case "mm.selection.pins":
-		m.Selection.Pins = list()
-		return nil
-	case "mm.selection.blacklist":
-		m.Selection.Blacklist = list()
-		return nil
-	case "mm.selection.w_liquidity":
-		return setF(&m.Selection.WLiquidity)
-	case "mm.selection.w_spread":
-		return setF(&m.Selection.WSpread)
-	case "mm.selection.w_confidence":
-		return setF(&m.Selection.WConfidence)
-	case "mm.selection.w_volume":
-		return setF(&m.Selection.WVolume)
-	case "mm.selection.w_depth":
-		return setF(&m.Selection.WDepth)
-	case "mm.selection.vol_sat":
-		return setF(&m.Selection.VolSat)
-	case "mm.selection.depth_ref":
-		return setF(&m.Selection.DepthRef)
-	case "mm.selection.spread_ref":
-		return setF(&m.Selection.SpreadRef)
-	case "mm.selection.half_spread_floor":
-		return setF(&m.Selection.HalfSpreadFloor)
-	case "mm.selection.plateau_k":
-		return setF(&m.Selection.PlateauK)
-	case "mm.selection.min_l":
-		return setF(&m.Selection.MinL)
-	case "mm.selection.min_s":
-		return setF(&m.Selection.MinS)
-	case "mm.selection.min_c":
-		return setF(&m.Selection.MinC)
-	case "mm.selection.hysteresis_margin":
-		return setF(&m.Selection.HysteresisMargin)
-	case "mm.selection.drop_threshold":
-		return setF(&m.Selection.DropThreshold)
-	case "mm.selection.max_per_underlying":
-		return setI(&m.Selection.MaxPerUnderlying)
-	case "mm.selection.max_per_expiry":
-		return setI(&m.Selection.MaxPerExpiry)
-	case "mm.strategy.base_spread":
-		return setF(&m.Strategy.BaseSpread)
-	case "mm.strategy.levels":
-		return setI(&m.Strategy.Levels)
-	case "mm.strategy.level_step":
-		return setF(&m.Strategy.LevelStep)
-	case "mm.strategy.base_size_shares":
-		return setI64(&m.Strategy.BaseSizeShares)
-	case "mm.strategy.size_step_shares":
-		return setI64(&m.Strategy.SizeStepShares)
-	case "mm.strategy.inventory_skew":
-		return setF(&m.Strategy.InventorySkew)
-	case "mm.strategy.max_inventory_shares":
-		return setI64(&m.Strategy.MaxInventoryShares)
-	case "mm.strategy.min_edge":
-		return setF(&m.Strategy.MinEdge)
-	case "mm.strategy.mid_anchor_weight":
-		return setF(&m.Strategy.MidAnchorWeight)
-	case "mm.strategy.quote_no_side":
-		return setB(&m.Strategy.QuoteNoSide)
-	case "mm.strategy.no_side_min_price":
-		return setF(&m.Strategy.NoSideMinPrice)
-	case "mm.arb.enabled":
-		return setB(&m.Arb.Enabled)
-	case "mm.arb.min_edge":
-		return setF(&m.Arb.MinEdge)
-	case "mm.arb.max_size_shares":
-		return setI64(&m.Arb.MaxSizeShares)
-	case "mm.settle.blackout_mins":
-		return setI(&m.Settle.BlackoutMins)
-	case "mm.fees.close_fee_bps":
-		return setF(&m.Fees.CloseFeeBps)
-	}
-	return fmt.Errorf("unknown config key %q", key)
-}
-
 // Dir is the config/state directory: $DELIVERATOR_HOME or ~/.config/deliverator.
 func Dir() string {
 	if d := os.Getenv("DELIVERATOR_HOME"); d != "" {
@@ -606,19 +302,6 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config %s has unknown key(s): %s — fix the spelling; a mistyped key is ignored, so its setting (e.g. a risk cap) would NOT take effect",
 			path, strings.Join(stray, ", "))
 	}
-	// The [mm] table is a POINTER that starts nil, so unlike the value sub-structs it
-	// does NOT inherit Default() under overlay — a PARTIAL [mm] would leave absent
-	// sub-keys at Go zero (broken weights/sizes). Re-decode just the mm subtree over a
-	// full DefaultMM so a partial table inherits defaults, matching how risk.* behaves.
-	if md.IsDefined("mm") {
-		seed := struct {
-			MM *MM `toml:"mm"`
-		}{MM: DefaultMM()}
-		if _, derr := toml.Decode(string(b), &seed); derr != nil {
-			return nil, fmt.Errorf("parse config %s: %w", path, derr)
-		}
-		cfg.MM = seed.MM
-	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -634,16 +317,42 @@ var deprecatedKeys = map[string]bool{
 	"wallet.agent_key_file":   true,
 }
 
+// deprecatedPrefixes are whole removed TABLES. A prefix rather than a key list
+// because [mm] had ~45 leaf keys, and enumerating them would be a maintenance
+// trap that drifts from a struct which no longer exists to check against.
+//
+// This is load-bearing, not tidiness. The strict unknown-key check exists to
+// catch TYPOS — a mistyped risk cap that silently fails to apply. An obsolete
+// table from a REMOVED FEATURE is a different thing, and treating it as a typo
+// turns a feature removal into an outage: with [mm] still present in the
+// operator's config, every command failed to load, including the read-only ones
+// a running recorder depends on. Removing a feature must not brick the configs
+// that mention it.
+var deprecatedPrefixes = []string{
+	"mm", // the outcome-mm daemon; the market maker moved out of this CLI
+}
+
 // undecodedKeys returns the TOML keys present in the file that map to no config
 // field, excluding the known-deprecated set.
 func undecodedKeys(md toml.MetaData) []string {
 	var out []string
 	for _, k := range md.Undecoded() {
-		if s := k.String(); !deprecatedKeys[s] {
-			out = append(out, s)
+		s := k.String()
+		if deprecatedKeys[s] || hasDeprecatedPrefix(s) {
+			continue
 		}
+		out = append(out, s)
 	}
 	return out
+}
+
+func hasDeprecatedPrefix(key string) bool {
+	for _, p := range deprecatedPrefixes {
+		if key == p || strings.HasPrefix(key, p+".") {
+			return true
+		}
+	}
+	return false
 }
 
 var hexAddr = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
@@ -654,6 +363,11 @@ func (c *Config) Validate() error {
 	case NetworkMainnet, NetworkTestnet:
 	default:
 		return fmt.Errorf("network must be %q or %q, got %q", NetworkMainnet, NetworkTestnet, c.Network)
+	}
+	switch c.Transport {
+	case "", "http", "ws":
+	default:
+		return fmt.Errorf("transport must be \"http\" or \"ws\", got %q", c.Transport)
 	}
 	if c.Wallet.MasterAddress != "" && !hexAddr.MatchString(c.Wallet.MasterAddress) {
 		return fmt.Errorf("wallet.master_address %q is not a 0x-prefixed 40-hex address", c.Wallet.MasterAddress)
@@ -768,74 +482,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Copy.DefaultScale < 0 || c.Copy.MinDiffUSD < 0 || c.Copy.MinLiqDistancePct < 0 || c.Copy.MaxLeverage < 0 || c.Copy.MaxOrdersPerCycle < 0 {
 		return fmt.Errorf("copy.* values must be >= 0")
-	}
-	if err := c.MM.validate(); err != nil {
-		return err
-	}
-	return nil
-}
-
-// validate checks the [mm] table. A nil MM (the default: no [mm] in the file) is
-// always valid — the outcome-mm binary substitutes DefaultMM. Method-on-pointer so
-// the nil receiver is handled here rather than at every call site.
-func (m *MM) validate() error {
-	if m == nil {
-		return nil
-	}
-	if m.QuoteIntervalMs < 0 {
-		return fmt.Errorf("mm.quote_interval_ms must be >= 0")
-	}
-	s := m.Selection
-	if s.MaxActiveMarkets < 0 {
-		return fmt.Errorf("mm.selection.max_active_markets must be >= 0")
-	}
-	if s.MinTTLMins < 0 || s.MaxTTLMins < 0 {
-		return fmt.Errorf("mm.selection.min_ttl_mins / max_ttl_mins must be >= 0")
-	}
-	if s.MaxTTLMins > 0 && s.MinTTLMins > 0 && s.MinTTLMins > s.MaxTTLMins {
-		return fmt.Errorf("mm.selection.min_ttl_mins (%d) must be <= max_ttl_mins (%d)", s.MinTTLMins, s.MaxTTLMins)
-	}
-	if s.ScanIntervalSecs < 0 {
-		return fmt.Errorf("mm.selection.scan_interval_secs must be >= 0")
-	}
-	for _, w := range []struct {
-		name string
-		val  float64
-	}{
-		{"w_liquidity", s.WLiquidity}, {"w_spread", s.WSpread}, {"w_confidence", s.WConfidence},
-		{"w_volume", s.WVolume}, {"w_depth", s.WDepth}, {"vol_sat", s.VolSat}, {"depth_ref", s.DepthRef},
-		{"spread_ref", s.SpreadRef}, {"half_spread_floor", s.HalfSpreadFloor}, {"plateau_k", s.PlateauK},
-		{"min_l", s.MinL}, {"min_s", s.MinS}, {"min_c", s.MinC}, {"hysteresis_margin", s.HysteresisMargin},
-		{"drop_threshold", s.DropThreshold},
-	} {
-		if w.val < 0 {
-			return fmt.Errorf("mm.selection.%s must be >= 0", w.name)
-		}
-	}
-	st := m.Strategy
-	if st.BaseSpread < 0 || st.LevelStep < 0 || st.MinEdge < 0 || st.InventorySkew < 0 {
-		return fmt.Errorf("mm.strategy.{base_spread,level_step,min_edge,inventory_skew} must be >= 0")
-	}
-	if st.Levels < 0 || st.BaseSizeShares < 0 || st.SizeStepShares < 0 || st.MaxInventoryShares < 0 {
-		return fmt.Errorf("mm.strategy.{levels,base_size_shares,size_step_shares,max_inventory_shares} must be >= 0")
-	}
-	if st.BaseSpread >= 1 {
-		return fmt.Errorf("mm.strategy.base_spread (%.4f) must be < 1 (probability units)", st.BaseSpread)
-	}
-	if st.MidAnchorWeight < 0 || st.MidAnchorWeight > 1 {
-		return fmt.Errorf("mm.strategy.mid_anchor_weight (%.4f) must be in [0,1]", st.MidAnchorWeight)
-	}
-	if st.NoSideMinPrice < 0 || st.NoSideMinPrice >= 1 {
-		return fmt.Errorf("mm.strategy.no_side_min_price (%.4f) must be in [0,1)", st.NoSideMinPrice)
-	}
-	if m.Arb.MinEdge < 0 || m.Arb.MaxSizeShares < 0 {
-		return fmt.Errorf("mm.arb.{min_edge,max_size_shares} must be >= 0")
-	}
-	if m.Settle.BlackoutMins < 0 {
-		return fmt.Errorf("mm.settle.blackout_mins must be >= 0")
-	}
-	if m.Fees.CloseFeeBps < 0 {
-		return fmt.Errorf("mm.fees.close_fee_bps must be >= 0")
 	}
 	return nil
 }
