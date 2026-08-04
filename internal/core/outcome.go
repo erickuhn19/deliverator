@@ -37,6 +37,7 @@ func (m *MetaStore) addOutcomesLocked(om *hl.OutcomeMeta) {
 		return
 	}
 	m.outcomeMeta = om
+	m.outcomeFetchedAt = time.Now()
 
 	// Retire the previous universe. Coins that rolled out must stop resolving:
 	// leaving them in byCoin lets an order price against a market that no longer

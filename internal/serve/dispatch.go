@@ -74,6 +74,14 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 	if !resp.OK && resp.Error != nil && resp.Error.Category == "risk" {
 		resp.Error.Message += fmt.Sprintf(" [enforcing %s]", s.eng.GuardGeneration())
 	}
+	// AN UNKNOWN COIN MUST NAME THE UNIVERSE IT WAS RESOLVED AGAINST. This is the
+	// error that ran for 13 hours on 2026-08-04 saying only "coin #10070 not found
+	// in info" — true, unhelpful, and identical whether the coin was bogus or the
+	// process was a roll behind. With the generation attached, "listed today" vs
+	// "universe fetched yesterday" is a one-line read (#45).
+	if !resp.OK && resp.Error != nil && resp.Error.Code == "unknown_coin" {
+		resp.Error.Message += fmt.Sprintf(" [%s]", s.eng.UniverseGeneration())
+	}
 	return resp
 }
 
@@ -133,8 +141,12 @@ var handlers = map[string]handler{
 	// ping is the handshake: it proves the socket is a deliverator server of a
 	// known schema before a bot sends anything that signs.
 	"ping": func(s *Server, _ context.Context, req Request) Response {
+		// A supervising bot can assert universe/config freshness here rather than
+		// discovering staleness by provoking a rejection.
 		return s.ok(req.ID, "ping", map[string]any{
 			"schema": output.SchemaVersion, "methods": Methods,
+			"universe_generation": s.eng.UniverseGeneration(),
+			"config_generation":   s.eng.GuardGeneration(),
 		}, nil)
 	},
 

@@ -860,3 +860,47 @@ func (c *Client) MeasureSkew(ctx context.Context) (int64, error) {
 func (c *Client) writeWarnings() []string {
 	return append(c.signerWarnings(), c.metaStaleWarnings()...)
 }
+
+// UniverseGeneration names the HIP-4 universe the engine is currently enforcing,
+// and — critically — whether the SIGNER agrees with it.
+//
+// The stamp alone would be a half-measure. #43 was precisely a case where the
+// meta store and the signer's hl.Info held DIFFERENT universes: the read path
+// resolved a rolled-to coin, the order passed every gate, got signed, and then
+// died at "coin not found in info" (exit 50, non-retryable). Reporting the meta
+// store's view while the signer holds another would have described that outage as
+// healthy. So this cross-checks the two resolvers and says so when they disagree.
+//
+// Before the first write there is no signer to check, which is reported honestly
+// rather than as agreement.
+func (c *Client) UniverseGeneration() string {
+	if c.meta == nil {
+		return "universe not loaded"
+	}
+	stamp := c.meta.UniverseStamp()
+
+	c.exMu.Lock()
+	ex := c.ex
+	c.exMu.Unlock()
+	if ex == nil {
+		return stamp.String() + ", signer not yet built"
+	}
+
+	// Every coin the read path resolves must also resolve on the signer.
+	info := ex.Info()
+	var missing []string
+	for _, coin := range c.meta.OutcomeCoins() {
+		if _, ok := info.CoinToAsset(strings.ToUpper(coin)); !ok {
+			missing = append(missing, coin)
+			if len(missing) >= 3 {
+				break
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return stamp.String() + ", signer in sync"
+	}
+	return fmt.Sprintf("%s, SIGNER OUT OF SYNC — %s do not resolve for signing "+
+		"(an order on them would pass the gates, get signed, then be rejected exit 50)",
+		stamp.String(), strings.Join(missing, ", "))
+}
