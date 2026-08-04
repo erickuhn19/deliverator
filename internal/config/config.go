@@ -119,9 +119,27 @@ type Risk struct {
 	MaxNetExposureUSD          float64 `toml:"max_net_exposure_usd"`           // 0 = off; |signed long − short|
 	MaxConcentrationPctPerCoin float64 `toml:"max_concentration_pct_per_coin"` // 0 = off; |coin notional| / equity * 100
 	MaxDrawdownPct             float64 `toml:"max_drawdown_pct"`               // 0 = off; (peak − equity) / peak * 100
-	MaxDailyLossUSD            float64 `toml:"max_daily_loss_usd"`             // 0 = off; (UTC-day anchor − equity) USD
-	MaxDailyLossPct            float64 `toml:"max_daily_loss_pct"`             // 0 = off; (anchor − equity) / anchor * 100
-	MaxOpenPositions           int     `toml:"max_open_positions"`             // 0 = off; cap on the number of concurrent open positions
+	// DrawdownWindowDays bounds WHICH peak max_drawdown_pct measures from.
+	// 0 = the all-time high-water mark (the original behaviour, unchanged).
+	//
+	// An all-time anchor permanently re-litigates history: once a real loss is
+	// realized and accepted, the gate stops asking "is this period going wrong"
+	// and its only steady states are strangling the account or being switched off.
+	// A live account sat at 98.7% utilization with $1.52 of losable equity and the
+	// only escape was setting the cap to 100 — i.e. disabling the ruin backstop
+	// entirely, which is strictly worse than a well-anchored one. A trailing window
+	// (e.g. 7 or 30) keeps a real floor that forgives acknowledged history. See #39.
+	//
+	// NOT RETROACTIVE. The trailing peak is computed from a per-UTC-day equity
+	// series that only starts accumulating once a build carrying it has run, and
+	// with no series the window falls back to the all-time peak (fail safe, never
+	// fail open). So a freshly-configured window behaves exactly like today's
+	// anchor and only diverges as history builds — to release an ALREADY-STRANDED
+	// anchor immediately, use `deliverator risk reset-anchor --yes`.
+	DrawdownWindowDays int     `toml:"drawdown_window_days"`
+	MaxDailyLossUSD    float64 `toml:"max_daily_loss_usd"` // 0 = off; (UTC-day anchor − equity) USD
+	MaxDailyLossPct    float64 `toml:"max_daily_loss_pct"` // 0 = off; (anchor − equity) / anchor * 100
+	MaxOpenPositions   int     `toml:"max_open_positions"` // 0 = off; cap on the number of concurrent open positions
 
 	// HIP-4 outcome-specific gates (enforced in core alongside the generic caps).
 	// Both default 0 = off, keeping the safe baseline unchanged. They apply to
@@ -441,6 +459,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Risk.MaxDrawdownPct > 100 || c.Risk.MaxDailyLossPct > 100 {
 		return fmt.Errorf("risk.max_drawdown_pct / risk.max_daily_loss_pct are percentages in [0,100]")
+	}
+	if c.Risk.DrawdownWindowDays < 0 || c.Risk.DrawdownWindowDays > 3650 {
+		return fmt.Errorf("risk.drawdown_window_days must be 0 (all-time peak) or 1..3650 days")
 	}
 	if c.Risk.MaxOpenPositions < 0 {
 		return fmt.Errorf("risk.max_open_positions must be >= 0 (0 = off)")

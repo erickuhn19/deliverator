@@ -2,10 +2,12 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/erickuhn19/deliverator/internal/config"
+	"github.com/erickuhn19/deliverator/internal/output"
 )
 
 // RiskCap is one configured risk-envelope limit plus, where measurable, the live
@@ -47,6 +49,22 @@ type RiskView struct {
 	DailyLossPct   float64          `json:"daily_loss_pct"`
 	RiskStateFound bool             `json:"risk_state_found"`
 	Halted         bool             `json:"halted"`
+
+	// Drawdown-anchor provenance (#39). DrawdownWindowDays is 0 for the all-time
+	// high-water mark. The reset fields are present only once the anchor has been
+	// re-based, so an operator can see that the current floor is a re-based one,
+	// when it happened, and what it superseded — a reset reduces protection and
+	// must not be invisible afterwards.
+	DrawdownWindowDays int     `json:"drawdown_window_days,omitempty"`
+	DrawdownAnchor     string  `json:"drawdown_anchor"` // "all-time peak" | "N-day trailing peak"
+	PeakResetCount     int     `json:"peak_reset_count,omitempty"`
+	PeakResetAtMs      int64   `json:"peak_reset_at_ms,omitempty"`
+	PrevPeakEquity     string  `json:"prev_peak_equity,omitempty"`
+	DrawdownUtilPct    float64 `json:"drawdown_util_pct,omitempty"` // dd as a % of the cap
+	// Warnings carries operator-facing notes about the envelope itself — notably
+	// that an all-time-anchored drawdown gate near its cap is effectively a
+	// standing halt whose only escapes are re-anchoring or disabling it.
+	Warnings []string `json:"warnings,omitempty"`
 	// Degraded/DegradedDexs carry the source portfolio's partial-read markers
 	// (NEXT-2 item 1): when set, equity/utilization above were computed from an
 	// INCOMPLETE book (the gates themselves refuse to act on it — fail closed).
@@ -86,10 +104,6 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 	// Include resting non-reduce-only orders' worst-case adds, so the view shows
 	// exactly the utilization the gates enforce (they count resting orders too).
 	m := computePortfolioMetrics(perCoin, pendingAddsFromOrders(pf.OpenOrders))
-	// The drawdown/daily-loss anchors are keyed per network+account (a testnet
-	// peak must never shadow a mainnet account, or one account another's).
-	st, ddPct, dlUSD, dlPct, found := ReadRiskState(c.network, c.queryAddr, equity)
-
 	// Read caps from disk, not the in-memory snapshot: a long-running console (and
 	// `risk` after a `config set`) must reflect edits to config.toml. The client's
 	// c.cfg is only the startup load. Falls back to the snapshot if there's no file.
@@ -110,6 +124,13 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 			perpDexs = fresh.PerpDexs
 		}
 	}
+
+	// The drawdown/daily-loss anchors are keyed per network+account (a testnet
+	// peak must never shadow a mainnet account, or one account another's). Read
+	// AFTER the on-disk caps are resolved, so the window this measures with is the
+	// same one the gates will enforce — a monitor and an enforcer disagreeing
+	// about the anchor is the shape that hid a two-day outage (#41).
+	st, ddPct, dlUSD, dlPct, found := ReadRiskState(c.network, c.queryAddr, equity, r.DrawdownWindowDays)
 
 	f := func(v float64) *float64 { return &v }
 	mk := func(key, label, unit, value string, active bool, current *float64, capVal float64) RiskCap {
@@ -151,17 +172,47 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 		{Key: "automation.allowed_coins", Label: "Allowed coins", Type: "list", Value: strings.Join(allowedCoins, ",")},
 		{Key: "perp_dexs", Label: "Sub-dexes (HIP-3)", Type: "list", Value: strings.Join(perpDexs, ",")},
 	}
+	anchor := "all-time peak"
+	if r.DrawdownWindowDays > 0 {
+		anchor = fmt.Sprintf("%d-day trailing peak", r.DrawdownWindowDays)
+	}
+	var rvWarnings []string
+	var ddUtil float64
+	if r.MaxDrawdownPct > 0 {
+		ddUtil = ddPct / r.MaxDrawdownPct * 100
+		// The same warning the gate raises, so an operator reading `risk` sees the
+		// standing-halt risk BEFORE a rejection rather than after.
+		if ddUtil > 90 && r.DrawdownWindowDays <= 0 {
+			rvWarnings = append(rvWarnings, fmt.Sprintf(
+				"drawdown is at %.0f%% of the %.1f%% cap and the anchor is the ALL-TIME peak — this gate is "+
+					"effectively a standing halt. Escapes: `deliverator risk reset-anchor --yes` (re-base the peak "+
+					"to current equity) or risk.drawdown_window_days (make the peak trailing). Setting the cap to "+
+					"100 turns the ruin backstop OFF and is strictly worse than either",
+				ddUtil, r.MaxDrawdownPct))
+		}
+	}
+	if r.MaxDrawdownPct >= 100 {
+		rvWarnings = append(rvWarnings, "risk.max_drawdown_pct is 100 — THE RUIN BACKSTOP IS EFFECTIVELY OFF. "+
+			"Prefer a real cap plus risk.drawdown_window_days (a trailing peak) or a reset anchor")
+	}
 	return &RiskView{
-		Equity:         f2s(equity),
-		Caps:           caps,
-		Posture:        posture,
-		PeakEquity:     f2s(st.PeakEquity),
-		DrawdownPct:    ddPct,
-		DayAnchor:      f2s(st.DayAnchorEquity),
-		DailyLossUSD:   dlUSD,
-		DailyLossPct:   dlPct,
-		RiskStateFound: found,
-		Halted:         c.Halted(),
+		Equity:             f2s(equity),
+		Caps:               caps,
+		Posture:            posture,
+		PeakEquity:         f2s(st.PeakEquity),
+		DrawdownPct:        ddPct,
+		DayAnchor:          f2s(st.DayAnchorEquity),
+		DailyLossUSD:       dlUSD,
+		DailyLossPct:       dlPct,
+		RiskStateFound:     found,
+		Halted:             c.Halted(),
+		DrawdownWindowDays: r.DrawdownWindowDays,
+		DrawdownAnchor:     anchor,
+		DrawdownUtilPct:    ddUtil,
+		PeakResetCount:     st.PeakResetCount,
+		PeakResetAtMs:      st.PeakResetAtMs,
+		PrevPeakEquity:     f2sOmitZero(st.PrevPeakEquity),
+		Warnings:           rvWarnings,
 		// Carry the source portfolio's partial-read markers: equity/utilization
 		// above were computed from an incomplete book and must say so (NEXT-2
 		// item 1). Note this view is strictly READ-ONLY (ReadRiskState) — a
@@ -169,4 +220,67 @@ func (c *Client) RiskStatusFromPortfolio(pf *PortfolioView) *RiskView {
 		Degraded:     pf.Degraded,
 		DegradedDexs: pf.DegradedDexs,
 	}
+}
+
+// f2sOmitZero formats a float like f2s but yields "" for zero, so an anchor that
+// has never been re-based simply omits the field rather than claiming "0".
+func f2sOmitZero(v float64) string {
+	if v == 0 {
+		return ""
+	}
+	return f2s(v)
+}
+
+// ResetDrawdownAnchor re-bases the drawdown high-water mark to current equity.
+//
+// OPERATOR ACTION, NOT AN AGENT ONE. Re-basing the anchor reduces protection, so
+// it is gated on explicit confirmation, written to the audit trail, and reached
+// only from `deliverator risk reset-anchor` — never from the order path. A
+// trading loop that could move its own floor to unblock itself would not be a
+// risk gate at all.
+//
+// It reads equity through the normal portfolio path, which REFUSES a degraded
+// snapshot: re-anchoring off a partially-read book could set the floor from an
+// understated equity and silently deepen the real drawdown allowance.
+func (c *Client) ResetDrawdownAnchor(ctx context.Context, confirm bool) (*AnchorReset, error) {
+	if !confirm {
+		return nil, output.Validation("confirm_required",
+			"re-basing the drawdown anchor REDUCES protection: it forgives the drawdown measured so far and "+
+				"restarts the gate from today's equity").
+			WithHint("re-run with --yes if you are acknowledging a realized loss. Consider risk.drawdown_window_days " +
+				"instead for an ongoing policy — a trailing peak forgives history automatically and needs no manual step")
+	}
+	pf, err := c.Portfolio(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Fail closed on a partial read: an understated equity would set the new floor
+	// too low and quietly widen the real loss allowance.
+	if len(pf.Degraded) > 0 || len(pf.DegradedDexs) > 0 {
+		return nil, output.Network("degraded_equity",
+			"account equity was read from an INCOMPLETE book — refusing to re-anchor the drawdown gate from it").
+			Retry().WithHint("retry when the venue is answering fully; a floor set from understated equity would widen the real loss allowance")
+	}
+	equity := accountEquity(pf)
+	if equity <= 0 {
+		return nil, output.Validation("no_equity",
+			"account equity is 0 or unreadable — cannot re-anchor the drawdown gate").
+			WithHint("fund the account or set wallet.master_address")
+	}
+	res, err := ResetPeakAnchor(c.network, c.queryAddr, equity)
+	if err != nil {
+		return nil, output.Network("risk_state", "cannot re-anchor drawdown state: "+err.Error()).Retry()
+	}
+	// An audit record is the point: this is a safety-reducing operator action and
+	// must be reviewable after the fact.
+	c.audit.Append(map[string]any{
+		"action":           "risk_reset_anchor",
+		"network":          c.network,
+		"account":          riskStateComponent(c.queryAddr),
+		"prev_peak_equity": res.PrevPeakEquity,
+		"new_peak_equity":  res.NewPeakEquity,
+		"drawdown_was_pct": res.DrawdownWasPct,
+		"peak_reset_count": res.ResetCount,
+	})
+	return &res, nil
 }

@@ -334,10 +334,16 @@ func TestRiskStatusFromDegradedPortfolioIsReadOnlyAndMarked(t *testing.T) {
 	}
 }
 
-// Source-level pin: observeEquity (the ONLY writer of the drawdown/daily-loss
-// anchors) may be called from exactly one place — checkPortfolioGatesBook, which
-// sits behind portfolioEquitySnapshot's degraded-snapshot refusal. A new caller
-// must consciously update this test AND prove it cannot consume degraded equity.
+// Source-level pin: observeEquity — the only writer of the drawdown/daily-loss
+// anchors ON THE ORDER PATH — may be called from exactly one place,
+// checkPortfolioGatesBook, which sits behind portfolioEquitySnapshot's
+// degraded-snapshot refusal. A new caller must consciously update this test AND
+// prove it cannot consume degraded equity.
+//
+// There is exactly one OTHER writer of that state: ResetPeakAnchor, the
+// operator-only drawdown re-anchor (#39). It is pinned separately by
+// TestResetPeakAnchorIsOperatorOnly, which proves it stays off the order path —
+// an agent able to move its own floor would not be gated at all.
 func TestObserveEquityHasExactlyOneCaller(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {

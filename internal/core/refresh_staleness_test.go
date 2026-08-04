@@ -23,6 +23,13 @@ func newSignerInfo() *hl.Info {
 // Regression tests for #43: the reactive outcome refresh added by #37 duplicated
 // the universe on every reload, left rolled-out coins resolvable, and raced every
 // concurrent Lookup under `serve`.
+//
+// ON "THESE FAIL WITHOUT THE FIX": their ASSERTIONS fail against the pre-fix
+// logic — verified by compiling this file against it with the one line
+// referencing the new hl.Info.AssetDecimals removed. The file as it stands does
+// NOT compile on the pre-fix tree, because it uses API introduced with the fix.
+// The distinction matters: "fails on old code" and "does not build on old code"
+// are not the same claim, and only the first is evidence the test is load-bearing.
 
 // rollUniverse builds a one-question priceBucket universe like mainnet's daily
 // BTC range market, shaped after a live outcomeMeta response.
