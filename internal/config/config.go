@@ -71,6 +71,16 @@ type Config struct {
 	// opts in (mirrors PerpDexs).
 	Outcomes bool `toml:"outcomes,omitempty"`
 
+	// Transport selects the pipe SIGNED ACTIONS travel down: "http" (default) or
+	// "ws". Reads are unaffected either way.
+	//
+	// REST order entry shares Hyperliquid's per-IP weight budget with market
+	// data, so placements compete with the very feed that decides where to place
+	// them. The socket does not. It only pays off in a LONG-LIVED process
+	// (`deliverator serve`, watch, chase) — a one-shot CLI invocation pays a
+	// handshake HTTP does not, which is why the default stays http.
+	Transport string `toml:"transport,omitempty"`
+
 	path string // resolved source path, for diagnostics
 }
 
@@ -112,6 +122,23 @@ type Risk struct {
 	MaxDailyLossUSD            float64 `toml:"max_daily_loss_usd"`             // 0 = off; (UTC-day anchor − equity) USD
 	MaxDailyLossPct            float64 `toml:"max_daily_loss_pct"`             // 0 = off; (anchor − equity) / anchor * 100
 	MaxOpenPositions           int     `toml:"max_open_positions"`             // 0 = off; cap on the number of concurrent open positions
+
+	// HIP-4 outcome-specific gates (enforced in core alongside the generic caps).
+	// Both default 0 = off, keeping the safe baseline unchanged. They apply to
+	// outcome ("#<enc>") coins only; perp/spot orders are unaffected.
+	//
+	// OutcomeSettleBlackoutMins refuses to OPEN or ADD outcome exposure within this
+	// many minutes of a market's expiry (the adverse-selection window where informed
+	// flow picks off a resting quote just before resolution). A settled market is
+	// ALWAYS refused regardless of this knob. Exits (reduce-only/closing) stay allowed
+	// so a holding can be unwound. Fail-closed: if the window is set but the expiry
+	// can't be parsed, new exposure is refused.
+	OutcomeSettleBlackoutMins int `toml:"outcome_settle_blackout_mins"` // 0 = off
+	// MaxOutcomeQuestionNotionalUSD caps the total worst-case notional across every
+	// leg of one HIP-4 question — the Yes and No sides of a binary, and every outcome
+	// under a multi-outcome question, share one bucket. It backstops the per-coin
+	// concentration cap, which cannot see that two "#<enc>" coins are the same bet.
+	MaxOutcomeQuestionNotionalUSD float64 `toml:"max_outcome_question_notional_usd"` // 0 = off
 
 	// MaxPriorityBps caps the order-priority fee (faster sequencing, paid in HYPE
 	// from staking balance). Hyperliquid's hard max is 8 bps; a lower value limits
@@ -290,16 +317,42 @@ var deprecatedKeys = map[string]bool{
 	"wallet.agent_key_file":   true,
 }
 
+// deprecatedPrefixes are whole removed TABLES. A prefix rather than a key list
+// because [mm] had ~45 leaf keys, and enumerating them would be a maintenance
+// trap that drifts from a struct which no longer exists to check against.
+//
+// This is load-bearing, not tidiness. The strict unknown-key check exists to
+// catch TYPOS — a mistyped risk cap that silently fails to apply. An obsolete
+// table from a REMOVED FEATURE is a different thing, and treating it as a typo
+// turns a feature removal into an outage: with [mm] still present in the
+// operator's config, every command failed to load, including the read-only ones
+// a running recorder depends on. Removing a feature must not brick the configs
+// that mention it.
+var deprecatedPrefixes = []string{
+	"mm", // the outcome-mm daemon; the market maker moved out of this CLI
+}
+
 // undecodedKeys returns the TOML keys present in the file that map to no config
 // field, excluding the known-deprecated set.
 func undecodedKeys(md toml.MetaData) []string {
 	var out []string
 	for _, k := range md.Undecoded() {
-		if s := k.String(); !deprecatedKeys[s] {
-			out = append(out, s)
+		s := k.String()
+		if deprecatedKeys[s] || hasDeprecatedPrefix(s) {
+			continue
 		}
+		out = append(out, s)
 	}
 	return out
+}
+
+func hasDeprecatedPrefix(key string) bool {
+	for _, p := range deprecatedPrefixes {
+		if key == p || strings.HasPrefix(key, p+".") {
+			return true
+		}
+	}
+	return false
 }
 
 var hexAddr = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
@@ -310,6 +363,11 @@ func (c *Config) Validate() error {
 	case NetworkMainnet, NetworkTestnet:
 	default:
 		return fmt.Errorf("network must be %q or %q, got %q", NetworkMainnet, NetworkTestnet, c.Network)
+	}
+	switch c.Transport {
+	case "", "http", "ws":
+	default:
+		return fmt.Errorf("transport must be \"http\" or \"ws\", got %q", c.Transport)
 	}
 	if c.Wallet.MasterAddress != "" && !hexAddr.MatchString(c.Wallet.MasterAddress) {
 		return fmt.Errorf("wallet.master_address %q is not a 0x-prefixed 40-hex address", c.Wallet.MasterAddress)
@@ -386,6 +444,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Risk.MaxOpenPositions < 0 {
 		return fmt.Errorf("risk.max_open_positions must be >= 0 (0 = off)")
+	}
+	if c.Risk.OutcomeSettleBlackoutMins < 0 {
+		return fmt.Errorf("risk.outcome_settle_blackout_mins must be >= 0 (0 = off)")
+	}
+	if c.Risk.MaxOutcomeQuestionNotionalUSD < 0 {
+		return fmt.Errorf("risk.max_outcome_question_notional_usd must be >= 0 (0 = off)")
 	}
 	if c.Alerting.TimeoutSec < 0 {
 		return fmt.Errorf("alerting.timeout_sec must be >= 0 (0 = 5s default)")

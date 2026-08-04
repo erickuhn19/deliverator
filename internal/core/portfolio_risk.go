@@ -39,10 +39,94 @@ import (
 // portfolioGuardsActive reports whether any account-wide gate is configured. When
 // false the entire portfolio-check path is skipped (zero added latency / behavior).
 func (c *Client) portfolioGuardsActive() bool {
-	r := c.cfg.Risk
+	r := c.riskConfig()
 	return r.MaxAccountLeverage > 0 || r.MaxNetExposureUSD > 0 || r.MaxConcentrationPctPerCoin > 0 ||
 		r.MaxDrawdownPct > 0 || r.MaxDailyLossUSD > 0 || r.MaxDailyLossPct > 0 ||
 		r.MaxOpenPositions > 0
+}
+
+// outcomeQuestionCapActive reports whether the per-question outcome cap should run for
+// THIS invocation. Unlike the coin-agnostic gates, the cap governs only outcome coins,
+// so a non-outcome perp/spot order must not force the (fail-closed) account-state read
+// on its behalf — the cap is only relevant when at least one touched coin is an outcome
+// coin ("#<enc>"). This keeps a transient read failure from rejecting an unrelated order.
+func (c *Client) outcomeQuestionCapActive(deltas []exposureDelta) bool {
+	if c.riskConfig().MaxOutcomeQuestionNotionalUSD <= 0 {
+		return false
+	}
+	for _, d := range deltas {
+		if strings.HasPrefix(d.coin, "#") {
+			return true
+		}
+	}
+	return false
+}
+
+// outcomeQuestionKey groups outcome coins that are the SAME bet. A multi-outcome
+// question (Question != 0) buckets all its outcomes together; a standalone binary
+// (Question == 0) buckets only its own Yes/No pair, keyed on the Outcome id — so two
+// unrelated Question==0 binaries never merge into one phantom bucket. Non-outcome
+// coins return ("", false).
+func outcomeQuestionKey(mk Market) (string, string, bool) {
+	if !mk.IsOutcome {
+		return "", "", false
+	}
+	if mk.Question != 0 {
+		return "q:" + strconv.Itoa(mk.Question), mk.QuestionName, true
+	}
+	name := mk.QuestionName
+	if name == "" {
+		name = mk.Title
+	}
+	return "o:" + strconv.Itoa(mk.Outcome), name, true
+}
+
+// heaviestOutcomeQuestion folds the resulting book's worst-case per-coin notional
+// (positions + this order's delta + resting pending-adds) into per-question buckets
+// and returns the heaviest one. Each outcome coin is valued at the same worst case
+// the per-coin gate uses (max of |v + resting buys| and |v − resting sells|), so the
+// per-question cap is consistent with max_concentration_pct_per_coin — it just sums
+// the legs the per-coin view cannot see are one bet. Non-outcome coins are ignored.
+func (c *Client) heaviestOutcomeQuestion(resulting map[string]float64, pending map[string]pendingAdd) (label string, notional float64) {
+	byKey := map[string]float64{}
+	nameByKey := map[string]string{}
+	seen := map[string]bool{}
+	fold := func(coin string, v float64, p pendingAdd) {
+		mk, ok := c.meta.Lookup(coin)
+		if !ok {
+			return
+		}
+		key, name, isOutcome := outcomeQuestionKey(mk)
+		if !isOutcome {
+			return
+		}
+		worst := math.Max(absF(v+p.buy), absF(v-p.sell))
+		byKey[key] += worst
+		if _, ok := nameByKey[key]; !ok {
+			nameByKey[key] = name
+		}
+	}
+	for coin, v := range resulting {
+		seen[coin] = true
+		fold(coin, v, pending[coin])
+	}
+	// Coins with only resting orders (no position) still deploy capital toward the
+	// question — fold them too.
+	for coin, p := range pending {
+		if seen[coin] {
+			continue
+		}
+		fold(coin, 0, p)
+	}
+	for key, n := range byKey {
+		if n > notional {
+			notional, label = n, key
+			if nm := nameByKey[key]; nm != "" {
+				label = nm
+			}
+		}
+	}
+	return label, notional
 }
 
 // reduceOnlyFlipErr rejects a reduce-only order that cannot actually REDUCE the
@@ -121,6 +205,20 @@ func parseFloatSafe(s string) float64 {
 	return f
 }
 
+// parseRiskFloat is the fail-closed parser for values that feed a signing gate.
+// Read-only views may normalize malformed exchange strings to zero, but a risk
+// gate must distinguish a real zero from an unreadable value.
+func parseRiskFloat(field, s string) (float64, error) {
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		if err == nil {
+			err = fmt.Errorf("non-finite value")
+		}
+		return 0, fmt.Errorf("%s %q is invalid: %w", field, s, err)
+	}
+	return f, nil
+}
+
 // equityOf is the DEPRECATED max(perp account_value, available USDC collateral)
 // equity heuristic. Both inputs drop by the margin reserved when positions
 // open, understating a unified account's equity — the gates, margin_ratio, and
@@ -180,6 +278,88 @@ func accountEquity(pf *PortfolioView) float64 {
 	return usdc + av + outcomeValue
 }
 
+// accountEquityForRisk is accountEquity with strict parsing. It is deliberately
+// separate from the tolerant read-surface helper: malformed 200-response data
+// must reject new exposure, not turn into phantom zero equity/exposure.
+func accountEquityForRisk(pf *PortfolioView) (float64, error) {
+	var perpUPnL, outcomeValue float64
+	for _, p := range pf.Positions {
+		if _, err := parseRiskFloat("position size for "+p.Coin, p.Szi); err != nil {
+			return 0, err
+		}
+		if p.Class == "outcome" {
+			if p.MarkPx == "" {
+				return 0, fmt.Errorf("outcome mark for %s is unavailable", p.Coin)
+			}
+			mark, err := parseRiskFloat("outcome mark for "+p.Coin, p.MarkPx)
+			if err != nil {
+				return 0, err
+			}
+			if mark <= 0 || mark > 1 {
+				return 0, fmt.Errorf("outcome mark for %s %q is outside (0,1]", p.Coin, p.MarkPx)
+			}
+			v, err := parseRiskFloat("position value for "+p.Coin, p.PositionValue)
+			if err != nil {
+				return 0, err
+			}
+			if v < 0 {
+				return 0, fmt.Errorf("position value for %s %q is negative", p.Coin, p.PositionValue)
+			}
+			outcomeValue += v
+			if math.IsInf(outcomeValue, 0) || math.IsNaN(outcomeValue) {
+				return 0, fmt.Errorf("aggregate outcome position value is non-finite")
+			}
+			continue
+		}
+		pnl, err := parseRiskFloat("unrealized pnl for "+p.Coin, p.UnrealizedPnl)
+		if err != nil {
+			return 0, err
+		}
+		perpUPnL += pnl
+		if math.IsInf(perpUPnL, 0) || math.IsNaN(perpUPnL) {
+			return 0, fmt.Errorf("aggregate perp unrealized pnl is non-finite")
+		}
+	}
+	var usdc float64
+	for _, b := range pf.SpotBalances {
+		if b.Coin != "USDC" {
+			continue
+		}
+		v, err := parseRiskFloat("spot USDC total", b.Total)
+		if err != nil {
+			return 0, err
+		}
+		usdc = v
+		break
+	}
+	if pf.CollateralShared {
+		equity := usdc + perpUPnL + outcomeValue
+		if math.IsNaN(equity) || math.IsInf(equity, 0) {
+			return 0, fmt.Errorf("aggregate account equity is non-finite")
+		}
+		return equity, nil
+	}
+	av, err := parseRiskFloat("main-dex account value", pf.AccountValue)
+	if err != nil {
+		return 0, err
+	}
+	for dex, b := range pf.PerpDexs {
+		v, err := parseRiskFloat("account value for sub-dex "+dex, b.AccountValue)
+		if err != nil {
+			return 0, err
+		}
+		av += v
+		if math.IsNaN(av) || math.IsInf(av, 0) {
+			return 0, fmt.Errorf("aggregate perp account value is non-finite")
+		}
+	}
+	equity := usdc + av + outcomeValue
+	if math.IsNaN(equity) || math.IsInf(equity, 0) {
+		return 0, fmt.Errorf("aggregate account equity is non-finite")
+	}
+	return equity, nil
+}
+
 // perpMarginEquity is the equity that can actually BACK PERP MARGIN — the
 // denominator for the liquidation-proximity read surfaces (portfolio's
 // margin_ratio, preview's resulting_account_leverage). It deliberately differs
@@ -236,6 +416,44 @@ func pendingContribution(o hl.FrontendOpenOrder) float64 {
 		return 0
 	}
 	return n
+}
+
+// validateRiskOrders rejects malformed exposure-adding open orders before their
+// notionals are folded. Treating an unpriced/non-finite row as zero would make a
+// configured cap evaluate against a smaller book than the exchange actually has.
+func validateRiskOrders(orders []hl.FrontendOpenOrder) error {
+	bySide := map[string]float64{}
+	for _, o := range orders {
+		if o.ReduceOnly || o.IsPositionTpSl {
+			continue
+		}
+		if math.IsNaN(o.Sz) || math.IsInf(o.Sz, 0) || o.Sz <= 0 {
+			return fmt.Errorf("open order oid=%d %s has invalid remaining size", o.Oid, o.Coin)
+		}
+		if math.IsNaN(o.LimitPx) || math.IsInf(o.LimitPx, 0) || math.IsNaN(o.TriggerPx) || math.IsInf(o.TriggerPx, 0) {
+			return fmt.Errorf("open order oid=%d %s has a non-finite price", o.Oid, o.Coin)
+		}
+		px := o.LimitPx
+		if px <= 0 {
+			px = o.TriggerPx
+		}
+		if px <= 0 {
+			return fmt.Errorf("open order oid=%d %s cannot be priced", o.Oid, o.Coin)
+		}
+		if o.Side != hl.OrderSideBid && o.Side != hl.OrderSideAsk {
+			return fmt.Errorf("open order oid=%d %s has invalid side %q", o.Oid, o.Coin, o.Side)
+		}
+		n := o.Sz * px
+		if math.IsNaN(n) || math.IsInf(n, 0) || n <= 0 {
+			return fmt.Errorf("open order oid=%d %s has invalid notional", o.Oid, o.Coin)
+		}
+		key := o.Coin + "\x00" + string(o.Side)
+		bySide[key] += n
+		if math.IsNaN(bySide[key]) || math.IsInf(bySide[key], 0) {
+			return fmt.Errorf("aggregate resting order notional for %s is non-finite", o.Coin)
+		}
+	}
+	return nil
 }
 
 // pendingAddsFromOrders folds an open-order book into per-coin pending-add
@@ -359,13 +577,19 @@ func (c *Client) portfolioEquitySnapshot(ctx context.Context, book *gateBook) (*
 	// perp account value(s) + spot + outcome. The earlier max(account_value,
 	// available_collateral) heuristic DROPPED by the margin reserved when a position
 	// opened, manufacturing a phantom drawdown/daily-loss.
-	equity := accountEquity(pf)
+	equity, err := accountEquityForRisk(pf)
+	if err != nil {
+		return nil, err
+	}
 	// Resting orders are worst-case future exposure: without them, sequential
 	// single orders (each passing against the FILLED book) tunnel arbitrarily
 	// far past every cap. The book was fetched exactly once this invocation —
 	// either by the caller (book != nil, whose fold may carry a modify's
 	// replacement) or by portfolioWith just above — so counting it adds no
 	// API weight.
+	if err := validateRiskOrders(pf.OpenOrders); err != nil {
+		return nil, err
+	}
 	pending := pendingAddsFromOrders(pf.OpenOrders)
 	if book != nil {
 		pending = book.pending
@@ -376,11 +600,24 @@ func (c *Client) portfolioEquitySnapshot(ctx context.Context, book *gateBook) (*
 		pending: pending,
 	}
 	for _, p := range pf.Positions {
-		n := parseFloatSafe(p.PositionValue)
-		if p.Side == "short" {
+		n, err := parseRiskFloat("position value for "+p.Coin, p.PositionValue)
+		if err != nil {
+			return nil, err
+		}
+		if n < 0 {
+			return nil, fmt.Errorf("position value for %s %q is negative", p.Coin, p.PositionValue)
+		}
+		szi, err := parseRiskFloat("position size for "+p.Coin, p.Szi)
+		if err != nil {
+			return nil, err
+		}
+		if szi < 0 {
 			n = -n
 		}
 		snap.perCoin[p.Coin] += n
+		if math.IsNaN(snap.perCoin[p.Coin]) || math.IsInf(snap.perCoin[p.Coin], 0) {
+			return nil, fmt.Errorf("aggregate position value for %s is non-finite", p.Coin)
+		}
 	}
 	return snap, nil
 }
@@ -457,7 +694,7 @@ func (c *Client) checkPortfolioGates(ctx context.Context, deltas []exposureDelta
 // replacement-adjusted pending fold — instead of fetching the book again.
 // book==nil behaves exactly like checkPortfolioGates.
 func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureDelta, book *gateBook) ([]string, error) {
-	if !c.portfolioGuardsActive() {
+	if !c.portfolioGuardsActive() && !c.outcomeQuestionCapActive(deltas) {
 		return nil, nil
 	}
 	snap, err := c.portfolioEquitySnapshot(ctx, book)
@@ -477,7 +714,7 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 	m := computePortfolioMetrics(resulting, snap.pending)
 	gross, net, maxCoinNotional, maxCoin := m.gross, m.net, m.maxCoinNotional, m.maxCoin
 
-	r := c.cfg.Risk
+	r := c.riskConfig()
 	// Net exposure needs no equity, so it is always checkable.
 	if cap := r.MaxNetExposureUSD; cap > 0 && absF(net) > cap {
 		return nil, output.Risk("max_net_exposure",
@@ -493,6 +730,18 @@ func (c *Client) checkPortfolioGatesBook(ctx context.Context, deltas []exposureD
 			return nil, output.Risk("max_open_positions",
 				fmt.Sprintf("this would make %d open positions (resting orders on a coin count), over the max of %d", count, cap)).
 				WithHint(fmt.Sprintf("close a position, cancel resting orders on unopened coins, or add to an existing one (cap %d concurrent)", cap))
+		}
+	}
+
+	// Per-question outcome concentration needs no equity ($ notional cap), so it is
+	// always checkable — like net-exposure and open-positions above. It backstops the
+	// per-coin concentration cap, which cannot tell that the Yes and No legs of one
+	// binary (two different "#<enc>" coins) are the same bet.
+	if cap := r.MaxOutcomeQuestionNotionalUSD; cap > 0 && c.outcomeQuestionCapActive(deltas) {
+		if label, notional := c.heaviestOutcomeQuestion(resulting, snap.pending); notional > cap {
+			return nil, output.Risk("max_outcome_question_notional",
+				fmt.Sprintf("outcome question %q would hold $%.2f across its legs (resting orders count), over the $%.2f cap", label, notional, cap)).
+				WithHint(fmt.Sprintf("reduce size or cancel resting orders so the question's total notional <= $%.2f", cap))
 		}
 	}
 
@@ -612,6 +861,9 @@ type riskState struct {
 // the current equity — the caller must surface that as a warning, because fresh
 // anchors measure nothing until they move.
 func observeEquity(network, account string, equity float64) (drawdownPct, dailyLossUSD, dailyLossPct float64, fresh bool, err error) {
+	if math.IsNaN(equity) || math.IsInf(equity, 0) {
+		return 0, 0, 0, false, fmt.Errorf("equity must be finite")
+	}
 	lk, err := state.Lock(riskStateLockPath(network, account))
 	if err != nil {
 		return 0, 0, 0, false, err
@@ -620,7 +872,11 @@ func observeEquity(network, account string, equity float64) (drawdownPct, dailyL
 
 	var st riskState
 	if b, e := os.ReadFile(riskStatePath(network, account)); e == nil {
-		_ = json.Unmarshal(b, &st) // corrupt => treated as fresh
+		if err := json.Unmarshal(b, &st); err != nil {
+			return 0, 0, 0, false, fmt.Errorf("decode risk state: %w", err)
+		}
+	} else if !os.IsNotExist(e) {
+		return 0, 0, 0, false, fmt.Errorf("read risk state: %w", e)
 	}
 	if st.Basis != currentEquityBasis {
 		st = riskState{} // equity basis changed: re-anchor instead of comparing stale figures
@@ -642,11 +898,19 @@ func observeEquity(network, account string, equity float64) (drawdownPct, dailyL
 		dailyLossPct = dailyLossUSD / st.DayAnchorEquity * 100
 	}
 	st.Basis = currentEquityBasis
-	if b, e := json.Marshal(st); e == nil {
-		_ = os.MkdirAll(filepath.Dir(riskStatePath(network, account)), 0o700)
-		// Atomic+fsync: a crash mid-write must not zero the drawdown/daily-loss
-		// anchors that gate signing (audit #91 / S12).
-		_ = state.WriteFileAtomic(riskStatePath(network, account), b, 0o600)
+	b, err := json.Marshal(st)
+	if err != nil {
+		return 0, 0, 0, false, fmt.Errorf("encode risk state: %w", err)
+	}
+	path := riskStatePath(network, account)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return 0, 0, 0, false, fmt.Errorf("create risk state directory: %w", err)
+	}
+	// Atomic+fsync: a crash mid-write must not zero the drawdown/daily-loss
+	// anchors that gate signing (audit #91 / S12). A failed write is a failed gate,
+	// not a fresh anchor that may silently reset again on the next process.
+	if err := state.WriteFileAtomic(path, b, 0o600); err != nil {
+		return 0, 0, 0, false, fmt.Errorf("persist risk state: %w", err)
 	}
 	return drawdownPct, dailyLossUSD, dailyLossPct, fresh, nil
 }

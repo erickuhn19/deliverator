@@ -368,6 +368,11 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 	if !ok {
 		return nil, nil, unknownCoin(req.Coin)
 	}
+	// HIP-4 settlement backstop: refuse new outcome exposure on a settled or
+	// in-blackout market before doing any pricing work (exits are exempt inside).
+	if err := c.outcomeSettleGate(mk, req); err != nil {
+		return nil, nil, err
+	}
 	req, nerr := c.applyNotional(ctx, mk, req)
 	if nerr != nil {
 		return nil, nil, nerr
@@ -439,7 +444,7 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 		// The cap basis is read only when the cap will actually be evaluated: a
 		// Closing (spot exit) order is exempt from the max caps in staticChecks,
 		// and de-risking must never be blocked by the fail-closed read below.
-		if c.cfg.Risk.MaxPositionNotionalUSD > 0 && !req.Closing {
+		if c.riskConfig().MaxPositionNotionalUSD > 0 && !req.Closing {
 			// Position + same-side resting pending-adds, fail-CLOSED on any read
 			// failure: an unreadable book must reject an exposure-adding order
 			// (retryable exit 40), never evaluate the cap as if flat. The book is
@@ -461,7 +466,7 @@ func (c *Client) Place(ctx context.Context, req OrderReq) (*PlaceResult, []strin
 	// fires (is_market=true — possibly instantly, if the trigger px is already
 	// crossed) as a market order; exits (reduce-only/closing) stay exempt.
 	gateIsMarket := isMarket || (req.Trigger != nil && req.Trigger.IsMarket)
-	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: gateIsMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly, Closing: req.Closing, HaltExempt: req.panicFlatten}); err != nil {
+	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: gateIsMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.riskConfig().MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly, Closing: req.Closing, HaltExempt: req.panicFlatten}); err != nil {
 		return nil, nil, err
 	}
 	// Account-wide gates run against the resulting book; a reduce-only/closing
@@ -693,6 +698,11 @@ func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResu
 	if req.TP == "" && req.SL == "" {
 		return nil, nil, output.Validation("no_bracket", "a bracket needs --tp and/or --sl")
 	}
+	// The bracket ENTRY leg opens fresh exposure → settlement/blackout backstop for
+	// outcome coins (the TP/SL children are reduce-only and exempt).
+	if serr := c.outcomeSettleCheck(mk); serr != nil {
+		return nil, nil, serr
+	}
 	warnings := []string{}
 	szOut, _, err := RoundSize(req.Size, mk.SzDecimals)
 	if err != nil {
@@ -748,7 +758,7 @@ func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResu
 	notional := refPx * szF
 	posNotional := 0.0
 	var book *gateBook // one open-orders read, shared cap → gates (parity with Place)
-	if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
+	if c.riskConfig().MaxPositionNotionalUSD > 0 {
 		// Position + same-side resting pending-adds, fail-CLOSED on read failure
 		// (see positionCapBase) — parity with Place.
 		b, berr := c.fetchGateBook(ctx)
@@ -762,7 +772,7 @@ func (c *Client) PlaceBracket(ctx context.Context, req BracketReq) ([]*PlaceResu
 		}
 		posNotional = notional + base
 	}
-	if rerr := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: isMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD}); rerr != nil {
+	if rerr := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: isMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.riskConfig().MinOrderNotionalUSD}); rerr != nil {
 		return nil, warnings, rerr
 	}
 	// The bracket ENTRY is the only new-exposure leg (tp/sl are reduce-only).
@@ -1112,6 +1122,10 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 		if !ok {
 			return nil, warnings, batchLegErr(i, unknownCoin(req.Coin))
 		}
+		// HIP-4 settlement backstop, per leg (exits exempt inside the gate).
+		if err := c.outcomeSettleGate(mk, req); err != nil {
+			return nil, warnings, batchLegErr(i, err)
+		}
 		req, nerr := c.applyNotional(ctx, mk, req) // --notional per leg (#50)
 		if nerr != nil {
 			return nil, warnings, batchLegErr(i, nerr)
@@ -1174,7 +1188,7 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 				refPx = c.marketableGuardPx(ctx, mk.Coin, req.Side, pxF)
 			}
 			notional = refPx * ro.szF
-			if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
+			if c.riskConfig().MaxPositionNotionalUSD > 0 {
 				// Cumulative cap basis: live position (fetched once per coin) + THIS
 				// LEG'S side's resting pending-adds (order book fetched ONCE for the
 				// whole batch — never per leg or per coin — and re-used by the
@@ -1208,7 +1222,7 @@ func (c *Client) PlaceBatch(ctx context.Context, reqs []OrderReq) ([]*PlaceResul
 		// limit_only: a trigger leg with is_market=true EXECUTES as a market order
 		// when it fires — gate it as market, like single Place (exits stay exempt).
 		gateIsMarket := ro.isMarket || (req.Trigger != nil && req.Trigger.IsMarket)
-		if rerr := c.staticChecks(riskCheck{Coin: mk.Coin, IsMarket: gateIsMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly}); rerr != nil {
+		if rerr := c.staticChecks(riskCheck{Coin: mk.Coin, IsMarket: gateIsMarket, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.riskConfig().MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly}); rerr != nil {
 			return nil, warnings, batchLegErr(i, rerr)
 		}
 
@@ -2039,6 +2053,13 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 	if !existing.ReduceOnly {
 		newPendingN := szF * pxF // limit-valued, exactly like the resting-book fold
 		increase = szF > existing.RemainingSz+1e-9 || newPendingN > existing.PendingNotional+1e-6
+		// A modify that GROWS an outcome order opens fresh exposure — apply the
+		// settlement/blackout backstop (a shrink/reprice is de-risking and exempt).
+		if increase {
+			if err := c.outcomeSettleCheck(mk); err != nil {
+				return nil, nil, err
+			}
+		}
 		// A modify to a crossing limit fills at the market — price the guard at the
 		// mid (the wire pxF still carries the new limit), same as Place/PlaceBatch.
 		refPx := pxF
@@ -2046,16 +2067,21 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 			refPx = c.marketableGuardPx(ctx, mk.Coin, side, pxF)
 		}
 		notional = refPx * szF
-		if increase && (c.cfg.Risk.MaxPositionNotionalUSD > 0 || c.portfolioGuardsActive()) {
+		if increase && (c.riskConfig().MaxPositionNotionalUSD > 0 || c.portfolioGuardsActive()) {
 			// An exposure-INCREASING modify needs the COMPLETE resting book: the
 			// partial sweep tolerated above is not enough once exposure grows.
 			if len(staleDexs) > 0 {
 				return nil, warnings, staleOrdersErr(staleDexs)
 			}
+			if err := validateRiskOrders(orders); err != nil {
+				return nil, warnings, output.Network("open_orders_read",
+					"cannot value resting orders to enforce the configured risk caps: "+err.Error()).Retry().
+					WithHint("retry the read; the caps fail closed rather than assume malformed orders have zero exposure")
+			}
 			pending := pendingAddsFromOrders(orders)
 			applyModifyReplacement(pending, existing, 0) // old order out; the replacement is added below
 			book = &gateBook{orders: orders, pending: pending}
-			if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
+			if c.riskConfig().MaxPositionNotionalUSD > 0 {
 				// Fail-CLOSED position read (retryable exit 40 on failure). Basis:
 				// filled position + the OTHER resting same-side orders + this
 				// replacement (via notional) — never the old order.
@@ -2068,7 +2094,7 @@ func (c *Client) Modify(ctx context.Context, oid *int64, cloid, newSize, newLimi
 			addPendingSide(book.pending, existing.Coin, side, newPendingN) // the replacement, at its new worst case
 		}
 	}
-	if rerr := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: false, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: existing.ReduceOnly}); rerr != nil {
+	if rerr := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: false, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.riskConfig().MinOrderNotionalUSD, ReduceOnly: existing.ReduceOnly}); rerr != nil {
 		return nil, warnings, rerr
 	}
 	// Account-wide gates (#43) on the resulting book — the replacement is in
@@ -2193,13 +2219,14 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 	results := make([]*PlaceResult, 0, len(reqs))
 	posSeed := map[string]float64{}
 	seen := map[string]bool{}
-	capActive := c.cfg.Risk.MaxPositionNotionalUSD > 0
+	capActive := c.riskConfig().MaxPositionNotionalUSD > 0
 	gatesActive := c.portfolioGuardsActive()
 	// pendingWork is the WORKING resting book: each leg's replacement is applied
 	// as the loop advances, so later legs (and the portfolio gates, run once at
 	// the end) see the book with all earlier modifies already in effect.
 	var pendingWork map[string]pendingAdd
 	anyIncrease := false
+	ordersValidated := false
 	for i, req := range reqs {
 		cloid := req.Cloid
 		if req.Oid == nil {
@@ -2278,11 +2305,23 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 			increase := szF > existing.RemainingSz+1e-9 || newPendingN > existing.PendingNotional+1e-6
 			if increase {
 				anyIncrease = true
+				// Growing an outcome order opens fresh exposure → settlement backstop.
+				if serr := c.outcomeSettleCheck(mk); serr != nil {
+					return nil, warnings, batchLegErr(i, serr)
+				}
 			}
 			if capActive || gatesActive {
 				if increase && len(staleDexs) > 0 {
 					// An exposure-INCREASING leg needs the COMPLETE resting book.
 					return nil, warnings, batchLegErr(i, staleOrdersErr(staleDexs))
+				}
+				if increase && !ordersValidated {
+					if err := validateRiskOrders(orders); err != nil {
+						return nil, warnings, batchLegErr(i, output.Network("open_orders_read",
+							"cannot value resting orders to enforce the configured risk caps: "+err.Error()).Retry().
+							WithHint("retry the read; the caps fail closed rather than assume malformed orders have zero exposure"))
+					}
+					ordersValidated = true
 				}
 				if pendingWork == nil {
 					pendingWork = pendingAddsFromOrders(orders)
@@ -2306,7 +2345,7 @@ func (c *Client) ModifyBatch(ctx context.Context, reqs []ModifyReq) ([]*PlaceRes
 				addPendingSide(pendingWork, existing.Coin, existing.Side, newPendingN)
 			}
 		}
-		if gerr := c.staticChecks(riskCheck{Coin: mk.Coin, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: existing.ReduceOnly}); gerr != nil {
+		if gerr := c.staticChecks(riskCheck{Coin: mk.Coin, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.riskConfig().MinOrderNotionalUSD, ReduceOnly: existing.ReduceOnly}); gerr != nil {
 			return nil, warnings, batchLegErr(i, gerr)
 		}
 
@@ -2592,6 +2631,15 @@ func (c *Client) AdjustMargin(ctx context.Context, coin string, usd float64) (*M
 	if c.Halted() {
 		return nil, output.Halt("halted", "global halt is active — margin change rejected").WithHint("deliverator halt off")
 	}
+	if math.IsNaN(usd) || math.IsInf(usd, 0) {
+		return nil, output.Validation("bad_amount", "margin amount must be a finite number")
+	}
+	scaled := usd * 1e6
+	maxInt := float64(int(^uint(0) >> 1))
+	minInt := -maxInt - 1
+	if math.IsInf(scaled, 0) || scaled >= maxInt || scaled <= minInt {
+		return nil, output.Validation("bad_amount", "margin amount is too large to encode safely")
+	}
 	if usd == 0 {
 		return nil, output.Validation("bad_amount", "margin amount must be non-zero (+add / -remove)")
 	}
@@ -2731,6 +2779,10 @@ func (c *Client) Twap(ctx context.Context, req TwapReq) (*TwapResult, []string, 
 	notional, posNotional := 0.0, 0.0
 	var book *gateBook // one open-orders read, shared cap → gates (parity with Place)
 	if !req.ReduceOnly {
+		// A non-reduce-only TWAP opens fresh exposure → settlement/blackout backstop.
+		if serr := c.outcomeSettleCheck(mk); serr != nil {
+			return nil, nil, serr
+		}
 		refPx, hasMid := c.midPrice(ctx, mk.Coin)
 		if !hasMid {
 			if c.pricingGuardsActive() {
@@ -2741,7 +2793,7 @@ func (c *Client) Twap(ctx context.Context, req TwapReq) (*TwapResult, []string, 
 			refPx = 0
 		}
 		notional = refPx * szF
-		if c.cfg.Risk.MaxPositionNotionalUSD > 0 {
+		if c.riskConfig().MaxPositionNotionalUSD > 0 {
 			// Position + same-side resting pending-adds, fail-CLOSED on read
 			// failure (see positionCapBase) — parity with Place.
 			b, berr := c.fetchGateBook(ctx)
@@ -2756,7 +2808,7 @@ func (c *Client) Twap(ctx context.Context, req TwapReq) (*TwapResult, []string, 
 			posNotional = notional + base
 		}
 	}
-	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: false, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.cfg.Risk.MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly}); err != nil {
+	if err := c.preTradeChecks(riskCheck{Coin: mk.Coin, IsMarket: false, NotionalUSD: notional, PositionNotionalUSD: posNotional, MinNotionalUSD: c.riskConfig().MinOrderNotionalUSD, ReduceOnly: req.ReduceOnly}); err != nil {
 		return nil, warnings, err
 	}
 	if !req.ReduceOnly {
@@ -2964,14 +3016,14 @@ const bpsToPriorityRate = 10000
 // risk.max_priority_bps (and HL's 8 bps hard cap). Returns 0 (no priority) when
 // unset, plus a warning string when a requested value was clamped down.
 func (c *Client) resolvePriority(override *int) (rate int, warning string) {
-	bps := c.cfg.Automation.PriorityBps
+	bps := c.automationConfig().PriorityBps
 	if override != nil {
 		bps = *override
 	}
 	if bps <= 0 {
 		return 0, ""
 	}
-	max := c.cfg.Risk.MaxPriorityBps
+	max := c.riskConfig().MaxPriorityBps
 	if max <= 0 || max > config.HLMaxPriorityBps {
 		max = config.HLMaxPriorityBps
 	}
@@ -3159,7 +3211,28 @@ func (c *Client) currentPositionNotional(ctx context.Context, coin string) (floa
 		}
 		var sum float64
 		for _, pv := range c.outcomePositionViews(ss.Balances, mids, coin) {
-			sum += absF(parseFloatSafe(pv.PositionValue))
+			if pv.MarkPx == "" {
+				return 0, positionReadErr("the current position", coin, "outcome mark is missing or invalid")
+			}
+			mark, merr := parseRiskFloat("outcome mark for "+coin, pv.MarkPx)
+			if merr != nil || mark <= 0 || mark > 1 {
+				detail := fmt.Sprintf("outcome mark %q is outside (0,1]", pv.MarkPx)
+				if merr != nil {
+					detail = merr.Error()
+				}
+				return 0, positionReadErr("the current position", coin, detail)
+			}
+			f, perr := parseRiskFloat("position value for "+coin, pv.PositionValue)
+			if perr != nil {
+				return 0, positionReadErr("the current position", coin, perr.Error())
+			}
+			if f < 0 {
+				return 0, positionReadErr("the current position", coin, "position value is negative")
+			}
+			sum += f
+			if math.IsNaN(sum) || math.IsInf(sum, 0) {
+				return 0, positionReadErr("the current position", coin, "aggregate outcome value is non-finite")
+			}
 		}
 		return sum, nil
 	}
@@ -3169,8 +3242,14 @@ func (c *Client) currentPositionNotional(ctx context.Context, coin string) (floa
 	}
 	for _, ap := range st.AssetPositions {
 		if coinMatches(ap.Position.Coin, coin) {
-			f, _ := strconv.ParseFloat(ap.Position.PositionValue, 64)
-			return absF(f), nil
+			f, perr := parseRiskFloat("position value for "+coin, ap.Position.PositionValue)
+			if perr != nil {
+				return 0, positionReadErr("the current position", coin, perr.Error())
+			}
+			if f < 0 {
+				return 0, positionReadErr("the current position", coin, "position value is negative")
+			}
+			return f, nil
 		}
 	}
 	return 0, nil
@@ -3209,6 +3288,11 @@ func (c *Client) fetchGateBook(ctx context.Context) (*gateBook, error) {
 	}
 	if len(stale) > 0 {
 		return nil, staleOrdersErr(stale)
+	}
+	if err := validateRiskOrders(orders); err != nil {
+		return nil, output.Network("open_orders_read",
+			"cannot value resting orders to enforce the configured risk caps: "+err.Error()).Retry().
+			WithHint("retry the read; the caps fail closed rather than assume malformed orders have zero exposure")
 	}
 	if orders == nil {
 		orders = []hl.FrontendOpenOrder{} // fetched-and-empty (portfolioWith must not re-fetch)

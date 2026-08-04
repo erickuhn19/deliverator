@@ -98,13 +98,18 @@ func (e *Exchange) UpdateLeverage(ctx context.Context, leverage int, name string
 
 // UpdateIsolatedMargin adds (amount>0) or removes (amount<0) isolated margin.
 //
-// MUST-VERIFY (parity landmine): this matches the reference Go SDK, which sends
-// `ntli` as a RAW USD float. The official Python SDK instead sends an integer in
-// 1e-6 units (int(usd*1e6)). We mirror the Go SDK so the differential signing
-// tests stay byte-identical; before relying on this on mainnet, confirm on
-// testnet that a $X margin add moves margin by exactly $X. If the exchange
-// honors only the integer form, change Ntli to FloatToUsdInt(amount).
+// The wire uses the official Python SDK encoding: signed integer USD*1e6 and
+// isBuy=true for both adds and removals (the sign carries direction).
 func (e *Exchange) UpdateIsolatedMargin(ctx context.Context, amount float64, name string) (*UserState, error) {
+	if math.IsNaN(amount) || math.IsInf(amount, 0) {
+		return nil, fmt.Errorf("isolated margin amount must be finite")
+	}
+	scaled := math.Round(amount * 1e6)
+	maxInt := float64(int(^uint(0) >> 1))
+	minInt := -maxInt - 1
+	if math.IsInf(scaled, 0) || scaled >= maxInt || scaled <= minInt {
+		return nil, fmt.Errorf("isolated margin amount is too large to encode safely")
+	}
 	asset, ok := e.info.CoinToAsset(name)
 	if !ok {
 		return nil, fmt.Errorf("coin %s not found in info", name)
@@ -119,7 +124,7 @@ func (e *Exchange) UpdateIsolatedMargin(ctx context.Context, amount float64, nam
 		Type:  "updateIsolatedMargin",
 		Asset: asset,
 		IsBuy: true,
-		Ntli:  int(math.Round(amount * 1e6)),
+		Ntli:  int(scaled),
 	}
 	if err := e.executeChecked(ctx, action); err != nil {
 		return nil, err

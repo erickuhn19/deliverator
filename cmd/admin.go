@@ -250,6 +250,10 @@ func riskCapValue(c *config.Config, key string) (string, bool) {
 		return v(r.MaxDailyLossPct), true
 	case "risk.max_open_positions":
 		return v(r.MaxOpenPositions), true
+	case "risk.outcome_settle_blackout_mins":
+		return v(r.OutcomeSettleBlackoutMins), true
+	case "risk.max_outcome_question_notional_usd":
+		return v(r.MaxOutcomeQuestionNotionalUSD), true
 	case "risk.max_priority_bps":
 		return v(r.MaxPriorityBps), true
 	}
@@ -362,6 +366,18 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 			return err
 		}
 		cfg.Risk.MaxOpenPositions = n
+	case "risk.outcome_settle_blackout_mins":
+		n, err := atoi()
+		if err != nil {
+			return err
+		}
+		cfg.Risk.OutcomeSettleBlackoutMins = n
+	case "risk.max_outcome_question_notional_usd":
+		f, err := atof()
+		if err != nil {
+			return err
+		}
+		cfg.Risk.MaxOutcomeQuestionNotionalUSD = f
 	case "risk.max_priority_bps":
 		n, err := atoi()
 		if err != nil {
@@ -460,6 +476,13 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 		}
 		cfg.Outcomes = b
 	default:
+		// The [mm] table went with the outcome-mm daemon. An existing config may still
+		// carry one, so say what actually happened rather than "unknown key": the
+		// market maker lives in the prediction-bot repo now, not in this CLI.
+		if strings.HasPrefix(key, "mm.") {
+			return fmt.Errorf("the [mm] table was removed along with the outcome-mm daemon; "+
+				"delete it from your config (key %q)", key)
+		}
 		return fmt.Errorf("unknown or unsettable key %q", key)
 	}
 	return cfg.Validate()

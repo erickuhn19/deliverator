@@ -3,8 +3,16 @@ package core
 import (
 	"context"
 
+	"github.com/erickuhn19/deliverator/internal/config"
 	hl "github.com/erickuhn19/deliverator/internal/hl"
 )
+
+// GuardConfigReloader is the optional long-running-client capability used by
+// outcome-MM. It is separate from ClientAPI so lightweight command fakes do not
+// need to implement daemon-only hot reload.
+type GuardConfigReloader interface {
+	ReloadGuardConfig(cfg *config.Config) error
+}
 
 // ClientAPI is the full surface the CLI (package cmd) invokes on *Client. It
 // exists purely so command handlers can be unit-tested against a fake client —

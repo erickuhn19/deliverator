@@ -49,10 +49,11 @@ func SetHalt(on bool) error {
 }
 
 func (c *Client) coinAllowed(coin string) bool {
-	if len(c.cfg.Automation.AllowedCoins) == 0 {
+	auto := c.automationConfig()
+	if len(auto.AllowedCoins) == 0 {
 		return true // empty allowlist = allow all (operator opts into lockdown)
 	}
-	for _, a := range c.cfg.Automation.AllowedCoins {
+	for _, a := range auto.AllowedCoins {
 		if strings.EqualFold(strings.TrimSpace(a), coin) {
 			return true
 		}
@@ -82,7 +83,7 @@ type riskCheck struct {
 // it cannot be priced, so the guard could not be enforced and we refuse rather
 // than slip through.
 func (c *Client) pricingGuardsActive() bool {
-	r := c.cfg.Risk
+	r := c.riskConfig()
 	return r.MaxOrderNotionalUSD > 0 || r.MaxPositionNotionalUSD > 0 || r.MinOrderNotionalUSD > 0 ||
 		c.portfolioGuardsActive()
 }
@@ -100,6 +101,7 @@ func (c *Client) preTradeChecks(rc riskCheck) error {
 // rate cap is kept separate (see preTradeChecks) so a batch — one signed action —
 // charges it ONCE rather than once per leg, which would self-trip mid-batch.
 func (c *Client) staticChecks(rc riskCheck) error {
+	guards := c.currentGuards()
 	// Panic's internal flatten legs skip the halt gate: the emergency flatten
 	// must work DURING a halt (see Panic). Every other write stays halt-gated.
 	if !rc.HaltExempt && c.Halted() {
@@ -116,7 +118,7 @@ func (c *Client) staticChecks(rc riskCheck) error {
 			"coin "+rc.Coin+" is not in automation.allowed_coins").
 			WithHint("trade an allowed coin or add it to allowed_coins")
 	}
-	if rc.IsMarket && !exit && c.cfg.Automation.LimitOnly {
+	if rc.IsMarket && !exit && guards.automation.LimitOnly {
 		return output.Risk("limit_only",
 			"automation.limit_only is set — market orders (including trigger orders that execute as market) are blocked").
 			WithHint("place a limit order with --limit/--alo, or a trigger-limit instead of --trigger-market")
@@ -137,12 +139,12 @@ func (c *Client) staticChecks(rc riskCheck) error {
 		// The max caps bound NEW exposure only — a close (which the floor above still
 		// guards against HL's sub-minimum reject) is exempt so it can always exit.
 		if !rc.Closing {
-			if cap := c.cfg.Risk.MaxOrderNotionalUSD; cap > 0 && rc.NotionalUSD > cap {
+			if cap := guards.risk.MaxOrderNotionalUSD; cap > 0 && rc.NotionalUSD > cap {
 				return output.Risk("max_order_notional",
 					fmt.Sprintf("order notional $%.2f exceeds cap $%.2f", rc.NotionalUSD, cap)).
 					WithHint(fmt.Sprintf("reduce size so notional <= $%.2f", cap))
 			}
-			if cap := c.cfg.Risk.MaxPositionNotionalUSD; cap > 0 && rc.PositionNotionalUSD > cap {
+			if cap := guards.risk.MaxPositionNotionalUSD; cap > 0 && rc.PositionNotionalUSD > cap {
 				return output.Risk("max_position_notional",
 					fmt.Sprintf("resulting position notional ~$%.2f (position + resting orders + this order) exceeds cap $%.2f", rc.PositionNotionalUSD, cap)).
 					WithHint(fmt.Sprintf("reduce size or cancel resting orders in %s so position notional <= $%.2f", rc.Coin, cap))
@@ -152,9 +154,69 @@ func (c *Client) staticChecks(rc riskCheck) error {
 	return nil
 }
 
+// outcomeSettleGate is the core fail-closed backstop for HIP-4 settlement risk
+// (spec §10). It refuses to OPEN or ADD outcome exposure on a market that has
+// already settled, or — when risk.outcome_settle_blackout_mins is set — within that
+// many minutes of expiry (the adverse-selection window where informed flow lifts a
+// stale quote right before resolution). Exits (reduce-only / closing) are always
+// allowed so a holding can be unwound, and non-outcome orders pass through
+// untouched. It is enforced in the Place / PlaceBatch entry paths, before signing —
+// so no invocation surface (CLI, the outcome-mm daemon, a hallucinating agent) can
+// open fresh exposure into a resolving market.
+func (c *Client) outcomeSettleGate(mk Market, req OrderReq) error {
+	// Outcome tokens are long-only spot, so a Sell can only REDUCE a holding — it is
+	// always de-risking. Exempt it (like ReduceOnly/Closing) so a plain `sell` can
+	// unwind a position during the blackout; only Buys (opening/adding exposure) are gated.
+	if req.ReduceOnly || req.Closing || (mk.IsOutcome && req.Side == Sell) {
+		return nil
+	}
+	return c.outcomeSettleCheck(mk)
+}
+
+// outcomeSettleCheck is the settlement/blackout backstop with no exit-exemption
+// logic — callers invoke it only for orders that OPEN or ADD outcome exposure
+// (Place/PlaceBatch new legs, an exposure-increasing Modify, a non-reduce-only Twap
+// or bracket entry). Non-outcome coins pass through. See outcomeSettleGate.
+func (c *Client) outcomeSettleCheck(mk Market) error {
+	if !mk.IsOutcome {
+		return nil
+	}
+	if strings.EqualFold(strings.TrimSpace(mk.ResolutionStatus), "settled") {
+		return output.Risk("outcome_settled",
+			"outcome market "+mk.Coin+" has settled — no new exposure").
+			WithHint("this market is resolved; quote an open outcome market")
+	}
+	win := c.riskConfig().OutcomeSettleBlackoutMins
+	if win <= 0 {
+		return nil
+	}
+	// An absent expiry is STRUCTURAL, not stale metadata: event and multi-outcome
+	// markets carry no expiry (parseOutcomeDescription only fills it for priceBinary),
+	// so there is no near-expiry blackout window to enforce. Do NOT fail closed here —
+	// that would ban the entire event/multi-outcome class regardless of resolution time.
+	// The "settled" check above still stops new exposure once such a market resolves.
+	if strings.TrimSpace(mk.Expiry) == "" {
+		return nil
+	}
+	exp, ok := parseOutcomeExpiryTime(mk.Expiry)
+	if !ok {
+		// Fail closed: a NON-EMPTY but unparseable expiry means stale/corrupt metadata
+		// for a market that does have one — refuse rather than assume safety.
+		return output.Risk("outcome_expiry_unknown",
+			"cannot parse expiry for "+mk.Coin+" to enforce the settlement blackout — refusing new exposure").
+			WithHint("retry once market metadata is fresh, or clear risk.outcome_settle_blackout_mins")
+	}
+	if time.Until(exp) <= time.Duration(win)*time.Minute {
+		return output.Risk("outcome_settle_blackout",
+			fmt.Sprintf("%s is within the %d-minute settlement blackout before expiry — no new exposure", mk.Coin, win)).
+			WithHint("quotes are pulled near expiry to avoid adverse selection; reduce or hold to settle")
+	}
+	return nil
+}
+
 // checkLeverage caps leverage changes (§6).
 func (c *Client) checkLeverage(x int) error {
-	if cap := c.cfg.Risk.MaxLeverage; cap > 0 && x > cap {
+	if cap := c.riskConfig().MaxLeverage; cap > 0 && x > cap {
 		return output.Risk("max_leverage",
 			fmt.Sprintf("leverage %dx exceeds cap %dx", x, cap)).
 			WithHint(fmt.Sprintf("use <= %dx", cap))
@@ -166,7 +228,7 @@ func (c *Client) checkLeverage(x int) error {
 // own per-address limit (§7). It records action timestamps in a small log and
 // rejects when more than max_orders_per_min occurred in the last 60s.
 func (c *Client) checkRateCap() error {
-	limit := c.cfg.Automation.MaxOrdersPerMin
+	limit := c.automationConfig().MaxOrdersPerMin
 	if limit <= 0 {
 		return nil
 	}
