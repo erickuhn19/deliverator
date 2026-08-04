@@ -28,6 +28,14 @@ func (m *MetaStore) AddOutcomes(om *hl.OutcomeMeta) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addOutcomesLocked(om)
+}
+
+// addOutcomesLocked is AddOutcomes's body. Callers must hold m.mu for writing.
+func (m *MetaStore) addOutcomesLocked(om *hl.OutcomeMeta) {
+	if om == nil {
+		return
+	}
 	m.outcomeMeta = om
 
 	// Retire the previous universe. Coins that rolled out must stop resolving:

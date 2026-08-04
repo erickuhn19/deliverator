@@ -120,6 +120,21 @@ type Client struct {
 	meta *MetaStore
 	info *hl.Info
 
+	// Meta freshness AT USE (#38). state.meta_ttl_secs was evaluated exactly once,
+	// in New: for a fork-per-command CLI "was the cache fresh at startup" and "is
+	// it fresh now" are the same question, but `serve` holds the answer for days.
+	// A stale szDecimals does not fail loudly — it mis-rounds a SIGNED order.
+	//
+	// metaTTL is 0 for hand-built clients that bypass New (most unit fixtures),
+	// and 0 means REFRESH DISABLED: a test client has no live endpoint to refresh
+	// against, and silently reaching for one would turn unit tests into network
+	// tests. Only New sets it.
+	metaMu      sync.Mutex
+	metaTTL     time.Duration
+	metaPath    string
+	metaAttempt time.Time // last refresh ATTEMPT, success or not (backoff anchor)
+	metaLastErr error     // last refresh failure, surfaced as a warning while stale
+
 	queryAddr string // master/sub address for READS (never the agent address, §4)
 	vaultAddr string // "" for master; sub-account address otherwise
 
@@ -240,6 +255,9 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Client, error)
 	// Meta: use a fresh cache, else fetch and persist.
 	metaPath := filepath.Join(config.Dir(), "meta.json")
 	ttl := time.Duration(cfg.State.MetaTTLSecs) * time.Second
+	// The same TTL now also governs refresh AT USE (#38). Only New sets these, so
+	// a hand-built client keeps metaTTL == 0 and never reaches for the network.
+	c.metaTTL, c.metaPath = ttl, metaPath
 	if ms, ok := LoadMetaCache(metaPath, c.network); ok && !opts.RefreshMeta && ms.Age() < ttl {
 		info, err := safeNewInfo(ctx, c.infoURL, c.httpc, ms.Meta(), ms.SpotMeta())
 		if err != nil {
@@ -504,6 +522,83 @@ func (c *Client) requireQueryAddr() error {
 // with the same auth error (exit 30) as a dedicated read when none is set.
 func (c *Client) RequireQueryAddr() error { return c.requireQueryAddr() }
 
+// metaRetryFloor bounds how often a FAILING refresh is retried, so a venue
+// outage cannot turn every order into an extra /info round-trip against an
+// endpoint that is already unhealthy.
+const metaRetryFloor = 30 * time.Second
+
+// ensureMetaFresh honours state.meta_ttl_secs at USE rather than at construction.
+//
+// It is deliberately best-effort: a refresh failure leaves the existing universe
+// in place and records a warning rather than blocking. Refusing to trade because
+// metadata could not be re-fetched would convert a read problem into an outage,
+// and the previous universe is still the best information available. What it must
+// never do is let a SILENTLY stale szDecimals round a signed order — hence the
+// warning surfaced alongside every write while the refresh is failing.
+//
+// Disabled (a no-op) when metaTTL <= 0 or there is no Info to fetch through,
+// which covers every hand-built test client.
+func (c *Client) ensureMetaFresh(ctx context.Context) {
+	if c.metaTTL <= 0 || c.info == nil || c.meta == nil {
+		return
+	}
+	if c.meta.Age() < c.metaTTL {
+		return // the common path: one time comparison, no lock
+	}
+
+	c.metaMu.Lock()
+	defer c.metaMu.Unlock()
+	// Re-check under the lock: several connection goroutines can arrive at the
+	// same expiry, and only the first should fetch.
+	if c.meta.Age() < c.metaTTL {
+		return
+	}
+	if !c.metaAttempt.IsZero() && time.Since(c.metaAttempt) < metaRetryFloor {
+		return // a recent attempt failed; do not hammer the endpoint per order
+	}
+	c.metaAttempt = time.Now()
+
+	meta, err := c.info.Meta(ctx)
+	if err != nil {
+		c.metaLastErr = err
+		return // keep the working universe
+	}
+	// Spot is fetched separately and is allowed to fail: MetaStore.Refresh keeps
+	// the previous spot universe rather than deleting it.
+	spot, _ := c.info.SpotMeta(ctx)
+	if err := c.meta.Refresh(meta, spot, time.Now()); err != nil {
+		c.metaLastErr = err
+		return
+	}
+	c.metaLastErr = nil
+	if c.metaPath != "" {
+		_ = c.meta.Save(c.metaPath)
+	}
+}
+
+// metaStaleWarnings reports that the universe is past its TTL and the refresh is
+// failing, so a write signed against possibly-stale precision says so in its
+// envelope instead of being silently wrong.
+func (c *Client) metaStaleWarnings() []string {
+	if c.metaTTL <= 0 || c.meta == nil {
+		return nil
+	}
+	c.metaMu.Lock()
+	lastErr := c.metaLastErr
+	c.metaMu.Unlock()
+	if lastErr == nil {
+		return nil
+	}
+	age := c.meta.Age()
+	if age < c.metaTTL {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"market metadata is %s old (past the %s meta_ttl_secs) and the refresh is failing (%v) — "+
+			"sizes/prices are being rounded with possibly-stale szDecimals",
+		age.Round(time.Second), c.metaTTL, lastErr)}
+}
+
 // GuardGeneration reports which on-disk config the gates are currently
 // enforcing, for the rejection envelope.
 func (c *Client) GuardGeneration() string {
@@ -755,4 +850,13 @@ func (c *Client) MeasureSkew(ctx context.Context) (int64, error) {
 	// Account for round-trip: compare server time to the midpoint of the request.
 	mid := local.Add(time.Since(local) / 2)
 	return serverT.UnixMilli() - mid.UnixMilli(), nil
+}
+
+// writeWarnings is what every signing path prepends to its result warnings: the
+// signer-binding warning plus, when the market universe is past its TTL and the
+// refresh is failing, a note that precision may be stale. Both describe the
+// conditions under which the order that just got signed might be wrong, which is
+// exactly what belongs in that envelope.
+func (c *Client) writeWarnings() []string {
+	return append(c.signerWarnings(), c.metaStaleWarnings()...)
 }

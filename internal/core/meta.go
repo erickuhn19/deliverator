@@ -172,7 +172,14 @@ func (m *MetaStore) AddPerpDex(dexIndex int, meta *hl.Meta) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addPerpDexLocked(dexIndex, meta)
+}
 
+// addPerpDexLocked is AddPerpDex's body. Callers must hold m.mu for writing.
+func (m *MetaStore) addPerpDexLocked(dexIndex int, meta *hl.Meta) {
+	if meta == nil {
+		return
+	}
 	// Retire the previous universe for this dex, if any.
 	if old, ok := m.perpDexCoins[dexIndex]; ok {
 		retired := make(map[string]bool, len(old))
@@ -303,6 +310,52 @@ func (m *MetaStore) build() {
 			m.ordered = append(m.ordered, mk)
 		}
 	}
+}
+
+// Refresh installs newly-fetched perp/spot metas and rebuilds the lookup tables,
+// preserving the sub-dex and HIP-4 universes registered on top of them.
+//
+// NEVER DESTRUCTIVE. Replacing a live universe is a very different act from
+// building an empty one at startup:
+//
+//   - A nil perp meta is REFUSED outright. It is the whole universe.
+//   - A nil spot meta KEEPS the previous one. At construction nil-spot is simply
+//     the initial state and "spot is optional" is correct; at use it would delete
+//     a working spot universe and turn every spot coin into an unknown_coin on a
+//     transient /info hiccup.
+//
+// The caller is responsible for only passing metas it actually fetched — a
+// partial refresh must not be laundered through here as a successful one.
+func (m *MetaStore) Refresh(meta *hl.Meta, spot *hl.SpotMeta, fetchedAt time.Time) error {
+	if meta == nil || len(meta.Universe) == 0 {
+		return fmt.Errorf("refusing to replace the market universe with an empty perp meta")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if spot == nil {
+		spot = m.spotMeta // a failed spot fetch must not delete a working spot universe
+	}
+	m.meta, m.spotMeta, m.fetchedAt = meta, spot, fetchedAt
+
+	// Rebuild the base tables from scratch so a delisting actually disappears
+	// rather than lingering from the previous build.
+	m.byCoin = make(map[string]Market, len(m.byCoin))
+	m.ordered = nil
+	m.build()
+
+	// Re-apply what was layered on top. Both writers are idempotent and reset
+	// their own bookkeeping, so this cannot double-count (#43).
+	dexes := m.perpDexs
+	m.perpDexs, m.perpDexCoins = nil, nil
+	for _, e := range dexes {
+		m.addPerpDexLocked(e.Index, e.Meta)
+	}
+	if om := m.outcomeMeta; om != nil {
+		m.outcomeCoins, m.outcomeMarkets = nil, nil
+		m.addOutcomesLocked(om)
+	}
+	return nil
 }
 
 // Lookup resolves a coin (perp ticker or spot pair name) to its Market.
