@@ -84,12 +84,31 @@ type Market struct {
 	Title            string `json:"title,omitempty"`             // human-readable: what a Yes/No resolves on
 	Question         int    `json:"question,omitempty"`          // grouping question id (0 = none)
 	QuestionName     string `json:"question_name,omitempty"`     // e.g. "2026 World Cup Champion"
-	Underlying       string `json:"underlying,omitempty"`        // priceBinary: BTC/ETH/...
+	Underlying       string `json:"underlying,omitempty"`        // priceBinary/priceBucket: BTC/ETH/...
 	TargetPrice      string `json:"target_price,omitempty"`      // priceBinary target
-	Expiry           string `json:"expiry,omitempty"`            // priceBinary expiry (YYYY-MM-DD HH:MMZ)
+	Expiry           string `json:"expiry,omitempty"`            // settlement (YYYY-MM-DD HH:MMZ)
 	ResolutionStatus string `json:"resolution_status,omitempty"` // "open" | "settled"
 	PriceBound       string `json:"price_bound,omitempty"`       // "0..1" — price is a probability
 	QuoteToken       string `json:"quote_token,omitempty"`       // collateral token, e.g. USDC
+
+	// Question-level shape, surfaced so an agent can discover a new market class
+	// at runtime instead of doing raw-API archaeology (schema v1 is additive).
+	// QuestionClass is the raw class token ("priceBinary", "priceBucket", …) and
+	// is empty for plain-English event questions.
+	QuestionClass   string   `json:"question_class,omitempty"`
+	QuestionPeriod  string   `json:"question_period,omitempty"`  // e.g. "1d" for a daily recurring market
+	PriceThresholds []string `json:"price_thresholds,omitempty"` // priceBucket: ascending bucket edges
+
+	// priceBucket leg placement. BucketIndex is the leg's position among the
+	// question's named outcomes (0-based, ascending by price); BucketLow/High are
+	// its open interval, with an empty side meaning unbounded. Set only when the
+	// question's structure was VERIFIED (see planPriceBuckets) — never guessed,
+	// because a mislabelled bucket is a money bug, not a display bug.
+	BucketIndex *int   `json:"bucket_index,omitempty"`
+	BucketLow   string `json:"bucket_low,omitempty"`
+	BucketHigh  string `json:"bucket_high,omitempty"`
+	// IsFallback marks the question's fallback leg ("none of the named buckets").
+	IsFallback bool `json:"is_fallback,omitempty"`
 }
 
 // metaCacheFile is the on-disk meta cache (§8): the raw API metas + a stamp.
