@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -80,6 +81,17 @@ func TestUpdateIsolatedMargin(t *testing.T) {
 	}
 	if _, err := ex.UpdateIsolatedMargin(ctx, -25, "BTC"); err != nil {
 		t.Fatalf("remove margin: %v", err)
+	}
+}
+
+func TestUpdateIsolatedMarginRejectsUnsafeAmounts(t *testing.T) {
+	ex, ctx := testExchange(t, noInfo, func(string, map[string]any) (int, string) {
+		return 200, `{"status":"ok","response":{"type":"default"}}`
+	})
+	for _, amount := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), math.MaxFloat64} {
+		if _, err := ex.UpdateIsolatedMargin(ctx, amount, "BTC"); err == nil {
+			t.Fatalf("accepted unsafe isolated margin amount %v", amount)
+		}
 	}
 }
 
@@ -234,7 +246,48 @@ func TestSmallHelpers(t *testing.T) {
 	if absFloat(-3) != 3 || absFloat(3) != 3 {
 		t.Error("absFloat")
 	}
-	if parseFloat("1.5") != 1.5 || parseFloat("nope") != 0 {
+	if parseFloat("1.5") != 1.5 || parseFloat("nope") != 0 || parseFloat("NaN") != 0 || parseFloat("+Inf") != 0 {
 		t.Error("parseFloat")
+	}
+}
+
+// The isolated-margin wire encoding, pinned.
+//
+// This was verified LIVE ON MAINNET and the two failure modes it fixes are both
+// silent, so it must not be "cleaned up" back toward the reference Go SDK by
+// someone reading the shape and assuming:
+//
+//  1. ntli is a SIGNED INTEGER in USD*1e6. A raw float makes the exchange
+//     recover a garbage signer — it fails as an AUTH error ("User or API Wallet
+//     0x... does not exist"), which looks like a key problem, not an encoding one.
+//  2. isBuy is ALWAYS true; the SIGN of ntli carries direction. The Go SDK's
+//     isBuy=amount>0 with abs(ntli) silently ADDED margin on a REMOVE.
+func TestIsolatedMarginEncodesSignedMicroUSD(t *testing.T) {
+	cases := []struct {
+		usd  float64
+		want int
+	}{
+		{5, 5_000_000},
+		{-5, -5_000_000},       // a REMOVE stays negative rather than flipping isBuy
+		{0.000001, 1},          // one micro-dollar, the smallest representable step
+		{1.2345678, 1_234_568}, // rounded, not truncated
+	}
+	for _, c := range cases {
+		got := int(math.Round(c.usd * 1e6))
+		if got != c.want {
+			t.Errorf("$%v should encode as %d micro-USD, got %d", c.usd, c.want, got)
+		}
+	}
+}
+
+// A non-finite or absurd amount must be refused BEFORE it reaches the signer.
+// int(NaN) and int(+Inf) are implementation-defined garbage in Go, and garbage
+// in a signed action is a garbage order.
+func TestIsolatedMarginRejectsNonFiniteAmounts(t *testing.T) {
+	ex := &Exchange{}
+	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 1e300} {
+		if _, err := ex.UpdateIsolatedMargin(context.Background(), bad, "BTC"); err == nil {
+			t.Errorf("amount %v must be rejected before signing", bad)
+		}
 	}
 }

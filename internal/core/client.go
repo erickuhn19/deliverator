@@ -355,6 +355,22 @@ func (c *Client) EnsureOutcomes(ctx context.Context) error {
 	return c.loadOutcomes(ctx)
 }
 
+// RefreshOutcomes reloads the HIP-4 universe unconditionally.
+//
+// EnsureOutcomes caches for the process lifetime, which is right for a one-shot
+// CLI and WRONG for anything long-lived: outcome markets are DAILY, so a server
+// that loaded the universe at startup stops recognising the coin the moment the
+// binary rolls. Every order then fails "unknown coin #<enc>" — while the
+// decision layer, reading a stream that resolves coins independently, believes
+// it is quoting normally.
+//
+// That is not hypothetical: it cost a full session of trading. A downstream
+// maker sat at 398 consecutive placement failures against a market it could see
+// perfectly well.
+func (c *Client) RefreshOutcomes(ctx context.Context) error {
+	return c.loadOutcomes(ctx)
+}
+
 // safeNewInfo / safeNewExchange convert internal/hl's panic-on-meta-fetch-failure
 // into a normal error (NewInfo/NewExchange panic if a nil meta must be fetched
 // and the network call fails).
