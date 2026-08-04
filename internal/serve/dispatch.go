@@ -38,6 +38,15 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 			fmt.Sprintf("method %q is not served", req.Method)).
 			WithHint("serve mode exposes the execution path only; streams and admin stay on the CLI. Available: "+joinMethods()))
 	}
+
+	// Pick up a `config set` BEFORE the gates read the caps. This process
+	// outlives the edit — a server that captured risk config at startup enforced
+	// it from memory for two days while `deliverator risk` from a fresh fork
+	// reported the operator's new value, so verification passed while the order
+	// path stayed blocked (#41). One stat per request; a parse only when the file
+	// actually moved.
+	guardWarns := s.eng.ReloadGuardsIfChanged(s.configPath)
+
 	resp := h(s, ctx, req)
 
 	// A "#<enc>" coin the universe does not know is almost always a stale cache,
@@ -51,6 +60,19 @@ func (s *Server) dispatch(ctx context.Context, req Request) Response {
 	if !resp.OK && resp.Error != nil && resp.Error.Code == "unknown_coin" &&
 		strings.Contains(resp.Error.Message, "#") && s.reloadOutcomes(ctx) {
 		resp = h(s, ctx, req)
+	}
+
+	// A reload that changed a cap must be legible in the envelope it affected —
+	// silently widening a limit is exactly what the operator must never miss.
+	if len(guardWarns) > 0 {
+		resp.Warnings = append(guardWarns, resp.Warnings...)
+	}
+	// A RISK REJECTION MUST NAME THE CONFIG IT ENFORCED. The two-day outage was
+	// invisible because the rejection quoted a cap ("70.0%") that no longer
+	// existed on disk, with nothing to say which generation it came from. With
+	// this, a stale server is diagnosable from a single error.
+	if !resp.OK && resp.Error != nil && resp.Error.Category == "risk" {
+		resp.Error.Message += fmt.Sprintf(" [enforcing %s]", s.eng.GuardGeneration())
 	}
 	return resp
 }

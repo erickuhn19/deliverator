@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	hl "github.com/erickuhn19/deliverator/internal/hl"
@@ -19,9 +20,11 @@ import (
 // leverage when no tier table applies (e.g. a sub-dex). Returns 0 for an unknown
 // or zero-leverage coin.
 func (m *MetaStore) MaintenanceMarginFraction(coin string, notional float64) float64 {
-	mk, ok := m.Lookup(coin)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	mk, ok := m.lookupLocked(coin)
 	if !ok {
-		mk, ok = m.Lookup(bareCoin(coin)) // sub-dex coins are indexed bare
+		mk, ok = m.lookupLocked(bareCoin(coin)) // sub-dex coins are indexed bare
 	}
 	if !ok || mk.MaxLeverage <= 0 {
 		return 0
@@ -81,12 +84,31 @@ type Market struct {
 	Title            string `json:"title,omitempty"`             // human-readable: what a Yes/No resolves on
 	Question         int    `json:"question,omitempty"`          // grouping question id (0 = none)
 	QuestionName     string `json:"question_name,omitempty"`     // e.g. "2026 World Cup Champion"
-	Underlying       string `json:"underlying,omitempty"`        // priceBinary: BTC/ETH/...
+	Underlying       string `json:"underlying,omitempty"`        // priceBinary/priceBucket: BTC/ETH/...
 	TargetPrice      string `json:"target_price,omitempty"`      // priceBinary target
-	Expiry           string `json:"expiry,omitempty"`            // priceBinary expiry (YYYY-MM-DD HH:MMZ)
+	Expiry           string `json:"expiry,omitempty"`            // settlement (YYYY-MM-DD HH:MMZ)
 	ResolutionStatus string `json:"resolution_status,omitempty"` // "open" | "settled"
 	PriceBound       string `json:"price_bound,omitempty"`       // "0..1" — price is a probability
 	QuoteToken       string `json:"quote_token,omitempty"`       // collateral token, e.g. USDC
+
+	// Question-level shape, surfaced so an agent can discover a new market class
+	// at runtime instead of doing raw-API archaeology (schema v1 is additive).
+	// QuestionClass is the raw class token ("priceBinary", "priceBucket", …) and
+	// is empty for plain-English event questions.
+	QuestionClass   string   `json:"question_class,omitempty"`
+	QuestionPeriod  string   `json:"question_period,omitempty"`  // e.g. "1d" for a daily recurring market
+	PriceThresholds []string `json:"price_thresholds,omitempty"` // priceBucket: ascending bucket edges
+
+	// priceBucket leg placement. BucketIndex is the leg's position among the
+	// question's named outcomes (0-based, ascending by price); BucketLow/High are
+	// its open interval, with an empty side meaning unbounded. Set only when the
+	// question's structure was VERIFIED (see planPriceBuckets) — never guessed,
+	// because a mislabelled bucket is a money bug, not a display bug.
+	BucketIndex *int   `json:"bucket_index,omitempty"`
+	BucketLow   string `json:"bucket_low,omitempty"`
+	BucketHigh  string `json:"bucket_high,omitempty"`
+	// IsFallback marks the question's fallback leg ("none of the named buckets").
+	IsFallback bool `json:"is_fallback,omitempty"`
 }
 
 // metaCacheFile is the on-disk meta cache (§8): the raw API metas + a stamp.
@@ -104,7 +126,22 @@ type PerpDexEntry struct {
 }
 
 // MetaStore holds the market universe and fast coin→Market lookups.
+//
+// CONCURRENCY. Every field below is guarded by mu. This store was originally
+// written for a process that lives for one command, where it is built once and
+// only read afterwards — but `serve` handles each connection on its own
+// goroutine (internal/serve/serve.go) and reloads the HIP-4 universe on the
+// daily roll (RefreshOutcomes). That makes AddOutcomes a WRITER racing every
+// Lookup, and a concurrent map read+write is a Go runtime FATAL ERROR, not a
+// recoverable panic — it would kill a process holding the signing socket. See
+// #43.
+//
+// The exported readers take mu.RLock. Methods that need a lookup while already
+// holding the lock must call lookupLocked, never Lookup: sync.RWMutex is not
+// reentrant, so a second RLock deadlocks the moment a writer is queued between
+// the two.
 type MetaStore struct {
+	mu             sync.RWMutex
 	network        string
 	fetchedAt      time.Time
 	meta           *hl.Meta
@@ -114,15 +151,59 @@ type MetaStore struct {
 	perpDexs       []PerpDexEntry
 	outcomeMeta    *hl.OutcomeMeta
 	outcomeMarkets []Market // HIP-4 outcomes — discoverable via `markets --class outcome`, kept out of `ordered`
+	// outcomeCoins is the set of byCoin keys the last AddOutcomes installed, so a
+	// reload can retire the coins that rolled out instead of leaving them
+	// resolvable forever.
+	outcomeCoins []string
+	// perpDexCoins is the same idea per sub-dex index.
+	perpDexCoins map[int][]string
 }
 
 // AddPerpDex indexes a builder sub-dex's perps as "<dex>:<coin>" markets so they
 // are tradable. The asset id matches hl.PerpDexAsset so signing is correct.
+//
+// Idempotent per dex index: re-adding a dex REPLACES its universe rather than
+// appending a second copy. It is called once per dex at construction today, but
+// an append-only writer is a latent duplication bug the moment anything reloads
+// (exactly what bit the outcome universe — see AddOutcomes and #43).
 func (m *MetaStore) AddPerpDex(dexIndex int, meta *hl.Meta) {
 	if meta == nil {
 		return
 	}
-	m.perpDexs = append(m.perpDexs, PerpDexEntry{Index: dexIndex, Meta: meta})
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Retire the previous universe for this dex, if any.
+	if old, ok := m.perpDexCoins[dexIndex]; ok {
+		retired := make(map[string]bool, len(old))
+		for _, key := range old {
+			delete(m.byCoin, key)
+			retired[key] = true
+		}
+		kept := m.ordered[:0]
+		for _, mk := range m.ordered {
+			if !retired[strings.ToUpper(mk.Coin)] {
+				kept = append(kept, mk)
+			}
+		}
+		m.ordered = kept
+	}
+	replaced := false
+	for i, e := range m.perpDexs {
+		if e.Index == dexIndex {
+			m.perpDexs[i] = PerpDexEntry{Index: dexIndex, Meta: meta}
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		m.perpDexs = append(m.perpDexs, PerpDexEntry{Index: dexIndex, Meta: meta})
+	}
+
+	if m.perpDexCoins == nil {
+		m.perpDexCoins = make(map[int][]string)
+	}
+	keys := make([]string, 0, len(meta.Universe))
 	for j, a := range meta.Universe {
 		mk := Market{
 			Coin:         a.Name,
@@ -135,24 +216,39 @@ func (m *MetaStore) AddPerpDex(dexIndex int, meta *hl.Meta) {
 			IsSpot:       false,
 			Delisted:     a.IsDelisted,
 		}
-		m.byCoin[strings.ToUpper(a.Name)] = mk
+		key := strings.ToUpper(a.Name)
+		m.byCoin[key] = mk
 		m.ordered = append(m.ordered, mk)
+		keys = append(keys, key)
 	}
+	m.perpDexCoins[dexIndex] = keys
 }
 
 // PerpDexEntries returns the loaded sub-dexes so the signing Exchange's Info can
 // be registered with the same asset ids.
-func (m *MetaStore) PerpDexEntries() []PerpDexEntry { return m.perpDexs }
+func (m *MetaStore) PerpDexEntries() []PerpDexEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]PerpDexEntry(nil), m.perpDexs...)
+}
 
 // OutcomeMeta returns the loaded HIP-4 outcome universe (nil if outcomes are not
 // enabled/loaded), so the signing Exchange's Info can be registered with the same
 // asset ids.
-func (m *MetaStore) OutcomeMeta() *hl.OutcomeMeta { return m.outcomeMeta }
+func (m *MetaStore) OutcomeMeta() *hl.OutcomeMeta {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.outcomeMeta
+}
 
 // OutcomeMarkets returns the loaded HIP-4 outcome markets (Yes/No legs) in a stable
 // order. They are surfaced via `markets --class outcome`, kept out of the default
 // `markets` listing because they number in the hundreds and rotate daily.
-func (m *MetaStore) OutcomeMarkets() []Market { return m.outcomeMarkets }
+func (m *MetaStore) OutcomeMarkets() []Market {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]Market(nil), m.outcomeMarkets...)
+}
 
 // NewMetaStore builds a store (and its lookup maps) from API metas.
 func NewMetaStore(network string, meta *hl.Meta, spotMeta *hl.SpotMeta, fetchedAt time.Time) *MetaStore {
@@ -211,6 +307,14 @@ func (m *MetaStore) build() {
 
 // Lookup resolves a coin (perp ticker or spot pair name) to its Market.
 func (m *MetaStore) Lookup(coin string) (Market, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lookupLocked(coin)
+}
+
+// lookupLocked is Lookup's body without the lock. Callers must already hold
+// m.mu (read or write) — see the concurrency note on MetaStore.
+func (m *MetaStore) lookupLocked(coin string) (Market, bool) {
 	mk, ok := m.byCoin[strings.ToUpper(strings.TrimSpace(coin))]
 	return mk, ok
 }
@@ -219,6 +323,8 @@ func (m *MetaStore) Lookup(coin string) (Market, bool) {
 // find the sellable balance when closing a spot holding. SpotBalance.Token keys
 // to the same index.
 func (m *MetaStore) SpotBaseToken(coin string) (int, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.spotMeta == nil {
 		return 0, false
 	}
@@ -239,7 +345,9 @@ func (m *MetaStore) SpotBaseToken(coin string) (int, bool) {
 // fees at the pair's mid (pnl attribution): failing this join would wrongly
 // EXCLUDE a fee whose mid is available, under-reporting costs.
 func (m *MetaStore) SpotPairForToken(token string) (Market, bool) {
-	if mk, ok := m.Lookup(token + "/USDC"); ok && mk.IsSpot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if mk, ok := m.lookupLocked(token + "/USDC"); ok && mk.IsSpot {
 		return mk, true // canonical pair name
 	}
 	if m.spotMeta == nil {
@@ -260,37 +368,61 @@ func (m *MetaStore) SpotPairForToken(token string) (Market, bool) {
 	}
 	for _, p := range m.spotMeta.Universe {
 		if len(p.Tokens) == 2 && p.Tokens[0] == tokIdx && p.Tokens[1] == usdcIdx {
-			return m.Lookup(p.Name)
+			return m.lookupLocked(p.Name)
 		}
 	}
 	return Market{}, false
 }
 
-// Markets returns all markets in universe order (perps first, then spot).
-func (m *MetaStore) Markets() []Market { return m.ordered }
+// Markets returns all markets in universe order (perps first, then spot). The
+// slice is copied: the caller must not observe a later refresh mutating it.
+func (m *MetaStore) Markets() []Market {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]Market(nil), m.ordered...)
+}
 
 // Age reports how stale the cache is.
-func (m *MetaStore) Age() time.Duration { return time.Since(m.fetchedAt) }
+func (m *MetaStore) Age() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return time.Since(m.fetchedAt)
+}
 
 // FetchedAt reports when the metadata was fetched.
-func (m *MetaStore) FetchedAt() time.Time { return m.fetchedAt }
+func (m *MetaStore) FetchedAt() time.Time {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.fetchedAt
+}
 
 // Meta / SpotMeta expose the raw API metas (to pass to NewExchange/NewInfo and
 // avoid a refetch/panic).
-func (m *MetaStore) Meta() *hl.Meta         { return m.meta }
-func (m *MetaStore) SpotMeta() *hl.SpotMeta { return m.spotMeta }
+func (m *MetaStore) Meta() *hl.Meta {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.meta
+}
+
+func (m *MetaStore) SpotMeta() *hl.SpotMeta {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.spotMeta
+}
 
 // Save writes the meta cache to path (0600).
 func (m *MetaStore) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	m.mu.RLock()
 	b, err := json.Marshal(metaCacheFile{
 		Network:   m.network,
 		FetchedAt: m.fetchedAt.UnixMilli(),
 		Meta:      m.meta,
 		SpotMeta:  m.spotMeta,
 	})
+	m.mu.RUnlock()
 	if err != nil {
 		return err
 	}

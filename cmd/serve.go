@@ -66,7 +66,10 @@ second front-end onto the engine, not a way around its envelope.`,
 			return fail("serve", err)
 		}
 
-		srv := serve.New(eng, serveSocketPath(), func() output.Meta { return RootMeta(0) })
+		// Watch the config this process actually loaded, so `config set` reaches
+		// the gates instead of being enforced from a startup snapshot forever (#41).
+		srv := serve.New(eng, serveSocketPath(), func() output.Meta { return RootMeta(0) }).
+			WatchConfig(Cfg.SourcePath())
 		if err := srv.Listen(); err != nil {
 			return fail("serve", output.Validation("listen", err.Error()))
 		}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -45,6 +46,40 @@ type guardConfig struct {
 	automation config.Automation
 }
 
+// guardGeneration identifies the on-disk config a guard snapshot came from.
+// (mtime, size) is enough to notice any `config set`, which rewrites the file
+// atomically, and it costs one stat rather than a parse per request.
+type guardGeneration struct {
+	ModTimeMs int64
+	Size      int64
+	Loaded    bool
+}
+
+// String is what a rejection quotes so a stale cache is visible in the error
+// itself, rather than only by diffing against a fresh CLI fork.
+func (g guardGeneration) String() string {
+	if !g.Loaded {
+		return "startup (config generation unknown)"
+	}
+	return fmt.Sprintf("config generation %d (mtime %s)",
+		g.ModTimeMs, time.UnixMilli(g.ModTimeMs).UTC().Format("2006-01-02T15:04:05Z"))
+}
+
+// currentGuardGeneration stamps the config file the client is starting from, so
+// the first ReloadGuardsIfChanged has a real baseline to compare against instead
+// of reloading once spuriously.
+func currentGuardGeneration(cfg *config.Config) guardGeneration {
+	path := config.Path()
+	if cfg != nil && cfg.SourcePath() != "" {
+		path = cfg.SourcePath()
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() == 0 {
+		return guardGeneration{}
+	}
+	return guardGeneration{ModTimeMs: fi.ModTime().UnixMilli(), Size: fi.Size(), Loaded: true}
+}
+
 func guardConfigFrom(cfg *config.Config) *guardConfig {
 	if cfg == nil {
 		return &guardConfig{}
@@ -73,11 +108,14 @@ type Client struct {
 	// unit clients leave it nil and fall back to cfg, which keeps the simple test
 	// fixtures working.
 	//
-	// There is deliberately NO exported setter. Swapping guards at runtime is a
-	// real need for a long-lived process, but it arrives WITH its consumer and a
-	// test rather than as unreachable API waiting for one.
-	guardMu sync.RWMutex
-	guards  *guardConfig
+	// The runtime swap is ReloadGuardsIfChanged, whose consumer is `serve` (#41):
+	// a server loaded risk config at startup and then enforced it from memory
+	// forever, rejecting 3,000+ placements against a cap the operator had already
+	// raised on disk. guardGen stamps the config file the current guards came
+	// from, so a rejection can say WHICH generation it enforced.
+	guardMu  sync.RWMutex
+	guards   *guardConfig
+	guardGen guardGeneration
 
 	meta *MetaStore
 	info *hl.Info
@@ -88,7 +126,11 @@ type Client struct {
 	nonce *state.NonceLock
 	audit *state.Audit
 
-	// lazily initialized only when a write needs to sign
+	// lazily initialized only when a write needs to sign, and guarded by exMu:
+	// under `serve` several connection goroutines can reach the first write at
+	// once, and the HIP-4 roll re-registers the signer's asset ids underneath
+	// them (see reregisterSignerUniverse). Nothing here is safe to touch unlocked.
+	exMu       sync.Mutex
 	agent      *wallet.Agent
 	ex         *hl.Exchange
 	signerWarn string // non-empty if the loaded signer is misconfigured (T3-keybind)
@@ -126,6 +168,8 @@ func (c *Client) automationConfig() config.Automation { return c.currentGuards()
 // T3-keybind), or nil. Every write path prepends it to its warnings so a
 // dangerous signer setup surfaces in the result envelope.
 func (c *Client) signerWarnings() []string {
+	c.exMu.Lock()
+	defer c.exMu.Unlock()
 	if c.signerWarn == "" {
 		return nil
 	}
@@ -160,12 +204,13 @@ func New(ctx context.Context, cfg *config.Config, opts Options) (*Client, error)
 		opts.Timeout = 15 * time.Second
 	}
 	c := &Client{
-		cfg:     cfg,
-		opts:    opts,
-		network: cfg.Network,
-		signURL: signURLFor(cfg.Network),
-		httpc:   &http.Client{Timeout: opts.Timeout},
-		guards:  guardConfigFrom(cfg),
+		cfg:      cfg,
+		opts:     opts,
+		network:  cfg.Network,
+		signURL:  signURLFor(cfg.Network),
+		httpc:    &http.Client{Timeout: opts.Timeout},
+		guards:   guardConfigFrom(cfg),
+		guardGen: currentGuardGeneration(cfg),
 	}
 	c.infoURL = c.signURL
 	if cfg.Endpoints.InfoURL != "" {
@@ -339,7 +384,32 @@ func (c *Client) loadOutcomes(ctx context.Context) error {
 	}
 	c.meta.AddOutcomes(om)
 	c.info.RegisterOutcomes(om)
+	c.reregisterSignerUniverse(om)
 	return nil
+}
+
+// reregisterSignerUniverse teaches an ALREADY-BUILT signer the reloaded HIP-4
+// asset ids.
+//
+// The signer carries its own hl.Info, seeded exactly once in exchange() on the
+// process's first write. Refreshing only c.meta and c.info left that copy on the
+// previous day's universe, so after a roll a placement resolved through the
+// gates, got SIGNED, and then died in newCreateOrderAction with "coin #<enc> not
+// found in info" — mapped to exit 50 (exchange-rejected, NON-retryable), which
+// serve's unknown_coin retry cannot recover. That reproduced the very outage the
+// reactive refresh was added to fix. See #43.
+//
+// No-op before the first write, when there is no signer to correct.
+func (c *Client) reregisterSignerUniverse(om *hl.OutcomeMeta) {
+	if om == nil {
+		return
+	}
+	c.exMu.Lock()
+	defer c.exMu.Unlock()
+	if c.ex == nil {
+		return
+	}
+	c.ex.Info().RegisterOutcomes(om)
 }
 
 // EnsureOutcomes lazily loads the HIP-4 outcome universe if it isn't already
@@ -411,6 +481,8 @@ func (c *Client) QueryAddr() string { return c.queryAddr }
 
 // AgentAddress returns the loaded agent address, or "" if no write has occurred.
 func (c *Client) AgentAddress() string {
+	c.exMu.Lock()
+	defer c.exMu.Unlock()
 	if c.agent == nil {
 		return ""
 	}
@@ -432,8 +504,136 @@ func (c *Client) requireQueryAddr() error {
 // with the same auth error (exit 30) as a dedicated read when none is set.
 func (c *Client) RequireQueryAddr() error { return c.requireQueryAddr() }
 
+// GuardGeneration reports which on-disk config the gates are currently
+// enforcing, for the rejection envelope.
+func (c *Client) GuardGeneration() string {
+	c.guardMu.RLock()
+	defer c.guardMu.RUnlock()
+	return c.guardGen.String()
+}
+
+// ReloadGuardsIfChanged re-reads the risk/automation config when the file on
+// disk has changed, and swaps the snapshot the gates read.
+//
+// WHY. `deliverator config set` writes the file and exits; a long-lived `serve`
+// had already captured risk config at startup and kept enforcing it from memory.
+// The operator raised max_drawdown_pct on disk, `deliverator risk` (a fresh
+// fork) correctly reported the new value, and the socket rejected 3,000+
+// placements against the old one for two days. The fork path and the serve path
+// disagreeing is what made it invisible. See #41.
+//
+// FAILING CLOSED IS THE WHOLE POINT. Config is where the risk caps live, so
+// "could not read it" must never become "there are no caps". A missing, empty,
+// or unparseable file KEEPS THE CURRENT GUARDS rather than resetting to a zero
+// config — every cap is `0 = off`, so a truncated file would silently disable
+// the account's entire risk envelope. A zero-length file is explicitly treated
+// like a missing one: it parses as valid TOML into an all-zero Config, which is
+// exactly the gutted-file shape that must not be honoured.
+//
+// A legitimate widening (the case that motivated this) IS applied — but it is
+// reported, never silent, per the standing rule that a cap must not widen
+// quietly.
+//
+// Returns the warnings to attach to the request's envelope.
+func (c *Client) ReloadGuardsIfChanged(path string) []string {
+	if path == "" {
+		path = config.Path()
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() == 0 {
+		c.guardMu.Lock()
+		defer c.guardMu.Unlock()
+		if !c.guardGen.Loaded {
+			return nil // never successfully stamped; nothing new to say
+		}
+		what := "unreadable"
+		if err == nil {
+			what = "zero-length"
+		}
+		c.guardGen.Loaded = false
+		return []string{fmt.Sprintf(
+			"risk config at %s is %s — KEEPING the previously loaded caps rather than "+
+				"falling back to an empty config (every cap is `0 = off`, so a truncated "+
+				"file would disable the whole risk envelope)", path, what)}
+	}
+
+	gen := guardGeneration{ModTimeMs: fi.ModTime().UnixMilli(), Size: fi.Size(), Loaded: true}
+
+	c.guardMu.RLock()
+	cur := c.guardGen
+	c.guardMu.RUnlock()
+	if cur.Loaded && cur.ModTimeMs == gen.ModTimeMs && cur.Size == gen.Size {
+		return nil // unchanged — the common path, one stat and done
+	}
+
+	cfg, lerr := config.Load(path)
+	if lerr != nil || cfg == nil {
+		c.guardMu.Lock()
+		defer c.guardMu.Unlock()
+		c.guardGen.Loaded = false
+		return []string{fmt.Sprintf(
+			"risk config at %s changed but does not parse (%v) — KEEPING the previously "+
+				"loaded caps; fix the file, the gates are still enforcing the last good one",
+			path, lerr)}
+	}
+
+	next := guardConfigFrom(cfg)
+
+	c.guardMu.Lock()
+	prev := c.guards
+	c.guards = next
+	c.guardGen = gen
+	c.guardMu.Unlock()
+
+	changes := describeRiskChanges(prev, next)
+	if len(changes) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("risk config reloaded from disk (%s): %s",
+		gen.String(), strings.Join(changes, "; "))}
+}
+
+// describeRiskChanges names every risk cap that moved between two snapshots,
+// calling out the safety-reducing direction explicitly. A widened or disabled
+// cap must be legible in the envelope — silently loosening the account's limits
+// is the failure mode this whole path is built to avoid.
+func describeRiskChanges(prev, next *guardConfig) []string {
+	if prev == nil || next == nil {
+		return nil
+	}
+	var out []string
+	for _, f := range []struct {
+		name     string
+		old, new float64
+	}{
+		{"risk.max_drawdown_pct", prev.risk.MaxDrawdownPct, next.risk.MaxDrawdownPct},
+		{"risk.max_daily_loss_pct", prev.risk.MaxDailyLossPct, next.risk.MaxDailyLossPct},
+		{"risk.max_daily_loss_usd", prev.risk.MaxDailyLossUSD, next.risk.MaxDailyLossUSD},
+		{"risk.max_account_leverage", prev.risk.MaxAccountLeverage, next.risk.MaxAccountLeverage},
+		{"risk.max_concentration_pct_per_coin", prev.risk.MaxConcentrationPctPerCoin, next.risk.MaxConcentrationPctPerCoin},
+		{"risk.max_order_notional_usd", prev.risk.MaxOrderNotionalUSD, next.risk.MaxOrderNotionalUSD},
+	} {
+		if f.old == f.new {
+			continue
+		}
+		switch {
+		case f.new == 0:
+			out = append(out, fmt.Sprintf("%s %g -> OFF (gate disabled)", f.name, f.old))
+		case f.old == 0:
+			out = append(out, fmt.Sprintf("%s OFF -> %g (gate enabled)", f.name, f.new))
+		case f.new > f.old:
+			out = append(out, fmt.Sprintf("%s %g -> %g (WIDENED)", f.name, f.old, f.new))
+		default:
+			out = append(out, fmt.Sprintf("%s %g -> %g (tightened)", f.name, f.old, f.new))
+		}
+	}
+	return out
+}
+
 // exchange lazily loads the agent key and builds the signing client.
 func (c *Client) exchange(ctx context.Context) (*hl.Exchange, error) {
+	c.exMu.Lock()
+	defer c.exMu.Unlock()
 	if c.ex != nil {
 		return c.ex, nil
 	}

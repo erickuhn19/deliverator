@@ -7,16 +7,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 )
 
 // spotAssetIndexOffset is added to a spot universe index to form its asset id.
 const spotAssetIndexOffset = 10000
 
 type Info struct {
-	transport      *httpTransport
+	transport *httpTransport
+	// mu guards coinToAsset/assetToDecimal. They are seeded once in NewInfo, but
+	// RegisterOutcomes/RegisterPerpDex write them AFTER construction and a
+	// long-lived server re-registers on the daily HIP-4 roll while other
+	// goroutines resolve coins to sign. A concurrent map read+write is a Go
+	// runtime FATAL ERROR, and these maps are on the signing path. See #43.
+	mu             sync.RWMutex
 	coinToAsset    map[string]int
 	assetToDecimal map[int]int
 	clientOpts     []ClientOpt
+}
+
+// AssetDecimals returns the registered szDecimals for an asset id (0 if absent).
+func (i *Info) AssetDecimals(asset int) int {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.assetToDecimal[asset]
 }
 
 // NewInfo builds a read client. If meta/spotMeta are nil they are fetched (and
@@ -83,6 +97,8 @@ func NewInfo(
 
 // CoinToAsset resolves a coin name to its integer asset id.
 func (i *Info) CoinToAsset(coin string) (int, bool) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
 	a, ok := i.coinToAsset[coin]
 	return a, ok
 }
@@ -209,6 +225,8 @@ func (i *Info) PerpDexNames(ctx context.Context) ([]string, error) {
 // RegisterPerpDex registers a sub-dex's coins into coin->asset resolution so an
 // order on "<dex>:<coin>" signs with the correct HIP-3 asset id.
 func (i *Info) RegisterPerpDex(dexIndex int, m *Meta) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	for j, a := range m.Universe {
 		asset := PerpDexAsset(dexIndex, j)
 		i.coinToAsset[a.Name] = asset
@@ -276,6 +294,8 @@ func (i *Info) RegisterOutcomes(m *OutcomeMeta) {
 	if m == nil {
 		return
 	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	for _, o := range m.Outcomes {
 		for side := 0; side < len(o.SideSpecs) && side <= outcomeMaxSide; side++ {
 			asset := OutcomeAsset(o.Outcome, side)
