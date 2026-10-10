@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -172,6 +173,12 @@ func renderHuman(env Envelope) {
 		}
 		if env.Error.RetryAfterMs != nil {
 			fmt.Fprintf(writer, "  retry after: %d ms\n", *env.Error.RetryAfterMs)
+		}
+		if len(env.Error.Cloids) > 0 {
+			fmt.Fprintf(writer, "  cloids: %s\n", strings.Join(env.Error.Cloids, " "))
+		}
+		if len(env.Error.IntentIDs) > 0 {
+			fmt.Fprintf(writer, "  intent_ids: %s\n", strings.Join(env.Error.IntentIDs, " "))
 		}
 		return
 	}

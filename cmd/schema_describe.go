@@ -7,6 +7,7 @@ import (
 
 	"github.com/erickuhn19/deliverator/internal/core"
 	"github.com/erickuhn19/deliverator/internal/hl"
+	"github.com/erickuhn19/deliverator/internal/papertrade"
 )
 
 // schemaRegistry maps a command name to a zero value of the type its `data`
@@ -47,6 +48,14 @@ var schemaRegistry = map[string]any{
 	// streams (one envelope per line)
 	"watch": core.WatchEval{},
 	"chase": core.ChaseEvent{},
+	// Papertrade (HyperEVM). Summary is the venue's own document.
+	"papertrade-markets":          papertrade.Markets{},
+	"papertrade-account":          papertrade.AccountView{},
+	"papertrade-open":             map[string]any{},
+	"papertrade-summary":          map[string]any{},
+	"papertrade-deposit-address":  map[string]any{},
+	"papertrade-deposit-status":   map[string]any{},
+	"papertrade-deposit-register": map[string]any{},
 }
 
 // describeCommand returns the JSON Schema of a command's `data` payload, and

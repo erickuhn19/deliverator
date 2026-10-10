@@ -1,7 +1,8 @@
 # Deliverator
 
 **A single-binary Go CLI: the non-custodial execution + tracking layer an
-autonomous agent (OpenClaw) drives to trade and manage a Hyperliquid portfolio.**
+autonomous agent (OpenClaw) drives to trade a Hyperliquid portfolio and
+Papertrade isolated perps.**
 
 > Codename ref: *Snow Crash* — the Deliverator. Fast, precise, no-BS.
 >
@@ -24,10 +25,13 @@ No backend. No telemetry. `scp` the binary to a box and go.
 
 > ⚠️ **This places real orders with real money on a live exchange.** `init` and
 > `onboard` configure **mainnet** — switch to `testnet` (`config set network
-> testnet`, or the console's network panel) for a paper-funds dry run first.
-> The non-custodial key means a bug can't *drain* your account, but it can still
-> place trades you didn't intend. Provided under the MIT license, **with no
-> warranty** ([LICENSE](./LICENSE)). You are responsible for what your agent does.
+> testnet`, or the console's network panel) for a Hyperliquid paper-funds dry
+> run first. **Papertrade is also real money** on HyperEVM (chain 999). It is
+> not that simulator, and `papertrade` writes refuse to run unless the
+> Hyperliquid network is mainnet. The non-custodial key means a bug can't
+> *drain* your account, but it can still place trades you didn't intend.
+> Provided under the MIT license, **with no warranty** ([LICENSE](./LICENSE)).
+> You are responsible for what your agent does.
 
 ---
 
