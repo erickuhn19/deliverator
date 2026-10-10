@@ -13,7 +13,10 @@ go 1.25.7
 //
 // 1.25.12: GO-2026-5856, an Encrypted Client Hello privacy leak in crypto/tls,
 // reachable from the websocket dialer and the http client.
-toolchain go1.25.12
+//
+// 1.26.9: govulncheck v1.8.0 (installed @latest in CI) requires go >= 1.26,
+// so the 1.25 toolchain could no longer build the scanner.
+toolchain go1.26.9
 
 require (
 	github.com/BurntSushi/toml v1.6.0
