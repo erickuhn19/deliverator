@@ -7,10 +7,11 @@ authoritative, always-current contract is `deliverator tools` (the embedded
 ## What you are driving
 
 Deliverator is a non-custodial CLI between an LLM agent and a **real-money**
-Hyperliquid account. You (the agent) decide *what* to trade; Deliverator enforces
+Hyperliquid account, and the same kind of harness for Papertrade isolated perps
+on HyperEVM. You (the agent) decide *what* to trade; Deliverator enforces
 that the *how* is correct, bounded, and auditable. It signs with an agent/API
-wallet that **physically cannot withdraw** — the worst you can do is place bad
-trades, never drain funds. Do not try to defeat that; it's the point.
+wallet that **physically cannot withdraw** on either venue — the worst you can do
+is place bad trades, never drain funds. Do not try to defeat that; it's the point.
 
 ## Non-negotiable rules
 
@@ -26,7 +27,8 @@ trades, never drain funds. Do not try to defeat that; it's the point.
    re-check before resubmitting the **same** cloid. This is the #1 way naive agents
    double-fill. The failure envelope's `error.cloids` carries the cloid(s) — even
    auto-generated ones — and exit 42 covers any post-send transport failure, not
-   just timeouts (pre-send failures are exit 40, safe to retry).
+   just timeouts (pre-send failures are exit 40, safe to retry). Hyperliquid only:
+   a Papertrade write has no cloid. Use the Papertrade retry rule below.
 4. **Respect the risk caps (exit 20).** They are enforced in core; switching how you
    invoke the binary cannot bypass them. A cap rejection means stop, not retry.
 5. **Stop on halt (exit 21).** A global halt or armed dead-man's switch is rejecting
@@ -48,7 +50,8 @@ trades, never drain funds. Do not try to defeat that; it's the point.
 
 Prices and sizes are **strings**. On failure: `ok=false`, `data=null`, and `error`
 is `{code, category, message, retryable, retry_after_ms, hint}` — plus `cloids`
-(the signed client order id(s)) on write failures.
+(the signed client order id(s)) on Hyperliquid write failures, and `intent_ids`
+on Papertrade write failures. Both arrays are additive.
 
 ## Exit codes (the contract)
 
@@ -68,6 +71,21 @@ is `{code, category, message, retryable, retry_after_ms, hint}` — plus `cloids
   remind whoever runs it to keep the human in the loop. Don't silently widen a cap.
   `config set network` warns the same loud way — flipping the testnet/mainnet
   boundary retargets every subsequent command, so never do it mid-loop on your own.
+
+## Papertrade
+
+`deliverator papertrade` trades isolated perps on HyperEVM (chain 999). That is
+real money at the Hyperliquid mid, not a simulator and not Hyperliquid testnet.
+There is no order book and no cloid. `size` on the wire is margin. The agent key
+signs opens, closes, and cancels, and cannot withdraw. Registering it is a
+one-time master signature via `DELIVERATOR_MASTER_KEY`, which is not stored.
+`serve` does not expose this venue. Default risk caps still apply, so 1000× is
+rejected while `risk.max_leverage` is 10.
+
+On exit 42 (or a post-sign exit 40), `error.intent_ids` names the intent. Run
+`deliverator papertrade intent status --intent <id>`. If it is absent, run
+`deliverator papertrade resend --intent <id>` so the same signed body is posted
+again. A new `papertrade open` is a new position.
 
 ## Contributing to this repo
 

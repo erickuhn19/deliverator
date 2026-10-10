@@ -39,8 +39,8 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:           "deliverator",
-	Short:         "Non-custodial Hyperliquid execution + tracking CLI for autonomous agents",
-	Long:          "Deliverator is the safe harness between an autonomous agent and a Hyperliquid account.\nIt signs with an agent/API wallet that cannot withdraw, enforces hard risk caps, and\nspeaks a deterministic, machine-parseable JSON contract. See `deliverator tools`.",
+	Short:         "Non-custodial Hyperliquid and Papertrade execution CLI for autonomous agents",
+	Long:          "Deliverator is the safe harness between an autonomous agent and a live trading account.\nHyperliquid orders sign with an agent wallet that cannot withdraw. Papertrade isolated\nperps (HyperEVM) use that same key for opens, closes, and cancels — it cannot withdraw\nthere either. Hard risk caps and a machine-parseable JSON contract apply to both.\nSee `deliverator tools`.",
 	SilenceErrors: true, // we render errors as envelopes ourselves
 	SilenceUsage:  true,
 	// A bare `deliverator` (or an unknown command) must emit an envelope under

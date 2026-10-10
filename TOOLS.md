@@ -235,6 +235,53 @@ bad call can do is place a bad trade, never move funds.
 
 > Builder-fee coverage: the configured builder fee attaches to `buy`/`sell`/`order`/`close` and bracket legs. Three cases earn **no** builder fee (each emits a warning): Hyperliquid's `twapOrder` and `modify` actions have no builder field (TWAP and modify orders carry no fee; a modify turns a fee-bearing order into a non-fee one); and a **spot BUY** pays its taker fee in the base token, so HL applies no (quote-denominated) builder fee — **spot sells and all perps do earn it.** To monetize spot flow, prefer the sell side or perps.
 
+## Papertrade (HyperEVM isolated perps — real funds)
+
+`deliverator papertrade` is a second venue. It is live HyperEVM (chain 999), not
+a simulator and not Hyperliquid testnet. There is no order book: an open fills
+at the Hyperliquid mid. There is no cloid. The wire field the venue calls `size`
+is **margin** (USDC, up to 18 decimals), not a coin size. Notional is margin ×
+leverage. The venue minimums are 10 USDC margin and $10,000 notional.
+
+```
+deliverator papertrade markets --json
+deliverator papertrade summary --json
+deliverator papertrade account --json
+deliverator papertrade deposit-address --json
+deliverator papertrade open --coin BTC --side long --margin 1000 --leverage 10 --json
+deliverator papertrade close --position 1 --json
+deliverator papertrade cancel --intent 0x… --json
+deliverator papertrade intent status --intent 0x…
+deliverator papertrade resend --intent 0x…
+deliverator papertrade session --json
+deliverator papertrade session register --json
+```
+
+The agent key signs open, close, and cancel. It cannot withdraw, stake, or
+register itself. `session register` is signed once by the master wallet from
+`DELIVERATOR_MASTER_KEY` and that secret is not stored. `deposit-address` only
+prints the proxy the master wallet can fund; Deliverator does not send the
+deposit. `serve` does not expose Papertrade.
+
+`--dry-run` validates and prices without allocating a nonce or signing. A live
+write stores the signed body before the POST. On **exit 42** (and on a post-sign
+exit 40) the failure envelope's `error.intent_ids` carries the intent id:
+
+1. Run `deliverator papertrade intent status --intent <id> --json`.
+2. If a position already carries it, it landed. Stop.
+3. If it is absent, `deliverator papertrade resend --intent <id> --json` posts
+   **that same signed body**. Do not `papertrade open` again — a new open is a
+   new position with a new nonce.
+
+Default risk caps still apply. `risk.max_leverage` defaults to 10, so a 1000×
+open is exit 20. `automation.limit_only` blocks opens (they fill at mid) and
+still allows closes. A global halt (exit 21) blocks new intents, including
+dry-runs; `resend` of an already-signed intent stays available so an exit 42 can
+be recovered. When an account-wide gate is set (`risk.max_account_leverage`,
+`risk.max_net_exposure_usd`, concentration, drawdown, daily loss, or
+`risk.max_open_positions`), a Papertrade open also has to pass it against the
+Hyperliquid book, and an unreadable book fails closed.
+
 ## Exit codes
 ```
 0  ok                 proceed
@@ -275,6 +322,10 @@ The exchange can take ~1–2s to index a new order by cloid. If status is "absen
 within a couple seconds of placing, **wait briefly and re-check** (or query by
 `--oid` if you have it) before resubmitting — a too-eager recheck can report an
 order that *did* land as absent and trick you into a double-fill.
+
+Papertrade does not use this cloid protocol. Its exit-42 handle is
+`error.intent_ids`, then `papertrade intent status` and `papertrade resend`.
+See **Papertrade** above.
 
 ## Reconcile after a restart (run this FIRST when resuming)
 Before placing anything after a (re)start or a missed tick, adopt on-chain reality:
