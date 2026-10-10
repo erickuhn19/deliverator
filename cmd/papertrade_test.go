@@ -39,6 +39,9 @@ const ptTradingBody = `{
   "intake": ["1","0","0",[]]
 }`
 
+// ptPaperJSON is the wallet frame's paper object. Staking tests override it.
+var ptPaperJSON = `{"balance": "0", "staked": "0"}`
+
 func ptAccountBody() string {
 	exp := time.Now().Unix() + 40*86400
 	return `{
@@ -51,7 +54,7 @@ func ptAccountBody() string {
 	  "locked": "0",
 	  "funds": {"availableBalance": "1000000000000000000000", "availableQueued": "0"},
 	  "consumableDebt": "0",
-	  "paper": {"balance": "0", "staked": "0"},
+	  "paper": ` + ptPaperJSON + `,
 	  "openPositions": []
 	}`
 }
