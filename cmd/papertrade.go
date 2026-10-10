@@ -60,8 +60,9 @@ func init() {
 	papertradeCmd.PersistentFlags().StringVar(&ptAddress, "address", "", "user wallet (default: wallet.master_address)")
 
 	papertradeCmd.AddCommand(ptMarketsCmd, ptSummaryCmd, ptAccountCmd, ptDepositCmd,
-		ptOpenCmd, ptCloseCmd, ptCancelCmd, ptResendCmd, ptIntentCmd, ptSessionCmd)
+		ptOpenCmd, ptCloseCmd, ptCancelCmd, ptResendCmd, ptIntentCmd, ptSessionCmd, ptDepositGroupCmd)
 	ptSessionCmd.AddCommand(ptRegisterCmd)
+	ptDepositGroupCmd.AddCommand(ptDepositRegisterCmd, ptDepositStatusCmd)
 
 	ptOpenCmd.Flags().StringVar(&ptCoin, "coin", "", "market symbol, for example BTC")
 	ptOpenCmd.Flags().StringVar(&ptSide, "side", "", "long or short")
@@ -144,6 +145,104 @@ var ptDepositCmd = &cobra.Command{
 			"collateral":      papertrade.Collateral,
 			"note":            "Send HyperCore USDC here from the master wallet. The first deposit of a new proxy costs 1 USDC to activate. Deliverator does not send it.",
 		}, paperReadWarnings()...)
+		return nil
+	},
+}
+
+var ptDepositGroupCmd = &cobra.Command{
+	Use:   "deposit",
+	Short: "Finish HyperCore deposits (proxy balance, register with the venue)",
+	RunE:  requireSubcommand,
+}
+
+// paperDepositState reads the proxy and the HyperCore USDC sitting on it.
+func paperDepositState(ctx context.Context, user common.Address) (map[string]any, papertrade.ProxyBalance, error) {
+	c := paperClient()
+	proxy, err := c.DepositProxy(ctx, user)
+	if err != nil {
+		return nil, papertrade.ProxyBalance{}, output.Network("papertrade", err.Error()).Retry()
+	}
+	bal, err := c.CoreBalance(ctx, proxy)
+	if err != nil {
+		return nil, bal, output.Network("hyperliquid", err.Error()).Retry()
+	}
+	return map[string]any{
+		"user":            strings.ToLower(user.Hex()),
+		"deposit_address": strings.ToLower(proxy.Hex()),
+		"core_balance":    bal,
+		"minimum_raw_6dp": papertrade.MinDepositRaw,
+	}, bal, nil
+}
+
+var ptDepositStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "HyperCore USDC waiting at the deposit proxy (read-only)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		const name = "papertrade.deposit.status"
+		ctx, cancel := cmdCtx()
+		defer cancel()
+		user, err := paperUser()
+		if err != nil {
+			return fail(name, err)
+		}
+		view, _, err := paperDepositState(ctx, user)
+		if err != nil {
+			return fail(name, err)
+		}
+		emitWarn(name, view, paperReadWarnings()...)
+		return nil
+	},
+}
+
+var ptDepositRegisterCmd = &cobra.Command{
+	Use:   "register",
+	Short: "Ask the venue to sweep HyperCore USDC at the proxy into Papertrade (unsigned, idempotent)",
+	Long: `Step two of a HyperCore deposit. The venue client POSTs
+/funding/deposits/check with {"user": <owner>} once the proxy holds at least
+10 USDC; the venue then deploys the proxy and registers the deposit
+(relayer action registerDeposit). No key signs this request.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		const name = "papertrade.deposit.register"
+		ctx, cancel := cmdCtx()
+		defer cancel()
+		user, err := paperUser()
+		if err != nil {
+			return fail(name, err)
+		}
+		view, bal, err := paperDepositState(ctx, user)
+		if err != nil {
+			return fail(name, err)
+		}
+		view["request"] = map[string]any{
+			"method": "POST",
+			"url":    paperClient().Exchange + papertrade.DepositCheckPath,
+			"body":   json.RawMessage(papertrade.DepositCheckBody(user)),
+		}
+		if !bal.MeetsMinimum {
+			return fail(name, output.Validation("deposit",
+				fmt.Sprintf("proxy holds %d raw USDC (6dp), under the 10 USDC minimum", bal.TotalRaw)).
+				WithHint("send more HyperCore USDC to the deposit address first"))
+		}
+		if flagDryRun {
+			view["dry_run"] = true
+			emitWarn(name, view, paperReadWarnings()...)
+			return nil
+		}
+		reported, err := paperClient().CheckDeposit(ctx, user)
+		if err != nil {
+			var dc *papertrade.DepositCheckError
+			if errors.As(err, &dc) {
+				return fail(name, output.Network("papertrade", err.Error()).
+					WithHint("the venue rejected the check; do not resend unchanged, inspect `papertrade deposit status` and `papertrade account`"))
+			}
+			return fail(name, output.Network("papertrade", err.Error()).Retry())
+		}
+		view["venue_proxy"] = strings.ToLower(reported.Hex())
+		if !strings.EqualFold(reported.Hex(), view["deposit_address"].(string)) {
+			view["warning"] = "venue proxy differs from computeProxyAddress"
+		}
+		view["note"] = "Registered. The balance shows in `papertrade account` once the venue indexes the sweep."
+		emitWarn(name, view, paperReadWarnings()...)
 		return nil
 	},
 }

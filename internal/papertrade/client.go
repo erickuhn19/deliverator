@@ -25,6 +25,7 @@ const browserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/5
 type Client struct {
 	Exchange string
 	RPC      string
+	Info     string
 	HTTP     *http.Client
 }
 
