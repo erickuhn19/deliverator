@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,6 +105,13 @@ func (m Model) renderRisk() string {
 		b.WriteString(m.renderCapRow(rc, idx))
 		idx++
 	}
+	// Envelope-level warnings — notably "the ruin backstop is effectively off".
+	// These are computed in core.RiskStatus and were previously only visible in
+	// `risk --json`, which is exactly the wrong place: the console is the surface
+	// an operator actually watches, and a warning nobody sees is not a warning.
+	for _, w := range m.risk.Warnings {
+		b.WriteString(cDanger.Render("  ⚠ "+wrapTo(w, 74, "    ")) + "\n")
+	}
 	if len(m.risk.Posture) > 0 {
 		b.WriteString(cHdr.Render("  POSTURE") + cDim.Render("  — environment & what the agent may trade") + "\n")
 		for _, p := range m.risk.Posture {
@@ -150,7 +158,45 @@ func (m Model) renderCapRow(rc core.RiskCap, i int) string {
 	} else if !rc.Active {
 		cur = cDim.Render("off")
 	}
+	// A CAP AT ITS MAXIMUM IS NOT A CAP. `max_drawdown_pct = 100` renders as
+	// "100 pct · cur 32.9% · 33%" with a comfortable green bar — it reads as a
+	// gate with headroom when it can never actually fire. Say so on the row
+	// itself; the utilization number is meaningless against a disabled gate.
+	if capDisabledAtMax(rc) {
+		util = cDanger.Render("OFF — cannot fire")
+	}
 	return fmt.Sprintf("%s%s %s  %-18s %s\n", prefix, name, val, cur, util)
+}
+
+// capDisabledAtMax reports a percentage cap set to 100 — nominally "active", but
+// unreachable, so its utilization bar is misleading rather than informative.
+func capDisabledAtMax(rc core.RiskCap) bool {
+	if !rc.Active || rc.Unit != "pct" {
+		return false
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(rc.Value), 64)
+	return err == nil && v >= 100
+}
+
+// wrapTo soft-wraps s to width, indenting continuation lines, so a long warning
+// stays readable in the panel instead of running off the edge.
+func wrapTo(s string, width int, indent string) string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	line := words[0]
+	for _, w := range words[1:] {
+		if len(line)+1+len(w) > width {
+			b.WriteString(line + "\n" + indent)
+			line = w
+			continue
+		}
+		line += " " + w
+	}
+	b.WriteString(line)
+	return b.String()
 }
 
 // renderPostureRow renders one posture setting: booleans as on/off, lists as their
