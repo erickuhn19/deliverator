@@ -248,6 +248,8 @@ deliverator papertrade markets --json
 deliverator papertrade summary --json
 deliverator papertrade account --json
 deliverator papertrade deposit-address --json
+deliverator papertrade deposit status --json     # HyperCore USDC waiting at the proxy (min $10)
+deliverator papertrade deposit register --json   # ask the venue to sweep it in (unsigned, idempotent)
 deliverator papertrade open --coin BTC --side long --margin 1000 --leverage 10 --json
 deliverator papertrade close --position 1 --json
 deliverator papertrade cancel --intent 0x… --json
