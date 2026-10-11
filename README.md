@@ -35,6 +35,57 @@ No backend. No telemetry. `scp` the binary to a box and go.
 
 ---
 
+## Supported venues
+
+| Venue | What Deliverator does | Signing key |
+|---|---|---|
+| **Hyperliquid** (main venue) | Perps and spot: market, limit, IOC, post-only, trigger, TP/SL brackets, batch, grid, chase, TWAP, modify, cancel, close, leverage, margin, copy-trading. Outcome markets: listed by `markets --class outcome` and quoted by the separate `outcome-mm` binary (see below). Reads, streams, risk gates, dead-man switch, halt, panic. | Agent/API wallet (trades, cannot withdraw). Risk caps live in `config.toml`. |
+| **Papertrade** (`deliverator papertrade`) | Isolated perps on HyperEVM (chain 999), real USDC. BTC and ETH only. Open, close, cancel, intent status, resend, markets, summary, account, deposit address, deposit status/register, session register, PAPER stake/unstake/claim. | Agent key as a session key for open/close/cancel. Master wallet (`DELIVERATOR_MASTER_KEY`, read per command, never stored) for session register, stake, unstake, claim. |
+
+Not supported: deposits, withdrawals, and transfers on either venue (by design),
+Papertrade through `serve`, and Papertrade builder codes (the venue has not
+turned them on yet; its roadmap puts frontend fees in a later phase).
+
+### Papertrade at a glance
+
+- **Real money.** Live HyperEVM, not a simulator and not Hyperliquid testnet.
+  Writes refuse to run unless the Hyperliquid network is mainnet.
+- **Markets:** BTC and ETH. Opens fill at the Hyperliquid mid; there is no order book.
+- **Leverage:** up to the venue's per-market maximum (1000x when written), checked
+  against `papertrade markets`. Deliverator's own `risk.max_leverage` still applies
+  (default 10), so raise it in `config.toml` to go higher.
+- **Sizes:** `--margin` is USDC margin. Minimums: 10 USDC margin and $10,000 notional.
+- **Funding:** send USDC (minimum $10) on HyperCore to the address from
+  `papertrade deposit-address`, check it with `papertrade deposit status`, then run
+  `papertrade deposit register` so the venue sweeps it in. Deliverator never sends funds.
+- **Session key:** run `papertrade session register` once with `DELIVERATOR_MASTER_KEY`
+  set. It binds the agent key so it can open, close, and cancel.
+- **PAPER:** the venue mints PAPER to traders on losses and liquidations. It is not
+  transferable yet.
+- **Staking:** `papertrade stake|unstake|claim` with `--yes`, signed by the master
+  wallet. The relayer enforces a minimum per stake (1000 PAPER when written; see
+  `account` → `staking.minimum_stake`). Rewards are paid in USDC.
+
+### Setup per venue
+
+```sh
+# Hyperliquid
+deliverator onboard            # or: deliverator init, then approve the agent in the HL UI
+deliverator connect
+
+# Papertrade (after the Hyperliquid setup; uses the same agent key)
+deliverator papertrade deposit-address --json   # fund it with USDC from HyperCore (min $10)
+deliverator papertrade deposit status --json
+deliverator papertrade deposit register --json
+DELIVERATOR_MASTER_KEY=0x... deliverator papertrade session register --json
+deliverator papertrade markets --json
+```
+
+Set `DELIVERATOR_MASTER_KEY` only in the shell that runs the command. It controls
+the whole wallet, including withdrawals.
+
+---
+
 ## Target Use Case & Positioning
 
 Deliverator is the **execution and safety layer** for autonomous agents — particularly LLM-driven ones — that trade on Hyperliquid. The intro above covers *what* it does; this section is about *when to reach for it* instead of the alternatives.
@@ -362,6 +413,8 @@ Submit (writes):
 - Account: `referral apply` · `onboard`.
 - Find + mirror a leader: `leaderboard` screens the official HL leaderboard (filter by window PnL/ROI/volume/account-value, `--profitable-in day,week,month` for consistency, `--sort`, paging) → pick a `data.rows[].address` → `copy <leader>` — non-custodial copy-trading; diff (read-only) by default, `--execute --yes` routes legs through the guarded order path (all risk gates apply). Stateless: pass `--mirrored`, persist `data.mirrored_now`.
 - Safety: `dms` · `halt` · `panic` · `watch` (real-time failsafe: evaluate a live risk metric, trigger `alert`/`dms`/`panic` on breach — the reactive counterpart to the DMS).
+
+Papertrade: `papertrade markets|summary|account|deposit-address|deposit status|deposit register|session|session register|open|close|cancel|intent status|resend|stake|unstake|claim` (see [Supported venues](#supported-venues) and [TOOLS.md](./TOOLS.md#papertrade-hyperevm-isolated-perps--real-funds)).
 
 Stream (live NDJSON): `stream book|bbo|trades|candles|fundings|active-asset|mids|fills|orders|webdata2|twap-fills|events`
 
