@@ -255,7 +255,17 @@ deliverator papertrade intent status --intent 0x…
 deliverator papertrade resend --intent 0x…
 deliverator papertrade session --json
 deliverator papertrade session register --json
+deliverator papertrade stake --amount 1000 --dry-run --json
+deliverator papertrade stake --amount 1000 --yes --json     # master wallet signs
+deliverator papertrade unstake --amount 500 --yes --json
+deliverator papertrade claim --yes --json                   # USDC staking rewards
 ```
+
+PAPER staking (`stake`, `unstake`, `claim`) is signed by the master wallet from
+`DELIVERATOR_MASTER_KEY` (not stored) in the `PaperStaking` EIP-712 domain, the
+same way the venue's web app signs it. The session key cannot stake. Writes need
+`--yes`. The relayer enforces a per-stake minimum (live: 1000 PAPER); `account`
+shows it under `staking.minimum_stake` with staked PAPER and pending USDC rewards.
 
 The agent key signs open, close, and cancel. It cannot withdraw, stake, or
 register itself. `session register` is signed once by the master wallet from

@@ -108,7 +108,7 @@ var ptSummaryCmd = &cobra.Command{
 
 var ptAccountCmd = &cobra.Command{
 	Use:   "account",
-	Short: "Balance, session keys, and open Papertrade positions",
+	Short: "Balance, session keys, open positions, and PAPER staking",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, cancel := cmdCtx()
 		defer cancel()
@@ -120,6 +120,7 @@ var ptAccountCmd = &cobra.Command{
 		if err != nil {
 			return fail("papertrade.account", err)
 		}
+		warnings = append(warnings, paperAttachStaking(ctx, &view)...)
 		emitWarn("papertrade.account", view, append(paperReadWarnings(), warnings...)...)
 		return nil
 	},

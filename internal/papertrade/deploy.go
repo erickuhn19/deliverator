@@ -3,7 +3,8 @@
 // Phase 1 accepts opens, closes, cancels, and session-key registration only as
 // signed intents posted to the exchange origin. The session key may sign
 // OpenPosition, Close, and CancelIntent. It cannot withdraw, stake, or register
-// itself — those authorities stay with the master wallet. There is no order
+// itself — those authorities stay with the master wallet (see staking.go for
+// the master-signed PaperStaking intents). There is no order
 // book and no cloid: each intent carries a client-allocated nonce, and the
 // intent id is derived from the EIP-712 digest.
 package papertrade
@@ -22,8 +23,7 @@ const (
 	// (open, close, cancel, register). The domain name signed by the venue
 	// client is the literal string "String" — see sign.go.
 	Exchange = "0x6cd5661646289fb6e65ea5c032310fded797d0a2"
-	// Paper is the PAPER token. Staking intents would verify against PaperStaking;
-	// this slice does not submit those.
+	// Paper is the PAPER token. Staking intents verify against PaperStaking.
 	Paper = "0xe40f17915daa230324030003a197cdaef2261c0e"
 	// PaperStaking is the verifying contract for stake / unstake / claim.
 	PaperStaking = "0xaad6c7b0cc3014fc80ffedae0ed7ce5967b0f016"

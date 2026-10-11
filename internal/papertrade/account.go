@@ -27,6 +27,8 @@ type Account struct {
 	OpenPositions           []Position   `json:"open_positions"`
 	PaperBalance            string       `json:"paper_balance"`
 	PaperStaked             string       `json:"paper_staked"`
+	PaperPendingBase        string       `json:"paper_pending_base"`
+	PaperRewardDebt         string       `json:"paper_reward_debt"`
 }
 
 // SessionKey is one registered trading key.
@@ -52,8 +54,21 @@ type Position struct {
 // AccountView adds the loaded agent key's readiness on top of Account.
 type AccountView struct {
 	Account
-	SessionKey   string `json:"session_key,omitempty"`
-	SessionReady *bool  `json:"session_ready,omitempty"`
+	SessionKey   string   `json:"session_key,omitempty"`
+	SessionReady *bool    `json:"session_ready,omitempty"`
+	Staking      *Staking `json:"staking,omitempty"`
+}
+
+// Staking is the PAPER staking summary. Amounts are 18-decimal raw strings plus
+// a human form. Rewards are USDC.
+type Staking struct {
+	PaperBalance          string `json:"paper_balance"`
+	PaperStaked           string `json:"paper_staked"`
+	PendingRewardsUSDCRaw string `json:"pending_rewards_usdc_raw,omitempty"`
+	PendingRewardsUSDC    string `json:"pending_rewards_usdc,omitempty"`
+	MinimumStakeRaw       string `json:"minimum_stake_raw,omitempty"`
+	MinimumStake          string `json:"minimum_stake,omitempty"`
+	StakingContract       string `json:"staking_contract"`
 }
 
 // ParseAccount decodes a wallet frame. The live stream sends named fields;
@@ -86,11 +101,14 @@ func ParseAccount(body []byte) (Account, error) {
 	debt, _ := asString(raw["consumableDebt"])
 	pBal, _ := asString(paper["balance"])
 	pStaked, _ := asString(paper["staked"])
+	pPending, _ := asString(paper["pendingBase"])
+	pDebt, _ := asString(paper["rewardDebt"])
 	return Account{
 		Address: strings.ToLower(addr), IndexedThroughBlock: block, IndexedThroughTimestamp: ts,
 		SessionKeys: keys, Balance: bal, Queued: queued, Locked: locked,
 		AvailableBalance: avail, AvailableQueued: availQ, ConsumableDebt: debt,
 		OpenPositions: positions, PaperBalance: pBal, PaperStaked: pStaked,
+		PaperPendingBase: pPending, PaperRewardDebt: pDebt,
 	}, nil
 }
 
