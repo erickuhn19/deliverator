@@ -36,7 +36,7 @@ const ptTradingBody = `{
   "instruments": [
     [0,"BTC",0,"10",true,false,false,false,false,null,null,null,"15000000000000000000000","814598000000000000000",1000,"10000000000000000000000000","476041580087574","100000000000000000","100000000000000000000000","0","0","0","0"]
   ],
-  "intake": ["1","0","0",[]]
+  "intakeControls": [1,"0",[]]
 }`
 
 // ptPaperJSON is the wallet frame's paper object. Staking tests override it.

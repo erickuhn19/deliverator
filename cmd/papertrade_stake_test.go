@@ -119,7 +119,7 @@ func TestPapertradeStakeGuards(t *testing.T) {
 
 func TestPapertradeStakeMinimumAndAccountView(t *testing.T) {
 	ptStakeUse(t, ptPaper2000)
-	m := paperTradingWithIntake(`["1","1000000000000000000000","0",["paperClaim"]]`)
+	m := paperTradingWithIntake(`[1,"1000000000000000000000",["paperClaim"]]`)
 	mk, err := parseTestMarkets(m)
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +146,7 @@ func TestPapertradeStakeMinimumAndAccountView(t *testing.T) {
 }
 
 func paperTradingWithIntake(intake string) string {
-	return strings.Replace(ptTradingBody, `"intake": ["1","0","0",[]]`, `"intake": `+intake, 1)
+	return strings.Replace(ptTradingBody, `"intakeControls": [1,"0",[]]`, `"intakeControls": `+intake, 1)
 }
 
 func parseTestMarkets(body string) (papertrade.Markets, error) {
