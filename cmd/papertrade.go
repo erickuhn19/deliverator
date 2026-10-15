@@ -129,6 +129,12 @@ var ptAccountCmd = &cobra.Command{
 var ptDepositCmd = &cobra.Command{
 	Use:   "deposit-address",
 	Short: "HyperCore USDC deposit proxy for this wallet (does not send funds)",
+	Long: `deposit-address prints this wallet's Papertrade deposit proxy. Fund it with a
+HyperCore USDC send from your Hyperliquid account (minimum 10 USDC), then run
+'papertrade deposit register'. Arbitrum and direct EVM sends are not supported.
+
+To get USDC into Hyperliquid first (Arbitrum bridge or an exchange withdrawal
+on the Hyperliquid network), run 'deliverator deposit-info'.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, cancel := cmdCtx()
 		defer cancel()

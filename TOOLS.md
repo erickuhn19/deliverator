@@ -235,13 +235,32 @@ bad call can do is place a bad trade, never move funds.
 
 > Builder-fee coverage: the configured builder fee attaches to `buy`/`sell`/`order`/`close` and bracket legs. Three cases earn **no** builder fee (each emits a warning): Hyperliquid's `twapOrder` and `modify` actions have no builder field (TWAP and modify orders carry no fee; a modify turns a fee-bearing order into a non-fee one); and a **spot BUY** pays its taker fee in the base token, so HL applies no (quote-denominated) builder fee — **spot sells and all perps do earn it.** To monetize spot flow, prefer the sell side or perps.
 
+## Funding: getting USDC in (read-only)
+
+`deliverator deposit-info --json` returns the bridge, token, minimums, your
+exchange-withdrawal destination, and your Papertrade deposit proxy for the
+active `--network`. It never signs or sends. Deliverator does not move funds.
+
+| Step | Where | Rules |
+|---|---|---|
+| Into Hyperliquid (mainnet) | Arbitrum One bridge `0x2Df1c51E09aECF9cacB7bc98cB1742757f163dF7` | Native USDC `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` only (not USDC.e). Minimum 5 USDC; less is lost. The **sender** is credited, so send from your own wallet, never from an exchange. Needs Arbitrum ETH for gas. |
+| Into Hyperliquid (testnet) | Arbitrum Sepolia bridge `0x08cfc1B6b2dCF36A1480b99353A354AA8AC56f89` | Test token USDC2 `0x1baAbB04529D43a73232B713C0FE471f7c7334d5`. |
+| From an exchange | Your Hyperliquid address (`wallet.master_address`) | Only if the exchange withdraws USDC on the Hyperliquid network. |
+| Into Papertrade | Proxy from `papertrade deposit-address` | HyperCore USDC send, minimum 10 USDC, then `papertrade deposit register`. |
+
+Sources: Hyperliquid bridge docs (hyperliquid.gitbook.io, "USDC" page; it lists
+this as the legacy bridge and prefers CCTP) and Circle's USDC address list.
+`data.safety` repeats the rules that lose funds when broken. Tell the user; do
+not paraphrase them away.
+
 ## Papertrade (HyperEVM isolated perps — real funds)
 
 `deliverator papertrade` is a second venue. It is live HyperEVM (chain 999), not
 a simulator and not Hyperliquid testnet. There is no order book: an open fills
 at the Hyperliquid mid. There is no cloid. The wire field the venue calls `size`
 is **margin** (USDC, up to 18 decimals), not a coin size. Notional is margin ×
-leverage. The venue minimums are 10 USDC margin and $10,000 notional.
+leverage. The venue minimums are 10 USDC margin and $1,000 notional (read the live values
+from `papertrade markets`).
 
 ```
 deliverator papertrade markets --json
