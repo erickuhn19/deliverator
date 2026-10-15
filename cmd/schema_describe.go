@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/erickuhn19/deliverator/internal/core"
+	"github.com/erickuhn19/deliverator/internal/funding"
 	"github.com/erickuhn19/deliverator/internal/hl"
 	"github.com/erickuhn19/deliverator/internal/papertrade"
 )
@@ -56,6 +57,8 @@ var schemaRegistry = map[string]any{
 	"papertrade-deposit-address":  map[string]any{},
 	"papertrade-deposit-status":   map[string]any{},
 	"papertrade-deposit-register": map[string]any{},
+	// Funding reference (read-only).
+	"deposit-info": funding.Info{},
 }
 
 // describeCommand returns the JSON Schema of a command's `data` payload, and

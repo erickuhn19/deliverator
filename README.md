@@ -42,7 +42,8 @@ No backend. No telemetry. `scp` the binary to a box and go.
 | **Hyperliquid** (main venue) | Perps and spot: market, limit, IOC, post-only, trigger, TP/SL brackets, batch, grid, chase, TWAP, modify, cancel, close, leverage, margin, copy-trading. Outcome markets: listed by `markets --class outcome` and quoted by the separate `outcome-mm` binary (see below). Reads, streams, risk gates, dead-man switch, halt, panic. | Agent/API wallet (trades, cannot withdraw). Risk caps live in `config.toml`. |
 | **Papertrade** (`deliverator papertrade`) | Isolated perps on HyperEVM (chain 999), real USDC. BTC and ETH only. Open, close, cancel, intent status, resend, markets, summary, account, deposit address, deposit status/register, session register, PAPER stake/unstake/claim. | Agent key as a session key for open/close/cancel. Master wallet (`DELIVERATOR_MASTER_KEY`, read per command, never stored) for session register, stake, unstake, claim. |
 
-Not supported: deposits, withdrawals, and transfers on either venue (by design),
+Not supported: sending deposits, withdrawals, and transfers on either venue (by
+design; `deposit-info` only tells you where to send),
 Papertrade through `serve`, and Papertrade builder codes (the venue has not
 turned them on yet; its roadmap puts frontend fees in a later phase).
 
@@ -54,7 +55,8 @@ turned them on yet; its roadmap puts frontend fees in a later phase).
 - **Leverage:** up to the venue's per-market maximum (1000x when written), checked
   against `papertrade markets`. Deliverator's own `risk.max_leverage` still applies
   (default 10), so raise it in `config.toml` to go higher.
-- **Sizes:** `--margin` is USDC margin. Minimums: 10 USDC margin and $10,000 notional.
+- **Sizes:** `--margin` is USDC margin. Minimums: 10 USDC margin and
+  $1,000 notional (live values in `papertrade markets`).
 - **Funding:** send USDC (minimum $10) on HyperCore to the address from
   `papertrade deposit-address`, check it with `papertrade deposit status`, then run
   `papertrade deposit register` so the venue sweeps it in. Deliverator never sends funds.
@@ -83,6 +85,37 @@ deliverator papertrade markets --json
 
 Set `DELIVERATOR_MASTER_KEY` only in the shell that runs the command. It controls
 the whole wallet, including withdrawals.
+
+### Getting USDC in (`deposit-info`)
+
+`deliverator deposit-info` is read-only. It prints where to send USDC for this
+wallet and in what order. It never signs or sends anything.
+
+```sh
+deliverator deposit-info --json                  # mainnet: Arbitrum One bridge
+deliverator deposit-info --network testnet --json
+deliverator deposit-info --address 0xYourHLAddress --json
+```
+
+1. **Into Hyperliquid.** Send at least **5 USDC** of **native USDC on Arbitrum**
+   (`0xaf88d065e77c8cC2239327C5EDb3A432268e5831`, not USDC.e) to the Hyperliquid
+   bridge `0x2Df1c51E09aECF9cacB7bc98cB1742757f163dF7`. The bridge credits the
+   address that **sends** the USDC. Send only from your own wallet, and keep some
+   Arbitrum ETH there for gas. A deposit under 5 USDC is lost. Testnet uses
+   bridge `0x08cfc1B6b2dCF36A1480b99353A354AA8AC56f89` and test token
+   `0x1baAbB04529D43a73232B713C0FE471f7c7334d5` on Arbitrum Sepolia.
+   Sources: [Hyperliquid bridge docs](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/bridge2)
+   and [Circle USDC addresses](https://developers.circle.com/stablecoins/usdc-contract-addresses).
+   Hyperliquid's docs call this the legacy bridge and prefer CCTP; they still
+   document this deposit flow.
+2. **Or from an exchange.** Never send to the bridge from an exchange; the
+   exchange's address gets the credit. If the exchange can withdraw USDC on the
+   **Hyperliquid network**, withdraw straight to your Hyperliquid address
+   (`wallet.master_address`).
+3. **Into Papertrade.** Send at least **10 USDC** on HyperCore from your Hyperliquid
+   account to your proxy (`papertrade deposit-address`), then run
+   `papertrade deposit register`. Arbitrum and direct EVM deposits to Papertrade
+   are not supported.
 
 ---
 
@@ -380,6 +413,7 @@ the only enforcement point — every value is treated as hostile until checked.
 ## Commands
 
 Setup: `init` · `connect`/`health` · `version` · `config [get|set|path]` ·
+`deposit-info` (read-only: how to get USDC into Hyperliquid and Papertrade) ·
 `account [add|ls|rm|set-default]` · `markets` · `schema` · `tools`
 
 Track (reads): `snapshot` (one-call tick: portfolio + limits + ctx[coins] + builder) ·
