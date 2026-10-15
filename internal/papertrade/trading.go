@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math/big"
+	"strconv"
 	"strings"
 )
 
@@ -58,10 +60,15 @@ type Instrument struct {
 }
 
 // Intake says which relayer actions are currently accepted.
+//
+// The venue sends it as "intakeControls": [revision, minimumPaperStakeRaw,
+// disabledActions]. Before 2026-10-15 it was "intake": [revision,
+// minimumPaperStakeRaw, maximumNetOpenInterestRaw, disabledActions]; that
+// shape still parses. MaximumNetOpenInterestRaw is empty on the new shape.
 type Intake struct {
 	Revision                  string          `json:"revision"`
 	MinimumPaperStakeRaw      string          `json:"minimum_paper_stake_raw"`
-	MaximumNetOpenInterestRaw string          `json:"maximum_net_open_interest_raw"`
+	MaximumNetOpenInterestRaw string          `json:"maximum_net_open_interest_raw,omitempty"`
 	Actions                   map[string]bool `json:"actions"`
 }
 
@@ -100,6 +107,7 @@ func ParseMarkets(body []byte) (Markets, error) {
 		MinimumOpenNotionalRaw string            `json:"minimumOpenNotionalRaw"`
 		AccRewardPerShareRaw   string            `json:"accRewardPerShareRaw"`
 		Instruments            []json.RawMessage `json:"instruments"`
+		IntakeControls         json.RawMessage   `json:"intakeControls"`
 		Intake                 json.RawMessage   `json:"intake"`
 	}
 	if err := dec.Decode(&raw); err != nil {
@@ -124,12 +132,59 @@ func ParseMarkets(body []byte) (Markets, error) {
 		}
 		out.Instruments = append(out.Instruments, ins)
 	}
-	intake, err := parseIntake(raw.Intake)
+	var intake Intake
+	switch {
+	case !isAbsent(raw.IntakeControls):
+		intake, err = parseIntakeControls(raw.IntakeControls)
+	case !isAbsent(raw.Intake):
+		intake, err = parseLegacyIntake(raw.Intake)
+	default:
+		// The venue client treats a missing intakeControls as every action
+		// accepted with no stake minimum. The relayer still refuses a paused
+		// action, so this cannot send anything the venue would not take.
+		intake = defaultIntake()
+	}
 	if err != nil {
 		return Markets{}, err
 	}
 	out.Intake = intake
 	return out, nil
+}
+
+func isAbsent(raw json.RawMessage) bool {
+	t := bytes.TrimSpace(raw)
+	return len(t) == 0 || string(t) == "null"
+}
+
+func defaultIntake() Intake {
+	return Intake{Revision: "0", MinimumPaperStakeRaw: "0", Actions: actionMap(nil)}
+}
+
+// parseIntakeControls decodes [revision, minimumPaperStakeRaw, disabledActions].
+func parseIntakeControls(raw json.RawMessage) (Intake, error) {
+	arr, err := decodeArray(raw)
+	if err != nil {
+		return Intake{}, fmt.Errorf("intakeControls: %w", err)
+	}
+	if len(arr) != 3 {
+		return Intake{}, fmt.Errorf("intakeControls: want 3 fields, got %d", len(arr))
+	}
+	revNum, ok1 := arr[0].(json.Number)
+	minStake, ok2 := arr[1].(string)
+	rev, revErr := revNum.Int64()
+	if !ok1 || !ok2 || revErr != nil || rev < 0 {
+		return Intake{}, fmt.Errorf("intakeControls header has the wrong types")
+	}
+	if _, ok := new(big.Int).SetString(minStake, 10); !ok {
+		return Intake{}, fmt.Errorf("intakeControls stake minimum %q", minStake)
+	}
+	off, err := disabledActions(arr[2])
+	if err != nil {
+		return Intake{}, err
+	}
+	return Intake{
+		Revision: strconv.FormatInt(rev, 10), MinimumPaperStakeRaw: minStake, Actions: actionMap(off),
+	}, nil
 }
 
 func parseInstrument(raw json.RawMessage) (Instrument, error) {
@@ -196,7 +251,8 @@ func parseInstrument(raw json.RawMessage) (Instrument, error) {
 	}, nil
 }
 
-func parseIntake(raw json.RawMessage) (Intake, error) {
+// parseLegacyIntake decodes the pre-2026-10-15 "intake" 4-tuple.
+func parseLegacyIntake(raw json.RawMessage) (Intake, error) {
 	arr, err := decodeArray(raw)
 	if err != nil {
 		return Intake{}, fmt.Errorf("intake: %w", err)
@@ -210,18 +266,35 @@ func parseIntake(raw json.RawMessage) (Intake, error) {
 	if !ok1 || !ok2 || !ok3 {
 		return Intake{}, fmt.Errorf("intake header has the wrong types")
 	}
-	disabled, err := decodeArray(mustRaw(arr[3]))
+	off, err := disabledActions(arr[3])
 	if err != nil {
-		return Intake{}, fmt.Errorf("intake actions: %w", err)
+		return Intake{}, err
+	}
+	return Intake{
+		Revision: rev, MinimumPaperStakeRaw: minStake, MaximumNetOpenInterestRaw: maxOI,
+		Actions: actionMap(off),
+	}, nil
+}
+
+func disabledActions(v any) (map[string]bool, error) {
+	disabled, err := decodeArray(mustRaw(v))
+	if err != nil {
+		return nil, fmt.Errorf("intake actions: %w", err)
 	}
 	off := map[string]bool{}
 	for _, d := range disabled {
-		name, ok := asString(d)
+		name, ok := d.(string)
 		if !ok {
-			return Intake{}, fmt.Errorf("intake action name has the wrong type")
+			return nil, fmt.Errorf("intake action name has the wrong type")
 		}
 		off[name] = true
 	}
+	return off, nil
+}
+
+// actionMap marks every known action on unless off names it. Unknown names in
+// off still surface as false.
+func actionMap(off map[string]bool) map[string]bool {
 	actions := map[string]bool{}
 	for _, name := range intakeActions {
 		actions[name] = !off[name]
@@ -231,10 +304,7 @@ func parseIntake(raw json.RawMessage) (Intake, error) {
 			actions[name] = false
 		}
 	}
-	return Intake{
-		Revision: rev, MinimumPaperStakeRaw: minStake, MaximumNetOpenInterestRaw: maxOI,
-		Actions: actions,
-	}, nil
+	return actions
 }
 
 func decodeArray(raw json.RawMessage) ([]any, error) {

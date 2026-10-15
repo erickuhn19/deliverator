@@ -155,7 +155,7 @@ const sampleTrading = `{
   "instruments": [
     [0,"BTC",0,"10",true,false,false,false,false,null,null,null,"15000000000000000000000","814598000000000000000",1000,"10000000000000000000000000","476041580087574","100000000000000000","100000000000000000000000","1","2","3","4"]
   ],
-  "intake": ["9","0","0",[]]
+  "intakeControls": [9,"0",[]]
 }`
 
 const sampleAccount = `{
@@ -177,3 +177,54 @@ const sampleAccount = `{
     {"positionId": "8", "instrumentId": 1, "isLong": false, "marginRaw": "1000000000000000000000", "leverage": 2, "intentId": "0xDEF"}
   ]
 }`
+
+// The venue moved "intake" (4-tuple with a net OI cap) to "intakeControls"
+// (3-tuple, numeric revision) on 2026-10-15. Both shapes must parse.
+func TestParseMarketsIntakeShapes(t *testing.T) {
+	live := strings.Replace(sampleTrading, `"intakeControls": [9,"0",[]]`,
+		`"intakeControls": [1791673267280300,"1000000000000000000000",["paperClaim","futureAction"]]`, 1)
+	m, err := ParseMarkets([]byte(live))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Intake.Revision != "1791673267280300" || m.Intake.MinimumPaperStakeRaw != "1000000000000000000000" ||
+		m.Intake.MaximumNetOpenInterestRaw != "" {
+		t.Fatalf("intake %+v", m.Intake)
+	}
+	if !m.ActionEnabled("openPosition") || m.ActionEnabled("paperClaim") || m.ActionEnabled("futureAction") {
+		t.Fatalf("actions %+v", m.Intake.Actions)
+	}
+	if on, ok := m.Intake.Actions["futureAction"]; !ok || on {
+		t.Fatal("an unknown disabled action must surface as false")
+	}
+
+	legacy := strings.Replace(sampleTrading, `"intakeControls": [9,"0",[]]`, `"intake": ["9","5","7",["openPosition"]]`, 1)
+	lm, err := ParseMarkets([]byte(legacy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lm.Intake.Revision != "9" || lm.Intake.MinimumPaperStakeRaw != "5" || lm.Intake.MaximumNetOpenInterestRaw != "7" ||
+		lm.ActionEnabled("openPosition") || !lm.ActionEnabled("closePositions") {
+		t.Fatalf("legacy %+v", lm.Intake)
+	}
+
+	// Absent controls: the venue client accepts every action with no minimum.
+	none := strings.Replace(sampleTrading, `,
+  "intakeControls": [9,"0",[]]`, ``, 1)
+	nm, err := ParseMarkets([]byte(none))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nm.ActionEnabled("openPosition") || !nm.ActionEnabled("paperClaim") || nm.Intake.MinimumPaperStakeRaw != "0" {
+		t.Fatalf("absent %+v", nm.Intake)
+	}
+
+	for _, bad := range []string{
+		`[1,"0"]`, `["1","0",[]]`, `[1,"x",[]]`, `[1,"0",[7]]`, `[1,"0","paperClaim"]`, `{"revision":1}`, `[-1,"0",[]]`,
+	} {
+		b := strings.Replace(sampleTrading, `[9,"0",[]]`, bad, 1)
+		if _, err := ParseMarkets([]byte(b)); err == nil {
+			t.Errorf("accepted intakeControls %s", bad)
+		}
+	}
+}
