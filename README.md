@@ -40,11 +40,11 @@ No backend. No telemetry. `scp` the binary to a box and go.
 | Venue | What Deliverator does | Signing key |
 |---|---|---|
 | **Hyperliquid** (main venue) | Perps and spot: market, limit, IOC, post-only, trigger, TP/SL brackets, batch, grid, chase, TWAP, modify, cancel, close, leverage, margin, copy-trading. Outcome markets: listed by `markets --class outcome` and quoted by the separate `outcome-mm` binary (see below). Reads, streams, risk gates, dead-man switch, halt, panic. | Agent/API wallet (trades, cannot withdraw). Risk caps live in `config.toml`. |
-| **Papertrade** (`deliverator papertrade`) | Isolated perps on HyperEVM (chain 999), real USDC. BTC and ETH only. Open, close, cancel, intent status, resend, markets, summary, account, deposit address, deposit status/register, session register, PAPER stake/unstake/claim. | Agent key as a session key for open/close/cancel. Master wallet (`DELIVERATOR_MASTER_KEY`, read per command, never stored) for session register, stake, unstake, claim. |
+| **Papertrade** (`deliverator papertrade`) | Isolated perps on HyperEVM (chain 999), real USDC. BTC and ETH only. Open, close, cancel, intent status, resend, markets, summary, account, deposit address, deposit status/register, session register, PAPER stake/unstake/claim, builder-code status/apply/claim. | Agent key as a session key for open/close/cancel. Master wallet (`DELIVERATOR_MASTER_KEY`, read per command, never stored) for session register, stake, unstake, claim, and builder apply/claim. |
 
 Not supported: deposits, withdrawals, and transfers on either venue (by design),
-Papertrade through `serve`, and Papertrade builder codes (the venue has not
-turned them on yet; its roadmap puts frontend fees in a later phase).
+and Papertrade through `serve`. A Papertrade builder code is optional and off
+unless you set one (see below).
 
 ### Papertrade at a glance
 
@@ -59,7 +59,18 @@ turned them on yet; its roadmap puts frontend fees in a later phase).
   `papertrade deposit-address`, check it with `papertrade deposit status`, then run
   `papertrade deposit register` so the venue sweeps it in. Deliverator never sends funds.
 - **Session key:** run `papertrade session register` once with `DELIVERATOR_MASTER_KEY`
-  set. It binds the agent key so it can open, close, and cancel.
+  set. It binds the agent key so it can open, close, and cancel. The registration
+  names a builder only when you pass `--builder` or set `papertrade.builder_address`.
+  The default is no builder, so closes pay no builder fee.
+- **Builder codes:** an approved builder address on that registration earns the
+  live protocol rate (0.5% of adjusted PnL when this was written; the owner can
+  change it through the timelock, up to 1%). The trader pays it on a winning
+  close, on top of the win fee. On a loss it comes out of the LP. Liquidations
+  pay none. Open and close do not take a builder. `papertrade builder` reads
+  approval and unclaimed fees. `papertrade builder apply` submits the same
+  signed application as the builders page (it does not approve you).
+  `papertrade builder claim` calls `claimBuilderFees()` from the builder wallet
+  and credits the exchange balance. Deliverator does not withdraw those fees.
 - **PAPER:** the venue mints PAPER to traders on losses and liquidations. It is not
   transferable yet.
 - **Staking:** `papertrade stake|unstake|claim` with `--yes`, signed by the master
@@ -78,6 +89,8 @@ deliverator papertrade deposit-address --json   # fund it with USDC from HyperCo
 deliverator papertrade deposit status --json
 deliverator papertrade deposit register --json
 DELIVERATOR_MASTER_KEY=0x... deliverator papertrade session register --json
+# optional: name an approved builder. Default is no builder fee.
+# deliverator papertrade session register --builder 0x... --yes --json
 deliverator papertrade markets --json
 ```
 
@@ -252,7 +265,9 @@ Every command emits one JSON envelope:
 and `error` is populated with `{code, category, message, retryable, retry_after_ms, hint}`
 plus, on write failures, `cloids` — the client order id(s) the action was signed
 with (all legs for a batch/grid), even when auto-generated — so the retry
-protocol below is always runnable.
+protocol below is always runnable. Papertrade relayer failures add `intent_ids`.
+A Papertrade builder-fee claim adds `tx_hash` when a HyperEVM transaction was
+broadcast. Both are additive.
 
 Two optional read-health fields (additive, omitted when clean) mark a tolerant
 read that succeeded with **incomplete data**: `degraded_dexs: ["<dex>"]` — a
@@ -414,7 +429,7 @@ Submit (writes):
 - Find + mirror a leader: `leaderboard` screens the official HL leaderboard (filter by window PnL/ROI/volume/account-value, `--profitable-in day,week,month` for consistency, `--sort`, paging) → pick a `data.rows[].address` → `copy <leader>` — non-custodial copy-trading; diff (read-only) by default, `--execute --yes` routes legs through the guarded order path (all risk gates apply). Stateless: pass `--mirrored`, persist `data.mirrored_now`.
 - Safety: `dms` · `halt` · `panic` · `watch` (real-time failsafe: evaluate a live risk metric, trigger `alert`/`dms`/`panic` on breach — the reactive counterpart to the DMS).
 
-Papertrade: `papertrade markets|summary|account|deposit-address|deposit status|deposit register|session|session register|open|close|cancel|intent status|resend|stake|unstake|claim` (see [Supported venues](#supported-venues) and [TOOLS.md](./TOOLS.md#papertrade-hyperevm-isolated-perps--real-funds)).
+Papertrade: `papertrade markets|summary|account|deposit-address|deposit status|deposit register|session|session register|open|close|cancel|intent status|resend|stake|unstake|claim|builder|builder apply|builder claim` (see [Supported venues](#supported-venues) and [TOOLS.md](./TOOLS.md#papertrade-hyperevm-isolated-perps--real-funds)).
 
 Stream (live NDJSON): `stream book|bbo|trades|candles|fundings|active-asset|mids|fills|orders|webdata2|twap-fills|events`
 

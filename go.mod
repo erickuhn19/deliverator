@@ -16,7 +16,10 @@ go 1.25.7
 //
 // 1.26.9: govulncheck v1.8.0 (installed @latest in CI) requires go >= 1.26,
 // so the 1.25 toolchain could no longer build the scanner.
-toolchain go1.26.9
+//
+// 1.26.10: GO-2026-6809, distrust of compromised intermediate certificates in
+// crypto/x509, reachable from the websocket dialer.
+toolchain go1.26.10
 
 require (
 	github.com/BurntSushi/toml v1.6.0
@@ -31,6 +34,7 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/term v0.45.0
+	golang.org/x/text v0.39.0
 )
 
 require (
@@ -68,7 +72,6 @@ require (
 	github.com/supranational/blst v0.3.16 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	golang.org/x/sync v0.19.0 // indirect
+	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
 )

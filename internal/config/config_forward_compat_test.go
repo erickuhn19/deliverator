@@ -36,7 +36,7 @@ func TestSaveOfADefaultConfigEmitsNoNewKeys(t *testing.T) {
 
 	// Keys introduced after the initial config surface. Each must be omitempty so
 	// a zero value is not written into a config an older binary may read.
-	for _, k := range []string{"drawdown_window_days"} {
+	for _, k := range []string{"drawdown_window_days", "builder_address", "[papertrade]"} {
 		if strings.Contains(got, k) {
 			t.Errorf("a default config wrote %q — add `omitempty` to that field, or every older "+
 				"binary reading this config will fail Load's strict unknown-key check", k)

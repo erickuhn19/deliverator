@@ -145,12 +145,14 @@ func (p *ptCapture) post(i int) []byte {
 }
 
 type ptEnvelope struct {
-	OK   bool            `json:"ok"`
-	Cmd  string          `json:"cmd"`
-	Data json.RawMessage `json:"data"`
-	Err  *struct {
+	OK       bool            `json:"ok"`
+	Cmd      string          `json:"cmd"`
+	Data     json.RawMessage `json:"data"`
+	Warnings []string        `json:"warnings"`
+	Err      *struct {
 		Code      string   `json:"code"`
 		IntentIDs []string `json:"intent_ids"`
+		TxHash    string   `json:"tx_hash"`
 		Hint      string   `json:"hint"`
 	} `json:"error"`
 }
@@ -175,7 +177,8 @@ func ptUse(t *testing.T, cap *ptCapture) string {
 		cfg: Cfg, dry: flagDryRun, timeout: flagTimeout, noAudit: flagNoAudit,
 		address: ptAddress, coin: ptCoin, side: ptSide, margin: ptMargin,
 		lev: ptLeverage, debt: ptUseDebt, pos: append([]string(nil), ptPositions...),
-		intent: ptIntent, days: ptDays,
+		intent: ptIntent, days: ptDays, builder: ptBuilder, appName: ptAppName,
+		website: ptWebsite, kind: ptContactKind, contact: ptContact, integration: ptIntegration,
 	}
 	Cfg = cfg
 	flagDryRun = false
@@ -185,30 +188,39 @@ func ptUse(t *testing.T, cap *ptCapture) string {
 	ptLeverage, ptDays = 0, 30
 	ptUseDebt = false
 	ptPositions = nil
+	ptBuilder, ptAppName, ptWebsite, ptContactKind, ptContact, ptIntegration = "", "", "", "", "", ""
 	t.Cleanup(func() {
 		Cfg = save.cfg
 		flagDryRun, flagTimeout, flagNoAudit = save.dry, save.timeout, save.noAudit
 		ptAddress, ptCoin, ptSide, ptMargin = save.address, save.coin, save.side, save.margin
 		ptLeverage, ptUseDebt, ptPositions, ptIntent, ptDays = save.lev, save.debt, save.pos, save.intent, save.days
+		ptBuilder, ptAppName, ptWebsite = save.builder, save.appName, save.website
+		ptContactKind, ptContact, ptIntegration = save.kind, save.contact, save.integration
 		output.Configure(true, nil)
 	})
 	return home
 }
 
 type ptSavedFlags struct {
-	cfg     *config.Config
-	dry     bool
-	timeout time.Duration
-	noAudit bool
-	address string
-	coin    string
-	side    string
-	margin  string
-	lev     int
-	debt    bool
-	pos     []string
-	intent  string
-	days    int
+	cfg         *config.Config
+	dry         bool
+	timeout     time.Duration
+	noAudit     bool
+	address     string
+	coin        string
+	side        string
+	margin      string
+	lev         int
+	debt        bool
+	pos         []string
+	intent      string
+	days        int
+	builder     string
+	appName     string
+	website     string
+	kind        string
+	contact     string
+	integration string
 }
 
 func ptRun(t *testing.T, c *cobra.Command) (ptEnvelope, error) {

@@ -56,6 +56,9 @@ var schemaRegistry = map[string]any{
 	"papertrade-deposit-address":  map[string]any{},
 	"papertrade-deposit-status":   map[string]any{},
 	"papertrade-deposit-register": map[string]any{},
+	"papertrade-builder":          map[string]any{},
+	"papertrade-builder-claim":    map[string]any{},
+	"papertrade-builder-apply":    map[string]any{},
 }
 
 // describeCommand returns the JSON Schema of a command's `data` payload, and

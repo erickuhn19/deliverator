@@ -311,6 +311,9 @@ var ptOpenCmd = &cobra.Command{
 		if !ready {
 			warnings = append(warnings, "agent session is not registered; a live open will be rejected until `papertrade session register`")
 		}
+		if w := paperBoundBuilderWarning(ctx, user); w != "" {
+			warnings = append(warnings, w)
+		}
 		if flagDryRun {
 			emitWarn(name, map[string]any{
 				"dry_run": true, "action": "openPosition", "coin": plan.Instrument.Symbol,
@@ -390,11 +393,15 @@ var ptCloseCmd = &cobra.Command{
 			return fail(name, output.Validation("position", "not an open position: "+strings.Join(missing, ", ")).
 				WithHint("run `deliverator papertrade account` and pass those position ids"))
 		}
+		warnings := paperReadWarnings()
+		if w := paperBoundBuilderWarning(ctx, user); w != "" {
+			warnings = append(warnings, w)
+		}
 		if flagDryRun {
 			emitWarn(name, map[string]any{
 				"dry_run": true, "action": "closePositions", "position_ids": wireIDs,
 				"user": strings.ToLower(user.Hex()),
-			})
+			}, warnings...)
 			return nil
 		}
 		agent, err := paperAgent()
@@ -424,11 +431,11 @@ var ptCloseCmd = &cobra.Command{
 			return err
 		}
 		paperAudit(name, map[string]any{"intent_id": signed.IntentID, "position_ids": wireIDs, "state": rec.State})
-		emit(name, map[string]any{
+		emitWarn(name, map[string]any{
 			"action": "closePositions", "intent_id": signed.IntentID, "state": rec.State,
 			"position_ids": wireIDs, "nonce": nonce, "user": strings.ToLower(user.Hex()),
 			"queue_revision": rec.QueueRevision,
-		})
+		}, warnings...)
 		return nil
 	},
 }
@@ -588,10 +595,12 @@ var ptSessionCmd = &cobra.Command{
 		if err != nil {
 			return fail(name, err)
 		}
-		emitWarn(name, map[string]any{
+		out := map[string]any{
 			"user": view.Address, "session_key": view.SessionKey, "session_ready": view.SessionReady,
 			"session_keys": view.SessionKeys, "indexed_through_timestamp": view.IndexedThroughTimestamp,
-		}, append(paperReadWarnings(), warnings...)...)
+		}
+		warnings = append(warnings, paperAnnotateSession(ctx, user, view, out)...)
+		emitWarn(name, out, append(paperReadWarnings(), warnings...)...)
 		return nil
 	},
 }
@@ -614,18 +623,46 @@ var ptRegisterCmd = &cobra.Command{
 		}
 		now := time.Now()
 		expiry := big.NewInt(now.Unix() + int64(days)*86400)
+		configured := ""
+		if Cfg != nil {
+			configured = Cfg.Papertrade.BuilderAddress
+		}
+		fee, err := papertrade.ResolveBuilder(ptBuilder, configured)
+		if err != nil {
+			return fail(name, output.Validation("builder", err.Error()).
+				WithHint("pass --builder 0x… or none. The default is no builder. This is not the Hyperliquid builder.address."))
+		}
+		ctx, cancel := cmdCtx()
+		defer cancel()
+		var feeRate string
+		if fee != (common.Address{}) {
+			_, rate, err := paperClient().CheckBuilder(ctx, fee)
+			if err != nil {
+				return fail(name, paperChainFail(err))
+			}
+			feeRate = papertrade.FormatFeeRate(rate)
+		}
 		preview := map[string]any{
 			"action": "registerSessionKey", "session_key": strings.ToLower(agent.Address),
-			"expiry_unix": expiry.String(), "days": days, "fee_address": papertrade.FeeAddress,
+			"expiry_unix": expiry.String(), "days": days, "fee_address": strings.ToLower(fee.Hex()),
+		}
+		var warnings []string
+		if msg := papertrade.FeeWarning(fee, feeRate); msg != "" {
+			preview["fee_rate"] = feeRate
+			warnings = append(warnings, msg)
 		}
 		if flagDryRun {
 			if addr, err := paperUser(); err == nil {
 				preview["user"] = strings.ToLower(addr.Hex())
 			}
 			preview["dry_run"] = true
-			preview["note"] = "A live register reads DELIVERATOR_MASTER_KEY, signs once, and does not store that key."
-			emit(name, preview)
+			preview["note"] = "A live register reads DELIVERATOR_MASTER_KEY, signs once, and does not store that key. A non-zero builder requires --yes."
+			emitWarn(name, preview, append(paperReadWarnings(), warnings...)...)
 			return nil
+		}
+		if fee != (common.Address{}) && !flagYes {
+			return fail(name, output.Validation("confirm", "naming a Papertrade builder charges that builder's fee on closes this key signs — pass --yes").
+				WithHint("run with --dry-run first. Omit --builder and leave papertrade.builder_address empty to register with no fee."))
 		}
 		master, user, err := paperMaster()
 		if err != nil {
@@ -634,8 +671,6 @@ var ptRegisterCmd = &cobra.Command{
 		if err := paperMasterMatches(user); err != nil {
 			return fail(name, err)
 		}
-		ctx, cancel := cmdCtx()
-		defer cancel()
 		markets, err := paperClient().Markets(ctx)
 		if err != nil {
 			return fail(name, output.Network("papertrade", err.Error()).Retry())
@@ -653,7 +688,7 @@ var ptRegisterCmd = &cobra.Command{
 		}
 		signed, err := papertrade.SignRegister(master, papertrade.RegisterMessage{
 			User: user, Key: common.HexToAddress(agent.Address), Expiry: expiry,
-			FeeAddress: common.HexToAddress(papertrade.FeeAddress),
+			FeeAddress: fee,
 			Nonce:      n, Deadline: paperDeadline(now),
 		})
 		if err != nil {
@@ -666,12 +701,16 @@ var ptRegisterCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		paperAudit(name, map[string]any{"intent_id": signed.IntentID, "session_key": strings.ToLower(agent.Address), "state": rec.State})
-		emit(name, map[string]any{
+		paperAudit(name, map[string]any{
+			"intent_id": signed.IntentID, "session_key": strings.ToLower(agent.Address),
+			"fee_address": strings.ToLower(fee.Hex()), "state": rec.State,
+		})
+		emitWarn(name, map[string]any{
 			"action": "registerSessionKey", "intent_id": signed.IntentID, "state": rec.State,
 			"user": strings.ToLower(user.Hex()), "session_key": strings.ToLower(agent.Address),
+			"fee_address": strings.ToLower(fee.Hex()),
 			"expiry_unix": expiry.String(), "nonce": nonce, "queue_revision": rec.QueueRevision,
-		})
+		}, append(paperReadWarnings(), warnings...)...)
 		return nil
 	},
 }
@@ -735,11 +774,16 @@ func paperAgent() (*wallet.Agent, error) {
 }
 
 func paperMaster() (*ecdsa.PrivateKey, common.Address, error) {
+	return loadMasterKey(
+		"session registration is signed by the master wallet",
+		"set DELIVERATOR_MASTER_KEY for this command only. It is not written to the keychain. The agent key cannot register itself.",
+	)
+}
+
+func loadMasterKey(what, hint string) (*ecdsa.PrivateKey, common.Address, error) {
 	raw := strings.TrimSpace(os.Getenv("DELIVERATOR_MASTER_KEY"))
 	if raw == "" {
-		return nil, common.Address{}, output.Auth("master_key",
-			"session registration is signed by the master wallet").
-			WithHint("set DELIVERATOR_MASTER_KEY for this command only. It is not written to the keychain. The agent key cannot register itself.")
+		return nil, common.Address{}, output.Auth("master_key", what).WithHint(hint)
 	}
 	pk, err := crypto.HexToECDSA(strings.TrimPrefix(raw, "0x"))
 	if err != nil {

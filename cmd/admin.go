@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/spf13/cobra"
 
 	"github.com/erickuhn19/deliverator/internal/config"
@@ -185,6 +186,7 @@ var configSetCmd = &cobra.Command{
 		// can be surfaced loudly.
 		oldVal, isRiskCap := riskCapValue(fresh, args[0])
 		oldNetwork := fresh.Network
+		oldPaperBuilder := fresh.Papertrade.BuilderAddress
 		if err := setConfigKey(fresh, args[0], args[1]); err != nil {
 			return fail("config.set", output.Validation("bad_config", err.Error()))
 		}
@@ -212,6 +214,9 @@ var configSetCmd = &cobra.Command{
 			}
 			w += "; confirm the account operator approved this change."
 			warnings = append(warnings, w)
+		}
+		if args[0] == "papertrade.builder_address" && !strings.EqualFold(oldPaperBuilder, fresh.Papertrade.BuilderAddress) {
+			warnings = append(warnings, paperBuilderConfigWarning(oldPaperBuilder, fresh.Papertrade.BuilderAddress))
 		}
 		emit("config.set", map[string]any{"key": args[0], "value": args[1], "saved": target}, warnings...)
 		return nil
@@ -288,6 +293,18 @@ func setConfigKey(cfg *config.Config, key, val string) error {
 		cfg.State.MetaTTLSecs = n
 	case "builder.address":
 		cfg.Builder.Address = val
+	case "papertrade.builder_address":
+		v := strings.TrimSpace(val)
+		switch {
+		case v == "" || strings.EqualFold(v, "none"):
+			cfg.Papertrade.BuilderAddress = ""
+		case common.IsHexAddress(v) && common.HexToAddress(v) == (common.Address{}):
+			cfg.Papertrade.BuilderAddress = ""
+		case common.IsHexAddress(v):
+			cfg.Papertrade.BuilderAddress = strings.ToLower(common.HexToAddress(v).Hex())
+		default:
+			return fmt.Errorf("papertrade.builder_address must be 0x and 40 hex characters, or none")
+		}
 	case "builder.fee_tenths_bps":
 		n, err := atoi()
 		if err != nil {
@@ -671,6 +688,13 @@ master_address = ""            # QUERY target — your MASTER address. NEVER the
 address = "0x2D2AEf445717466eD8DBEfd2751cDc42369Fba75"  # Deliverator builder EOA (override with your own)
 fee_tenths_bps = 50            # 50 = 0.05%; perps cap 100
 attach_mode = "all"            # all | manual
+
+# Papertrade builder code (HyperEVM). Uncomment only to name a builder the
+# contract owner has approved. Empty means session registration names no
+# builder. This is NOT the Hyperliquid builder above, and it does not change
+# a session key that is already registered.
+# [papertrade]
+# builder_address = ""
 
 [risk]
 max_order_notional_usd = 10000

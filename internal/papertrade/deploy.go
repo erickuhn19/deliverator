@@ -33,9 +33,18 @@ const (
 	// 18-decimal raw integers; the venue scales by 10^(18-6).
 	Collateral = "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24"
 
-	// FeeAddress is the builder/fee receiver attached to RegisterSessionKey.
-	// The venue client hard-codes the zero address; builder codes are not live.
+	// FeeAddress is the builder/fee receiver attached to RegisterSessionKey when
+	// the operator names none. The venue client hard-codes this zero address
+	// (viem zeroAddress). A non-zero feeAddress is a builder code; see builder.go.
 	FeeAddress = "0x0000000000000000000000000000000000000000"
+
+	// SessionKeyManager registers session keys. builderRegistry() on it returns
+	// the live BuilderRegistry. Confirmed on chain 999, 2026-10-23.
+	SessionKeyManager = "0x8326eb8896e358717f10502ec73ce8d28e37b108"
+	// BuilderRegistryFallback is the registry published in the contract-address
+	// docs and returned by SessionKeyManager.builderRegistry(). Calls use the
+	// live pointer; this is the documented address those calls returned.
+	BuilderRegistryFallback = "0xfdc6550436dd75ce8a0b145f935b7d3a64f53248"
 
 	// IntentTTLSeconds is the lifetime of a signed intent (floor(now/1000)+3600).
 	IntentTTLSeconds int64 = 3600
