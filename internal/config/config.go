@@ -48,9 +48,13 @@ const (
 
 // Config mirrors the TOML in spec §14.
 type Config struct {
-	Network    string            `toml:"network"`
-	Wallet     Wallet            `toml:"wallet"`
-	Builder    Builder           `toml:"builder"`
+	Network string  `toml:"network"`
+	Wallet  Wallet  `toml:"wallet"`
+	Builder Builder `toml:"builder"`
+	// Papertrade is the HyperEVM venue. It is not the Hyperliquid builder fee
+	// above. An empty BuilderAddress (the default, and omitted from a saved
+	// config) means session registration names no builder.
+	Papertrade Papertrade        `toml:"papertrade,omitempty"`
 	Risk       Risk              `toml:"risk"`
 	Automation Automation        `toml:"automation"`
 	State      State             `toml:"state"`
@@ -111,6 +115,15 @@ type Wallet struct {
 	// MasterAddress is the QUERY target for all reads. Never the agent address —
 	// querying the agent address returns empty/garbage (the canonical bug, §4).
 	MasterAddress string `toml:"master_address"`
+}
+
+// Papertrade is venue-local configuration for HyperEVM isolated perps.
+// BuilderAddress is copied into RegisterSessionKey.feeAddress when
+// `papertrade session register` is run without --builder. Empty means the
+// zero address: closes pay no builder fee. It does not change a key that is
+// already registered, and it is not `builder.address`.
+type Papertrade struct {
+	BuilderAddress string `toml:"builder_address,omitempty"`
 }
 
 // Builder — the operator's builder EOA and fee posture (§14, §17.2).
@@ -420,6 +433,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Builder.Address != "" && !hexAddr.MatchString(c.Builder.Address) {
 		return fmt.Errorf("builder.address %q is not a 0x-prefixed 40-hex address", c.Builder.Address)
+	}
+	if c.Papertrade.BuilderAddress != "" && !hexAddr.MatchString(c.Papertrade.BuilderAddress) {
+		return fmt.Errorf("papertrade.builder_address %q is not a 0x-prefixed 40-hex address", c.Papertrade.BuilderAddress)
 	}
 	switch c.Builder.AttachMode {
 	case AttachAll, AttachManual:

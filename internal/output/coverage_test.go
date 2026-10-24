@@ -75,6 +75,32 @@ func TestCloidsFieldPropagation(t *testing.T) {
 	}
 }
 
+func TestTxHashFieldPropagation(t *testing.T) {
+	e := Timeout("papertrade_tx", "receipt missing").WithTxHash("0xabc")
+	if e.TxHash != "0xabc" {
+		t.Fatalf("WithTxHash: %+v", e)
+	}
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"tx_hash":"0xabc"`) {
+		t.Fatalf("tx_hash must serialize: %s", b)
+	}
+	b, _ = json.Marshal(Timeout("t", "m"))
+	if strings.Contains(string(b), "tx_hash") {
+		t.Fatalf("tx_hash must be omitted when unset: %s", b)
+	}
+
+	var buf bytes.Buffer
+	Configure(false, &buf)
+	defer Configure(true, nil)
+	Fail("papertrade.builder.claim", e, Meta{})
+	if !strings.Contains(buf.String(), "tx_hash: 0xabc") {
+		t.Fatalf("human render missing tx hash:\n%s", buf.String())
+	}
+}
+
 func TestRenderHumanSuccessAndError(t *testing.T) {
 	var buf bytes.Buffer
 	Configure(false, &buf)

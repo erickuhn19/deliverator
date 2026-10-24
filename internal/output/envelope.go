@@ -180,6 +180,9 @@ func renderHuman(env Envelope) {
 		if len(env.Error.IntentIDs) > 0 {
 			fmt.Fprintf(writer, "  intent_ids: %s\n", strings.Join(env.Error.IntentIDs, " "))
 		}
+		if env.Error.TxHash != "" {
+			fmt.Fprintf(writer, "  tx_hash: %s\n", env.Error.TxHash)
+		}
 		return
 	}
 	if env.Data != nil {

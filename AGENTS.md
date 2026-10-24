@@ -82,6 +82,13 @@ one-time master signature via `DELIVERATOR_MASTER_KEY`, which is not stored.
 `serve` does not expose this venue. Default risk caps still apply, so 1000× is
 rejected while `risk.max_leverage` is 10.
 
+A Papertrade builder code is the `feeAddress` on that registration, not a flag
+on open or close. The default is no builder. Set `papertrade.builder_address`
+or pass `session register --builder` (a non-zero builder needs `--yes`, and the
+address must already be approved). `papertrade builder` inspects the code.
+`builder apply` only submits the off-chain application. `builder claim` sends
+`claimBuilderFees()` from the builder wallet and does not withdraw.
+
 On exit 42 (or a post-sign exit 40), `error.intent_ids` names the intent. Run
 `deliverator papertrade intent status --intent <id>`. If it is absent, run
 `deliverator papertrade resend --intent <id>` so the same signed body is posted

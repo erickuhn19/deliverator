@@ -38,6 +38,11 @@ type Error struct {
 	// not have a Hyperliquid cloid; the relayer intent id is how an agent runs
 	// the status-then-resend protocol after exit 40 or 42. Additive (schema v1).
 	IntentIDs []string `json:"intent_ids,omitempty"`
+	// TxHash is a HyperEVM transaction hash for a Papertrade builder-fee claim
+	// whose broadcast outcome is known enough to name the hash. Additive
+	// (schema v1). On exit 42, do not send claimBuilderFees again until this
+	// transaction is mined or dropped.
+	TxHash string `json:"tx_hash,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Message }
@@ -98,6 +103,9 @@ func (e *Error) WithCloids(cloids ...string) *Error { e.Cloids = cloids; return 
 // WithIntentIDs attaches Papertrade relayer intent id(s) so a failed write can
 // be status-checked and resent without allocating a new nonce.
 func (e *Error) WithIntentIDs(ids ...string) *Error { e.IntentIDs = ids; return e }
+
+// WithTxHash attaches a HyperEVM transaction hash. Additive (schema v1).
+func (e *Error) WithTxHash(hash string) *Error { e.TxHash = hash; return e }
 
 // Per-category constructors — terse call sites at the command layer.
 func Validation(code, msg string) *Error { return NewError(CatValidation, code, msg) }

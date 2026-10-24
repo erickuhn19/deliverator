@@ -70,7 +70,9 @@ type CancelMessage struct {
 }
 
 // RegisterMessage binds a session key. The master wallet signs it. FeeAddress
-// is the zero address until builder codes exist.
+// is the builder code. The zero address names no builder, which is the default
+// and what the venue client signs. A non-zero address must already be an
+// approved builder or the relayer refuses the registration.
 type RegisterMessage struct {
 	User       common.Address
 	Key        common.Address

@@ -256,7 +256,12 @@ deliverator papertrade cancel --intent 0x… --json
 deliverator papertrade intent status --intent 0x…
 deliverator papertrade resend --intent 0x…
 deliverator papertrade session --json
-deliverator papertrade session register --json
+deliverator papertrade session register --json          # no builder unless configured
+deliverator papertrade session register --builder 0x… --dry-run --json
+deliverator papertrade session register --builder 0x… --yes --json
+deliverator papertrade builder --json                   # fee rate, approval, unclaimed
+deliverator papertrade builder apply --name … --website https://… --contact-kind email --contact you@example.com --integration "…" --dry-run --json
+deliverator papertrade builder claim --dry-run --json
 deliverator papertrade stake --amount 1000 --dry-run --json
 deliverator papertrade stake --amount 1000 --yes --json     # master wallet signs
 deliverator papertrade unstake --amount 500 --yes --json
@@ -269,11 +274,49 @@ same way the venue's web app signs it. The session key cannot stake. Writes need
 `--yes`. The relayer enforces a per-stake minimum (live: 1000 PAPER); `account`
 shows it under `staking.minimum_stake` with staked PAPER and pending USDC rewards.
 
-The agent key signs open, close, and cancel. It cannot withdraw, stake, or
-register itself. `session register` is signed once by the master wallet from
-`DELIVERATOR_MASTER_KEY` and that secret is not stored. `deposit-address` only
-prints the proxy the master wallet can fund; Deliverator does not send the
-deposit. `serve` does not expose Papertrade.
+The agent key signs open, close, and cancel. It cannot withdraw, stake,
+register itself, or claim builder fees. `session register` is signed once by the
+master wallet from `DELIVERATOR_MASTER_KEY` and that secret is not stored.
+`deposit-address` only prints the proxy the master wallet can fund; Deliverator
+does not send the deposit. `serve` does not expose Papertrade.
+
+### Builder codes
+
+A builder code is the `feeAddress` on `RegisterSessionKey`. It is not a flag on
+open or close. Docs: [Builder codes](https://docs.papertrade.xyz/how/builder-codes/),
+[Session keys](https://docs.papertrade.xyz/learn/session-keys/),
+[Contract addresses](https://docs.papertrade.xyz/dev/contract-addresses/).
+The builders page is <https://exchange.papertrade.xyz/builders>.
+
+- **Default is no builder.** `papertrade.builder_address` is empty unless set,
+  and `--builder` is the per-registration override (`none` or the zero address
+  opts out of a configured builder). This is not Hyperliquid `builder.address`.
+  Naming a non-zero builder requires `--yes`. The address must already be
+  approved (`BuilderRegistry.isApproved`); otherwise registration is refused.
+- **Cost.** While the builder stays approved, closes that key signs pay the
+  live `feeRate()` (0.5% of adjusted PnL when written; timelock can change it,
+  cap 1%). The trader pays it on a win, on top of the win fee. On a loss it
+  comes out of the LP. Liquidations pay none. Re-register to change the address.
+  An existing key keeps the fee it was registered with.
+- **Inspect.** `papertrade builder` reads the registry, `builderFees(address)`,
+  and `GET /query/builders/leaderboard`, `/query/builders/{address}/stats`, and
+  `/query/builders/{address}/application`.
+- **Apply.** `papertrade builder apply` signs the same personal message as the
+  builders page and POSTs `/query/builders/applications`. That submits an
+  application. It does not approve the builder. Approval is a 24-hour timelock
+  action by the contract owner. The multisig can remove a builder immediately.
+  Deliverator cannot approve, remove, or move fees after a lost key (that move
+  is also owner-timelock only).
+- **Claim.** `papertrade builder claim` sends `claimBuilderFees()` on the
+  Exchange from the builder wallet (`DELIVERATOR_MASTER_KEY`, not stored).
+  Gas is HYPE. Fees credit the exchange balance; any part the LP cannot cover
+  joins the payout queue. Deliverator does not withdraw them. A zero
+  `builderFees` balance, or a transaction already pending from that address,
+  is refused before broadcast. On exit 42, `error.tx_hash` is the transaction.
+  Do not claim again until it is mined or dropped.
+
+There is no trader `approveBuilderFee` step. Signing the session registration
+that names the builder is the approval.
 
 `--dry-run` validates and prices without allocating a nonce or signing. A live
 write stores the signed body before the POST. On **exit 42** (and on a post-sign
@@ -335,9 +378,11 @@ within a couple seconds of placing, **wait briefly and re-check** (or query by
 `--oid` if you have it) before resubmitting — a too-eager recheck can report an
 order that *did* land as absent and trick you into a double-fill.
 
-Papertrade does not use this cloid protocol. Its exit-42 handle is
-`error.intent_ids`, then `papertrade intent status` and `papertrade resend`.
-See **Papertrade** above.
+Papertrade relayer writes do not use this cloid protocol. Their exit-42 handle
+is `error.intent_ids`, then `papertrade intent status` and `papertrade resend`.
+A builder-fee claim is a HyperEVM transaction, not an intent: on exit 42,
+`error.tx_hash` is the transaction to watch. Do not send `builder claim` again
+until that transaction is mined or dropped. See **Papertrade** above.
 
 ## Reconcile after a restart (run this FIRST when resuming)
 Before placing anything after a (re)start or a missed tick, adopt on-chain reality:
